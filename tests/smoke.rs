@@ -39,5 +39,25 @@ fn json_snapshot_emits_valid_shape() {
     assert_eq!(v["backend"], "mock");
     assert_eq!(v["gpus"].as_array().unwrap().len(), 2);
     assert!(v["gpus"][0]["utilization_pct"].is_number());
-    assert!(v["processes"].as_array().is_some());
+
+    // Process rows must be populated and sorted (gpu-mem desc) — this runs
+    // on the Windows runner too, where the PTY suite can't.
+    let procs = v["processes"].as_array().unwrap();
+    assert!(procs.len() >= 4, "expected mock process rows");
+    for p in procs {
+        assert!(p["pid"].as_u64().unwrap() > 0);
+        assert!(p["gpu_index"].is_number());
+        assert!(!p["command"].as_str().unwrap().is_empty());
+        assert!(!p["user"].as_str().unwrap().is_empty());
+    }
+    let first = procs.first().unwrap()["gpu_mem_bytes"].as_u64().unwrap();
+    let last = procs.last().unwrap()["gpu_mem_bytes"].as_u64().unwrap();
+    assert!(first >= last, "rows not sorted by gpu-mem desc");
+    // The snapshot process (this test's child) must attribute itself.
+    assert!(
+        procs
+            .iter()
+            .any(|p| p["command"].as_str().unwrap().contains("gpur")),
+        "own process missing from attribution"
+    );
 }

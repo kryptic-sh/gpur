@@ -35,6 +35,7 @@ impl Tui {
         cmd.args(["--mock", "--no-splash", "--tick-ms", "100"]);
         cmd.args(extra_args);
         cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         let child = pty.slave.spawn_command(cmd).unwrap();
         drop(pty.slave);
 
@@ -251,6 +252,90 @@ fn sigterm_restores_terminal_modes() {
         raw.contains("[?1006l"),
         "mouse capture not disabled on SIGTERM"
     );
+}
+
+#[test]
+fn process_rows_show_real_content() {
+    let mut t = Tui::spawn(&[]);
+    // The mock's first process row is the app itself: its pid must appear
+    // in the table with the binary name, enriched by sysinfo.
+    let pid = t.child.process_id().expect("child pid").to_string();
+    t.wait_for("own process row", move |s| {
+        s.contains(&pid) && s.contains("gpur")
+    });
+    t.send("q");
+    t.wait_exit();
+}
+
+#[test]
+fn sort_cycle_and_reverse_update_caption() {
+    let mut t = Tui::spawn(&[]);
+    t.wait_for("default sort", |s| s.contains("gpu-mem↓"));
+    t.send("s");
+    t.wait_for("cycled to gpu%", |s| s.contains("gpu%↓"));
+    t.send("r");
+    t.wait_for("reversed arrow", |s| s.contains("gpu%↑"));
+    t.send("q");
+    t.wait_exit();
+}
+
+#[test]
+fn process_cursor_highlight_moves() {
+    let mut t = Tui::spawn(&[]);
+    t.wait_for("process rows", |s| s.contains("COMMAND"));
+    t.send("p"); // focus process list
+    let first = highlighted_row(&mut t).expect("a highlighted row");
+    t.send("j");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        t.pump_once(Duration::from_millis(100));
+        if let Some(now) = highlighted_row(&mut t)
+            && now != first
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "cursor highlight never moved");
+    }
+    t.send("q");
+    t.wait_exit();
+}
+
+/// Text of the row whose cells carry the selection background
+/// (surface1 #45475a under the pinned truecolor mode).
+fn highlighted_row(t: &mut Tui) -> Option<String> {
+    t.pump_once(Duration::from_millis(50));
+    let screen = t.parser.screen();
+    for row in 0..ROWS {
+        if matches!(
+            screen.cell(row, 2).map(|c| c.bgcolor()),
+            Some(vt100::Color::Rgb(0x45, 0x47, 0x5a))
+        ) {
+            let text: String = (0..COLS)
+                .filter_map(|c| screen.cell(row, c).map(|cl| cl.contents()))
+                .collect();
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn kill_dialog_opens_and_cancels() {
+    let mut t = Tui::spawn(&[]);
+    t.wait_for("process rows", |s| s.contains("COMMAND"));
+    t.send("p");
+    t.send("x");
+    t.wait_for("confirm popup", |s| s.contains("send SIGTERM to"));
+    t.send("n"); // cancel — nothing must die
+    t.wait_for("popup gone", |s| !s.contains("send SIGTERM to"));
+    assert!(
+        !matches!(t.child.try_wait(), Ok(Some(_))),
+        "app died after cancelled kill"
+    );
+    t.send("q");
+    assert!(t.wait_exit().success());
 }
 
 /// Minimal libc-free SIGTERM via /bin/kill would need a shell; declare the
