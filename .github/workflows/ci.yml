@@ -1,14 +1,19 @@
 name: CI
 
+# Release jobs live in this file (not an `on: release` workflow) because
+# releases created with GITHUB_TOKEN do not fire downstream triggers.
+
 on:
   pull_request:
   push:
     branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -102,3 +107,403 @@ jobs:
       - run: cargo build --locked
       - run: cargo run --locked -- --version
       - run: cargo run --locked -- --help
+
+  # Runs on every main push (dry-run) and every v* tag / dispatch. Skips
+  # PRs. Artifact upload happens always; publishing to the GitHub Release
+  # is a separate tag-gated job. This catches packaging breakage before a
+  # tag is cut.
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [test]
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            zigbuild_target: x86_64-unknown-linux-gnu.2.28
+            zig: "true"
+            macos_min: ""
+            suffix: ""
+            archive: tar.gz
+            deb: "true"
+            rpm: "true"
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            zigbuild_target: aarch64-unknown-linux-gnu.2.28
+            zig: "true"
+            macos_min: ""
+            suffix: ""
+            archive: tar.gz
+            deb: "true"
+            rpm: "true"
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            zigbuild_target: x86_64-unknown-linux-musl
+            zig: "true"
+            macos_min: ""
+            suffix: ""
+            archive: tar.gz
+            deb: "false"
+            rpm: "false"
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            zigbuild_target: aarch64-unknown-linux-musl
+            zig: "true"
+            macos_min: ""
+            suffix: ""
+            archive: tar.gz
+            deb: "false"
+            rpm: "false"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            zigbuild_target: ""
+            zig: "false"
+            macos_min: ""
+            suffix: ".exe"
+            archive: zip
+            deb: "false"
+            rpm: "false"
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            zigbuild_target: ""
+            zig: "false"
+            macos_min: "11.0"
+            suffix: ""
+            archive: tar.gz
+            deb: "false"
+            rpm: "false"
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            zigbuild_target: ""
+            zig: "false"
+            macos_min: "10.15"
+            suffix: ""
+            archive: tar.gz
+            deb: "false"
+            rpm: "false"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$CARGO_VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME != Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          cache: false
+      - run: rustup update --no-self-update stable
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Setup zig
+        if: matrix.zig == 'true'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.15.1"
+      - name: Install cargo-zigbuild
+        if: matrix.zig == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build binary (zigbuild)
+        if: matrix.zig == 'true'
+        run: cargo zigbuild --release --locked --target ${{ matrix.zigbuild_target }} --bin gpur
+      - name: Build binary (native)
+        if: matrix.zig == 'false'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_min }}
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin gpur
+      - name: Smoke artifact
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin'
+        run: ./target/${{ matrix.target }}/release/gpur --version
+      - name: Package (Linux / macOS)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          TAG=${GITHUB_REF_NAME}
+          ARCHIVE="gpur-${TAG}-${{ matrix.target }}.tar.gz"
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/gpur dist/
+          cp README.md LICENSE dist/
+          tar -czf "$ARCHIVE" -C dist .
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          else
+            shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          fi
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $archive = "gpur-$tag-${{ matrix.target }}.zip"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/gpur.exe dist/
+          Copy-Item README.md, LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
+      - name: Install cargo-deb
+        if: matrix.deb == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - name: Build .deb
+        if: matrix.deb == 'true'
+        run: |
+          cargo deb --target ${{ matrix.target }} --no-build --no-strip
+          DEB_FILE=$(ls target/${{ matrix.target }}/debian/gpur_*.deb | head -1)
+          cp "$DEB_FILE" .
+          sha256sum "$(basename "$DEB_FILE")" > "$(basename "$DEB_FILE").sha256"
+      - name: Install cargo-generate-rpm
+        if: matrix.rpm == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-generate-rpm
+      - name: Build .rpm
+        if: matrix.rpm == 'true'
+        run: |
+          cargo generate-rpm --target ${{ matrix.target }} --payload-compress none
+          RPM_FILE=$(ls target/${{ matrix.target }}/generate-rpm/gpur-*.rpm | head -1)
+          cp "$RPM_FILE" .
+          sha256sum "$(basename "$RPM_FILE")" > "$(basename "$RPM_FILE").sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpur-${{ matrix.target }}
+          path: |
+            gpur-*.tar.gz
+            gpur-*.tar.gz.sha256
+            gpur-*.zip
+            gpur-*.zip.sha256
+            gpur_*.deb
+            gpur_*.deb.sha256
+            gpur-*.rpm
+            gpur-*.rpm.sha256
+
+  publish-github-release:
+    name: Publish GitHub Release
+    needs: [build, fmt, clippy, deny, machete]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gpur-*
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: [publish-github-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - name: Publish (idempotent)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/gpur/$VERSION")
+          if [ "$STATUS" = "200" ]; then
+            echo "gpur $VERSION already on crates.io — skipping"
+            exit 0
+          fi
+          cargo publish --locked
+
+  aur-bin:
+    name: Publish AUR (gpur-bin)
+    needs: [publish-github-release]
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install deps
+        run: pacman -Sy --noconfirm --needed base-devel git openssh curl
+      - uses: actions/checkout@v7
+      - name: Resolve version
+        id: tag
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Render PKGBUILD
+        run: |
+          VERSION=${{ steps.tag.outputs.version }}
+          BASE="https://github.com/kryptic-sh/gpur/releases/download/v${VERSION}"
+          SHA_X86=$(curl -sL "$BASE/gpur-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
+          SHA_A64=$(curl -sL "$BASE/gpur-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
+          test -n "$SHA_X86" && test -n "$SHA_A64"
+          mkdir -p out
+          sed -e "s/{VERSION}/${VERSION}/g" \
+              -e "s/{SHA256_X86_64}/${SHA_X86}/g" \
+              -e "s/{SHA256_AARCH64}/${SHA_A64}/g" \
+              pkg/aur/PKGBUILD-bin.in > out/PKGBUILD
+      - name: Generate .SRCINFO
+        run: |
+          useradd -m builder
+          chown -R builder out
+          su -s /bin/bash builder -c 'cd out && makepkg --printsrcinfo > .SRCINFO'
+      - name: Push to AUR
+        env:
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/known_hosts"
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_KEY }}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          git config --global user.name  "gpur-ci"
+          git config --global user.email "ci@kryptic.sh"
+          git clone ssh://aur@aur.archlinux.org/gpur-bin.git aur-repo
+          cp out/PKGBUILD out/.SRCINFO aur-repo/
+          cp pkg/aur/LICENSE pkg/aur/.gitignore aur-repo/
+          cd aur-repo
+          git add PKGBUILD .SRCINFO LICENSE .gitignore
+          if git diff --cached --quiet; then echo "nothing to push"; exit 0; fi
+          git commit -m "gpur-bin ${{ steps.tag.outputs.version }}-1"
+          git push origin master
+
+  brew-tap:
+    name: Publish Homebrew formula
+    needs: [publish-github-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve version
+        id: tag
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Render formula
+        run: |
+          VERSION=${{ steps.tag.outputs.version }}
+          BASE="https://github.com/kryptic-sh/gpur/releases/download/v${VERSION}"
+          SHA_ARM=$(curl -sL "$BASE/gpur-v${VERSION}-aarch64-apple-darwin.tar.gz.sha256" | awk '{print $1}')
+          SHA_X86=$(curl -sL "$BASE/gpur-v${VERSION}-x86_64-apple-darwin.tar.gz.sha256" | awk '{print $1}')
+          test -n "$SHA_ARM" && test -n "$SHA_X86"
+          mkdir -p out
+          sed -e "s/{VERSION}/${VERSION}/g" \
+              -e "s/{SHA256_AARCH64_DARWIN}/${SHA_ARM}/g" \
+              -e "s/{SHA256_X86_64_DARWIN}/${SHA_X86}/g" \
+              pkg/homebrew/gpur.rb.in > out/gpur.rb
+      - name: Push to tap
+        env:
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/brew -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/known_hosts"
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.BREW_SSH_KEY }}" > ~/.ssh/brew
+          chmod 600 ~/.ssh/brew
+          git config --global user.name  "gpur-ci"
+          git config --global user.email "ci@kryptic.sh"
+          git clone git@github.com:kryptic-sh/homebrew-tap.git tap
+          mkdir -p tap/Formula
+          cp out/gpur.rb tap/Formula/gpur.rb
+          cd tap
+          git add Formula/gpur.rb
+          if git diff --cached --quiet; then echo "nothing to push"; exit 0; fi
+          git commit -m "gpur ${{ steps.tag.outputs.version }}"
+          git push origin HEAD:main
+
+  scoop-bucket:
+    name: Publish Scoop manifest
+    needs: [publish-github-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve version
+        id: tag
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Render manifest
+        run: |
+          VERSION=${{ steps.tag.outputs.version }}
+          BASE="https://github.com/kryptic-sh/gpur/releases/download/v${VERSION}"
+          SHA_WIN=$(curl -sL "$BASE/gpur-v${VERSION}-x86_64-pc-windows-msvc.zip.sha256" | awk '{print $1}')
+          test -n "$SHA_WIN"
+          mkdir -p out
+          sed -e "s/{VERSION}/${VERSION}/g" \
+              -e "s/{SHA256_X86_64_WINDOWS}/${SHA_WIN}/g" \
+              pkg/scoop/gpur.json.in > out/gpur.json
+      - name: Push to bucket
+        env:
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/scoop -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=~/.ssh/known_hosts"
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SCOOP_SSH_KEY }}" > ~/.ssh/scoop
+          chmod 600 ~/.ssh/scoop
+          git config --global user.name  "gpur-ci"
+          git config --global user.email "ci@kryptic.sh"
+          git clone git@github.com:kryptic-sh/scoop-bucket.git bucket
+          mkdir -p bucket/bucket
+          cp out/gpur.json bucket/bucket/gpur.json
+          cd bucket
+          git add bucket/gpur.json
+          if git diff --cached --quiet; then echo "nothing to push"; exit 0; fi
+          git commit -m "gpur ${{ steps.tag.outputs.version }}"
+          git push origin HEAD:main
+
+  alpine:
+    name: Publish Alpine .apk
+    needs: [publish-github-release]
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    permissions:
+      contents: write
+    steps:
+      - name: Install deps
+        run: apk add --no-cache alpine-sdk bash curl coreutils
+      - uses: actions/checkout@v7
+      - name: Resolve version
+        id: tag
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Render APKBUILD
+        run: |
+          VERSION=${{ steps.tag.outputs.version }}
+          BASE="https://github.com/kryptic-sh/gpur/releases/download/v${VERSION}"
+          curl -sLO "$BASE/gpur-v${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          SHA512=$(sha512sum "gpur-v${VERSION}-x86_64-unknown-linux-musl.tar.gz" | awk '{print $1}')
+          mkdir -p out
+          sed -e "s/{VERSION}/${VERSION}/g" \
+              -e "s/{SHA512_X86_64}/${SHA512}/g" \
+              pkg/alpine/APKBUILD.in > out/APKBUILD
+      - name: Build .apk
+        run: |
+          adduser -D builder
+          addgroup builder abuild
+          mkdir -p /var/cache/distfiles
+          chmod a+w /var/cache/distfiles
+          cp "gpur-v${{ steps.tag.outputs.version }}-x86_64-unknown-linux-musl.tar.gz" /var/cache/distfiles/
+          chown -R builder out
+          su builder -c 'abuild-keygen -a -n'
+          # Install the pubkey BEFORE building or index signing fails.
+          cp /home/builder/.abuild/*.rsa.pub /etc/apk/keys/
+          su builder -c "cd $PWD/out && abuild -F -r"
+          APK=$(find /home/builder/packages -name 'gpur-*.apk' | head -1)
+          cp "$APK" .
+          sha256sum "$(basename "$APK")" > "$(basename "$APK").sha256"
+      - name: Upload .apk to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            gpur-*.apk
+            gpur-*.apk.sha256
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

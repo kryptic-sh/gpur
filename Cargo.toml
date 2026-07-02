@@ -8,6 +8,25 @@ repository = "https://github.com/kryptic-sh/gpur"
 keywords = ["gpu", "monitor", "tui", "nvtop", "btop"]
 categories = ["command-line-utilities"]
 
+[package.metadata.deb]
+maintainer = "mxaddict <mxaddict@kryptic.sh>"
+copyright = "2026, mxaddict <mxaddict@kryptic.sh>"
+extended-description = "btop-style GPU monitor for the terminal. NVIDIA, AMD, and Apple GPUs on Linux, macOS, and Windows."
+section = "utils"
+priority = "optional"
+assets = [
+  ["target/release/gpur", "usr/bin/", "755"],
+  ["README.md", "usr/share/doc/gpur/README.md", "644"],
+  ["LICENSE", "usr/share/doc/gpur/LICENSE", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/gpur", dest = "/usr/bin/gpur", mode = "755" },
+  { source = "README.md", dest = "/usr/share/doc/gpur/README.md", mode = "644", doc = true },
+  { source = "LICENSE", dest = "/usr/share/licenses/gpur/LICENSE", mode = "644", doc = true },
+]
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }

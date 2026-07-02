@@ -10,6 +10,12 @@ and this project adheres to
 
 ### Added
 
+- Org-style release pipeline in `ci.yml`: 7-target build matrix (linux gnu/musl
+  x86_64+aarch64 via cargo-zigbuild glibc 2.28, windows msvc, both mac arches
+  with `MACOSX_DEPLOYMENT_TARGET`), `.deb`/`.rpm` on gnu targets, sha256
+  sidecars, dry-run builds on every main push with tag-gated publishing: GitHub
+  Release, crates.io, AUR (`gpur-bin`), Homebrew tap, Scoop bucket, Alpine
+  `.apk`. Templates under `pkg/`.
 - NVIDIA backend: NVML via `nvml-wrapper` (Linux/Windows) — utilization, VRAM,
   temperature, power + limit, fan, core/mem clocks, PCIe gen/width and RX/TX
   throughput. Driver library loaded dynamically; probe fails soft.
