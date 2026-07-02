@@ -155,9 +155,12 @@ fn draw_gpus(frame: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
-    // content_length is the TOTAL item count; the thumb size comes from the
-    // viewport/content ratio.
-    let mut sb = ScrollbarState::new(n)
+    // ratatui quirk: the thumb only reaches the track end when
+    // position == content_length - 1, so content_length must be the number
+    // of SCROLL POSITIONS (max_scroll + 1), not the item count. With
+    // viewport = shown this also keeps thumb size = shown/total of track.
+    let max_scroll = n.saturating_sub(shown);
+    let mut sb = ScrollbarState::new(max_scroll + 1)
         .position(app.gpu_scroll)
         .viewport_content_length(shown);
     frame.render_stateful_widget(
@@ -576,7 +579,8 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
             area.width,
             area.height.saturating_sub(3),
         );
-        let mut sb = ScrollbarState::new(total)
+        // Same scroll-positions semantics as the GPU list scrollbar.
+        let mut sb = ScrollbarState::new(max_scroll + 1)
             .position(app.proc_scroll)
             .viewport_content_length(visible);
         frame.render_stateful_widget(
