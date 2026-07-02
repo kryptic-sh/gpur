@@ -38,4 +38,13 @@ pub struct Cli {
     /// Like --once but machine-readable JSON on stdout
     #[arg(long)]
     pub json: bool,
+
+    /// Graph glyph set (overrides config `graphs`); ascii for terminals
+    /// without braille/block fonts
+    #[arg(long, value_enum)]
+    pub graphs: Option<crate::app::GraphStyle>,
+
+    /// Append one JSON line per poll to this file (sensor logging)
+    #[arg(long, value_name = "FILE")]
+    pub log: Option<PathBuf>,
 }

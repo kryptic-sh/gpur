@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, GraphStyle};
 use crate::backend::GpuSnapshot;
 use crate::theme::UiTheme;
 use ratatui::Frame;
@@ -342,6 +342,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         format!(" {:>3.0}% ", gpu.utilization_pct),
         &t.util_stops(),
         t,
+        app.graph_style,
     );
     draw_meter(
         frame,
@@ -355,25 +356,32 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         ),
         &t.vram_stops(),
         t,
+        app.graph_style,
     );
 
     if spark_row.height >= 2
         && let Some(hist) = hist
     {
-        draw_waveform(frame, spark_row, &hist.util, &hist.vram, t);
+        draw_waveform(frame, spark_row, &hist.util, &hist.vram, t, app.graph_style);
     }
 
     let mut info: Vec<Span> = vec![Span::raw(" ")];
     if let Some(c) = gpu.temperature_c {
         if let Some(h) = hist {
-            info.push(Span::styled(mini_spark(&h.temp, 100), t.dim));
+            info.push(Span::styled(
+                mini_spark(&h.temp, 100, app.graph_style),
+                t.dim,
+            ));
         }
         info.push(Span::styled(format!(" {c:.0}°C  "), t.temp_style(c)));
     }
     if let Some(w) = gpu.power_w {
         let max_w = gpu.power_limit_w.unwrap_or(0.0).max(w).max(1.0) as u64;
         if let Some(h) = hist {
-            info.push(Span::styled(mini_spark(&h.power, max_w), t.dim));
+            info.push(Span::styled(
+                mini_spark(&h.power, max_w, app.graph_style),
+                t.dim,
+            ));
         }
         let limit = gpu
             .power_limit_w
@@ -401,6 +409,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
 
 /// btop-style meter: `LABEL ■■■■■■■■····  42%` with a position gradient over
 /// the filled squares.
+#[allow(clippy::too_many_arguments)]
 fn draw_meter(
     frame: &mut Frame,
     area: Rect,
@@ -409,10 +418,15 @@ fn draw_meter(
     value: String,
     stops: &[(u8, u8, u8)],
     t: &UiTheme,
+    style: GraphStyle,
 ) {
     if area.height == 0 {
         return;
     }
+    let (fill, empty) = match style {
+        GraphStyle::Ascii => ("=", "."),
+        _ => ("■", "·"),
+    };
     let mut spans = vec![Span::styled(label.to_string(), Style::new().fg(t.fg))];
     let meter_w = (area.width as usize)
         .saturating_sub(label.chars().count() + value.chars().count())
@@ -426,23 +440,45 @@ fn draw_meter(
         };
         if i < filled {
             spans.push(Span::styled(
-                "■",
+                fill,
                 Style::new().fg(crate::theme::gradient(stops, pos)),
             ));
         } else {
-            spans.push(Span::styled("·", t.dim));
+            spans.push(Span::styled(empty, t.dim));
         }
     }
     spans.push(Span::styled(value, Style::new().fg(t.fg)));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Five-cell inline braille sparkline of the last ten samples, scaled to
-/// `max` — the `⣀⣀⣀⣠⣤` blips btop puts next to temps and power draws.
-fn mini_spark(data: &[u64], max: u64) -> String {
+/// Five-cell inline sparkline of recent samples, scaled to `max` — the
+/// `⣀⣀⣀⣠⣤` blips btop puts next to temps and power draws. Follows the
+/// configured glyph set.
+fn mini_spark(data: &[u64], max: u64, style: GraphStyle) -> String {
     const CELLS: usize = 5;
-    let n = CELLS * 2;
     let max = max.max(1);
+    if style != GraphStyle::Braille {
+        const ASCII_RAMP: [char; 5] = ['_', '.', '-', '+', '#'];
+        return (0..CELLS)
+            .map(|c| {
+                let v = if data.len() >= CELLS {
+                    data[data.len() - CELLS + c]
+                } else {
+                    let pad = CELLS - data.len();
+                    if c < pad { 0 } else { data[c - pad] }
+                }
+                .min(max);
+                if style == GraphStyle::Block {
+                    let lvl = ((v as usize * 8).div_ceil(max as usize)).clamp(1, 8);
+                    EIGHTHS[lvl]
+                } else {
+                    let lvl = ((v as usize * 4).div_ceil(max as usize)).clamp(0, 4);
+                    ASCII_RAMP[lvl]
+                }
+            })
+            .collect();
+    }
+    let n = CELLS * 2;
     let mut out = String::with_capacity(CELLS * 3);
     for c in 0..CELLS {
         let mut bits = 0u8;
@@ -475,18 +511,31 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
+/// Lower-block glyphs by filled eighths (index 0..=8).
+const EIGHTHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 const BRAILLE_BASE: u32 = 0x2800;
 /// Braille dot bit for (sub-column, dot-row counted from cell top).
 const DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
 
 /// btop-style mirrored waveform: `up_data` (gpu%) grows upward from the
-/// vertical midline, `down_data` (vram%) grows downward, both in braille
-/// (2 samples per cell column, 4 dot rows per cell) with a color gradient
-/// from the midline toward the edges. Zero values keep one dot row, so an
-/// idle GPU still draws a thin center line.
-fn draw_waveform(frame: &mut Frame, area: Rect, up_data: &[u64], down_data: &[u64], t: &UiTheme) {
+/// vertical midline, `down_data` (vram%) grows downward, with a color
+/// gradient from the midline toward the edges. Zero values keep a minimum
+/// sliver, so an idle GPU still draws a thin center line. The glyph set is
+/// selectable: braille (2 samples/cell, 4 rows/cell), block eighths, or
+/// pure ascii.
+fn draw_waveform(
+    frame: &mut Frame,
+    area: Rect,
+    up_data: &[u64],
+    down_data: &[u64],
+    t: &UiTheme,
+    style: GraphStyle,
+) {
     if area.height < 2 || area.width == 0 {
         return;
+    }
+    if style != GraphStyle::Braille {
+        return draw_waveform_cells(frame, area, up_data, down_data, t, style);
     }
     let top_rows = (area.height / 2) as usize;
     let bot_rows = area.height as usize - top_rows;
@@ -550,6 +599,91 @@ fn draw_waveform(frame: &mut Frame, area: Rect, up_data: &[u64], down_data: &[u6
         }
     }
 
+    buf.set_string(area.x, area.y, "gpu%", t.dim);
+    buf.set_string(area.x, area.y + area.height - 1, "vram%", t.dim);
+}
+
+/// Block/ascii waveform: one sample per column. Block mode uses eighth
+/// glyphs (down-growing partials via fg/bg swap since Unicode has no lower
+/// upper-partials); ascii uses a `.-+#` coverage ramp.
+fn draw_waveform_cells(
+    frame: &mut Frame,
+    area: Rect,
+    up_data: &[u64],
+    down_data: &[u64],
+    t: &UiTheme,
+    style: GraphStyle,
+) {
+    let top_rows = (area.height / 2) as usize;
+    let bot_rows = area.height as usize - top_rows;
+    let cols = area.width as usize;
+    let up_stops = t.util_stops();
+    let down_stops = t.vram_stops();
+    // Sub-units per cell: 8 block eighths or 4 ascii coverage steps.
+    let unit = if style == GraphStyle::Block { 8 } else { 4 };
+    const ASCII_RAMP: [char; 5] = [' ', '.', '-', '+', '#'];
+
+    let sample = |data: &[u64], i: usize| -> u64 {
+        if data.len() >= cols {
+            data[data.len() - cols + i]
+        } else {
+            let pad = cols - data.len();
+            if i < pad { 0 } else { data[i - pad] }
+        }
+    };
+
+    let bg = crate::theme::rgb_of(Some(t.bg), (0x1e, 0x1e, 0x2e));
+    let buf = frame.buffer_mut();
+    for half in 0..2 {
+        let (rows, data, stops) = if half == 0 {
+            (top_rows, up_data, &up_stops[..])
+        } else {
+            (bot_rows, down_data, &down_stops[..])
+        };
+        for cy in 0..rows {
+            let y = if half == 0 {
+                area.y + (top_rows - 1 - cy) as u16
+            } else {
+                area.y + (top_rows + cy) as u16
+            };
+            let frac = if rows > 1 {
+                cy as f64 / (rows - 1) as f64
+            } else {
+                0.0
+            };
+            let color = crate::theme::gradient(stops, frac);
+            for cx in 0..cols {
+                let v = sample(data, cx).min(100) as usize;
+                let units = ((v * rows * unit) / 100).max(1);
+                let in_cell = units.saturating_sub(cy * unit).min(unit);
+                if in_cell == 0 {
+                    continue;
+                }
+                let (ch, cell_style) = match style {
+                    GraphStyle::Block if half == 0 => (EIGHTHS[in_cell], Style::new().fg(color)),
+                    GraphStyle::Block => {
+                        if in_cell == 8 {
+                            ('█', Style::new().fg(color))
+                        } else {
+                            // Complement trick: paint the empty lower part in
+                            // the background color over a bar-colored cell.
+                            (
+                                EIGHTHS[8 - in_cell],
+                                Style::new()
+                                    .fg(ratatui::style::Color::Rgb(bg.0, bg.1, bg.2))
+                                    .bg(color),
+                            )
+                        }
+                    }
+                    _ => (ASCII_RAMP[in_cell], Style::new().fg(color)),
+                };
+                if let Some(cell) = buf.cell_mut((area.x + cx as u16, y)) {
+                    cell.set_char(ch);
+                    cell.set_style(cell_style);
+                }
+            }
+        }
+    }
     buf.set_string(area.x, area.y, "gpu%", t.dim);
     buf.set_string(area.x, area.y + area.height - 1, "vram%", t.dim);
 }

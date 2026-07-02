@@ -13,6 +13,26 @@ pub enum Focus {
     Procs,
 }
 
+/// Glyph set for graphs: braille needs good font coverage, block works on
+/// most terminals, ascii works everywhere (Linux console, weird fonts).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub enum GraphStyle {
+    Braille,
+    Block,
+    Ascii,
+}
+
+impl GraphStyle {
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "braille" => Some(Self::Braille),
+            "block" => Some(Self::Block),
+            "ascii" => Some(Self::Ascii),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
@@ -169,6 +189,9 @@ pub struct App {
     pub status: Option<(String, Instant)>,
     /// (rect, gpu index) of each card drawn last frame, for click hit-tests.
     pub card_rects: Vec<(ratatui::layout::Rect, usize)>,
+    pub graph_style: GraphStyle,
+    /// JSONL sink: one line per successful poll when --log is given.
+    log: Option<std::io::BufWriter<std::fs::File>>,
     /// Unfiltered process rows; `procs` is the filtered+sorted view.
     all_procs: Vec<ProcRow>,
     sys: System,
@@ -182,8 +205,12 @@ impl App {
         tick_ms: u64,
         history_len: usize,
         no_splash: bool,
+        graph_style: GraphStyle,
+        log: Option<std::io::BufWriter<std::fs::File>>,
     ) -> Self {
         Self {
+            graph_style,
+            log,
             backend,
             gpus: Vec::new(),
             history: Vec::new(),
@@ -277,6 +304,30 @@ impl App {
             }
         }
         self.refresh_processes();
+        self.write_log();
+    }
+
+    /// Append one JSONL record per successful poll. A write error drops the
+    /// logger with a status message instead of spamming or crashing.
+    fn write_log(&mut self) {
+        use std::io::Write;
+        let Some(w) = self.log.as_mut() else { return };
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let rec = serde_json::json!({
+            "ts_ms": ts,
+            "gpus": self.gpus,
+            "processes": self.all_procs,
+        });
+        let ok = serde_json::to_writer(&mut *w, &rec).is_ok()
+            && writeln!(w).is_ok()
+            && w.flush().is_ok();
+        if !ok {
+            self.log = None;
+            self.set_status("log write failed — logging disabled".into());
+        }
     }
 
     fn refresh_processes(&mut self) {

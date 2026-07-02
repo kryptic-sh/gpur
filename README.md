@@ -31,6 +31,8 @@ gpur --mock       # fake GPUs, works anywhere
 gpur --mock 6     # demo a 6-GPU rig
 gpur --once       # one text snapshot, no TUI (scripts, quick checks)
 gpur --json       # machine-readable snapshot (waybar/polybar, monitoring)
+gpur --log x.jsonl  # append one JSON record per poll (benchmark/sensor logs)
+gpur --graphs ascii # graph glyphs: braille (default) | block | ascii
 ```
 
 ## Keys & mouse
@@ -58,6 +60,9 @@ means built-in defaults.
 ```toml
 tick_ms = 1000
 history_len = 300
+# graph glyphs: "braille" (default), "block", or "ascii" for fonts
+# without braille coverage
+graphs = "braille"
 # hjkl-theme TOML; omit for the built-in theme
 theme = "/path/to/theme.toml"
 ```

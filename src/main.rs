@@ -33,8 +33,29 @@ fn main() -> Result<()> {
 
     let theme = theme::load(theme_path.as_deref())?;
     let backend = backend::detect(cli.mock)?;
+    let graph_style = cli
+        .graphs
+        .or_else(|| app::GraphStyle::from_config(&cfg.graphs))
+        .unwrap_or(app::GraphStyle::Braille);
+    let log = match &cli.log {
+        Some(path) => Some(std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?,
+        )),
+        None => None,
+    };
 
-    let mut app = App::new(backend, theme, tick_ms, cfg.history_len, cli.no_splash);
+    let mut app = App::new(
+        backend,
+        theme,
+        tick_ms,
+        cfg.history_len,
+        cli.no_splash,
+        graph_style,
+        log,
+    );
     app.poll();
 
     if cli.once || cli.json {

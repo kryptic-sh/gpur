@@ -12,6 +12,8 @@ pub struct GpurConfig {
     pub theme: Option<PathBuf>,
     /// History window kept per GPU (sparkline samples).
     pub history_len: usize,
+    /// Graph glyph set: "braille" (default), "block", or "ascii".
+    pub graphs: String,
 }
 
 impl Default for GpurConfig {
@@ -20,6 +22,7 @@ impl Default for GpurConfig {
             tick_ms: 1000,
             theme: None,
             history_len: 300,
+            graphs: "braille".into(),
         }
     }
 }

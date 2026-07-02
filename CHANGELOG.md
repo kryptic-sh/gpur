@@ -8,6 +8,15 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Graph glyph fallback: `graphs = "braille"|"block"|"ascii"` in config (or
+  `--graphs`) switches the waveform, mini-sparks, and meters — block for
+  terminals with patchy braille fonts, ascii for the Linux console.
+- Sensor logging: `--log FILE` appends one JSON line per poll (`ts_ms`, gpus,
+  processes); works in TUI and `--once` modes, disables itself with a status
+  message on write errors.
+
 ## [0.4.0] - 2026-07-02
 
 ### Changed
