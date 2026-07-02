@@ -163,6 +163,9 @@ fn survives_resize_storm() {
     let mut t = Tui::spawn(&[]);
     t.wait_for("cards", |s| s.contains("Mock GPU 0"));
     // Storm through degenerate sizes; the app must neither crash nor wedge.
+    // (ratatui only emits diffs, so don't expect a spontaneous full redraw
+    // afterwards — macOS coalesces the resize events. Instead prove the app
+    // is alive by demanding a NEW screen element.)
     for (rows, cols) in [
         (5, 5),
         (2, 40),
@@ -180,10 +183,15 @@ fn survives_resize_storm() {
                 pixel_height: 0,
             })
             .unwrap();
+        // NB: the vt100 test parser stays at full size — it panics on 1x1
+        // grids, and out-of-range coords from small-screen frames clamp.
         t.pump_once(Duration::from_millis(50));
     }
-    t.parser = vt100::Parser::new(ROWS, COLS, 0);
-    t.wait_for("re-render after storm", |s| s.contains("Mock GPU 0"));
+    t.send("?");
+    t.wait_for("responsive after storm (help overlay)", |s| {
+        s.contains("any key closes")
+    });
+    t.send(" "); // close overlay
     t.send("q");
     assert!(t.wait_exit().success());
 }

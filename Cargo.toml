@@ -39,7 +39,6 @@ hjkl-keymap-tui = "0.33"
 hjkl-kitty = "0.33"
 hjkl-splash = "0.33"
 hjkl-theme = "0.33"
-hjkl-theme-tui = "0.33"
 nvml-wrapper = "0.12"
 ratatui = "0.30"
 serde = { version = "1.0", features = ["derive"] }

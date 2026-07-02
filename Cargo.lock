@@ -681,7 +681,6 @@ dependencies = [
  "hjkl-kitty",
  "hjkl-splash",
  "hjkl-theme",
- "hjkl-theme-tui",
  "io-kit-sys",
  "libc",
  "nvml-wrapper",
@@ -785,16 +784,6 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "toml",
-]
-
-[[package]]
-name = "hjkl-theme-tui"
-version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37d654b699f722735f2db0f3e568cf544283ffc4d4e771c64010f9db0dffc950"
-dependencies = [
- "hjkl-theme",
- "ratatui",
 ]
 
 [[package]]
