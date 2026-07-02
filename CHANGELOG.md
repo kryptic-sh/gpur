@@ -10,6 +10,17 @@ and this project adheres to
 
 ### Added
 
+- Terminal teardown hardening: a chained panic hook and a Unix signal handler
+  (SIGTERM/SIGHUP/SIGINT) now restore mouse capture, the kitty keyboard
+  protocol, raw mode, and the alt screen — external kills and panics no longer
+  leave the shell with mouse reporting garbage.
+- PTY integration tests in CI (`tests/tui.rs`, Unix): the real binary runs
+  against a pseudo-terminal with a vt100 emulator asserting rendered content,
+  fold/filter/quit key flows, and teardown escape sequences on both clean quit
+  and SIGTERM.
+- Invalid `graphs` config values are now a startup error instead of a silent
+  fallback to braille.
+
 - Video engine utilization in the info line: NVIDIA shows split `enc`/`dec`
   (NVML), AMD shows unified VCN `video %` (fdinfo engine deltas), Intel shows
   media-engine `video %` (i915 video/video-enhance ns, xe vcs/vecs cycles),

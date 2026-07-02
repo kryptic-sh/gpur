@@ -33,10 +33,15 @@ fn main() -> Result<()> {
 
     let theme = theme::load(theme_path.as_deref())?;
     let backend = backend::detect(cli.mock)?;
-    let graph_style = cli
-        .graphs
-        .or_else(|| app::GraphStyle::from_config(&cfg.graphs))
-        .unwrap_or(app::GraphStyle::Braille);
+    let graph_style = match cli.graphs {
+        Some(s) => s,
+        None => app::GraphStyle::from_config(&cfg.graphs).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown graphs value {:?} in config (expected braille, block, or ascii)",
+                cfg.graphs
+            )
+        })?,
+    };
     let log = match &cli.log {
         Some(path) => Some(std::io::BufWriter::new(
             std::fs::OpenOptions::new()
@@ -62,14 +67,59 @@ fn main() -> Result<()> {
         return snapshot(&mut app, cli.json, tick_ms);
     }
 
+    // ratatui::init installs a panic hook restoring raw mode + alt screen;
+    // it knows nothing about mouse capture or the kitty protocol, so chain
+    // our teardown in front of it — a panic must not leave the shell with
+    // mouse reporting on.
     let mut terminal = ratatui::init();
     hjkl_kitty::enable(&mut stdout())?;
     crossterm::execute!(stdout(), EnableMouseCapture)?;
+    {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_extras();
+            prev(info);
+        }));
+    }
+    install_signal_teardown();
+
     let result = run(&mut terminal, &mut app);
-    let _ = crossterm::execute!(stdout(), DisableMouseCapture);
-    let _ = hjkl_kitty::disable(&mut stdout());
+    restore_extras();
     ratatui::restore();
     result
+}
+
+/// Undo what we set up beyond ratatui's own raw-mode/alt-screen handling.
+/// Safe to call more than once — both sequences are idempotent pops.
+fn restore_extras() {
+    let _ = crossterm::execute!(stdout(), DisableMouseCapture);
+    let _ = hjkl_kitty::disable(&mut stdout());
+}
+
+/// External SIGTERM/SIGHUP/SIGINT would otherwise kill the process with raw
+/// mode, the alt screen, and mouse capture still active. (Ctrl-C arrives as
+/// a key event under raw mode, so SIGINT here means an outside `kill -INT`.)
+#[cfg(unix)]
+fn install_signal_teardown() {
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+    let Ok(mut signals) = Signals::new([SIGTERM, SIGHUP, SIGINT]) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        if let Some(sig) = signals.forever().next() {
+            restore_extras();
+            ratatui::restore();
+            // Conventional 128+signal exit code.
+            std::process::exit(128 + sig);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn install_signal_teardown() {
+    // Windows: Ctrl-C is delivered as a key event under raw mode and
+    // taskkill offers no interception point comparable to Unix signals.
 }
 
 /// Headless one-shot: a second poll after a short gap makes the delta-based
