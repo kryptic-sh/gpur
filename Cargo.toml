@@ -1,0 +1,23 @@
+[package]
+name = "gpur"
+version = "0.1.0"
+edition = "2024"
+description = "btop-style GPU monitor TUI — NVIDIA, AMD, Apple Silicon; Linux, macOS, Windows"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/gpur"
+keywords = ["gpu", "monitor", "tui", "nvtop", "btop"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+crossterm = "0.29"
+hjkl-config = "0.33"
+hjkl-keymap = "0.33"
+hjkl-keymap-tui = "0.33"
+hjkl-kitty = "0.33"
+hjkl-splash = "0.33"
+hjkl-theme = "0.33"
+hjkl-theme-tui = "0.33"
+ratatui = "0.30"
+serde = { version = "1.0", features = ["derive"] }

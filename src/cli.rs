@@ -1,0 +1,31 @@
+use clap::Parser;
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "gpur",
+    version,
+    about = "btop-style GPU monitor — NVIDIA, AMD, Apple Silicon",
+    before_help = include_str!("art.txt")
+)]
+pub struct Cli {
+    /// Use deterministic mock GPUs (demo the UI without hardware)
+    #[arg(long)]
+    pub mock: bool,
+
+    /// Path to config.toml (default: $XDG_CONFIG_HOME/gpur/config.toml)
+    #[arg(long, short)]
+    pub config: Option<PathBuf>,
+
+    /// Path to a theme TOML (overrides the config file)
+    #[arg(long, short)]
+    pub theme: Option<PathBuf>,
+
+    /// Poll interval in milliseconds (overrides the config file)
+    #[arg(long)]
+    pub tick_ms: Option<u64>,
+
+    /// Skip the startup splash
+    #[arg(long)]
+    pub no_splash: bool,
+}
