@@ -465,14 +465,11 @@ impl App {
     }
 
     fn next_gpu(&mut self) {
-        if !self.gpus.is_empty() {
-            self.selected = (self.selected + 1) % self.gpus.len();
-        }
+        // Clamp at the ends — no wrap-around.
+        self.selected = (self.selected + 1).min(self.gpus.len().saturating_sub(1));
     }
 
     fn prev_gpu(&mut self) {
-        if !self.gpus.is_empty() {
-            self.selected = (self.selected + self.gpus.len() - 1) % self.gpus.len();
-        }
+        self.selected = self.selected.saturating_sub(1);
     }
 }

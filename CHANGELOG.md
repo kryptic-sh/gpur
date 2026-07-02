@@ -8,6 +8,10 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- GPU selection no longer wraps: j/k and the wheel stop at the first/last card.
+
 ### Added
 
 - Headless snapshot mode: `--once` prints one text snapshot, `--json` emits
