@@ -7,6 +7,12 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Us
 
 const SPLASH_MS: u64 = 1500;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Gpus,
+    Procs,
+}
+
 #[derive(Default)]
 pub struct History {
     pub util: Vec<u64>,
@@ -66,6 +72,10 @@ pub struct App {
     /// Pane rectangles from the last draw, for routing mouse wheel events.
     pub gpus_rect: ratatui::layout::Rect,
     pub proc_rect: ratatui::layout::Rect,
+    /// Which pane arrow keys act on.
+    pub focus: Focus,
+    /// (rect, gpu index) of each card drawn last frame, for click hit-tests.
+    pub card_rects: Vec<(ratatui::layout::Rect, usize)>,
     sys: System,
     users: Users,
 }
@@ -96,6 +106,8 @@ impl App {
             proc_scroll: 0,
             gpus_rect: ratatui::layout::Rect::default(),
             proc_rect: ratatui::layout::Rect::default(),
+            focus: Focus::Gpus,
+            card_rects: Vec::new(),
             sys: System::new(),
             users: Users::new_with_refreshed_list(),
         }
@@ -185,26 +197,47 @@ impl App {
         match action {
             Action::Quit => return true,
             Action::TogglePause => self.paused = !self.paused,
-            Action::NextGpu => {
-                if !self.gpus.is_empty() {
-                    self.selected = (self.selected + 1) % self.gpus.len();
-                }
-            }
-            Action::PrevGpu => {
-                if !self.gpus.is_empty() {
-                    self.selected = (self.selected + self.gpus.len() - 1) % self.gpus.len();
-                }
-            }
+            Action::NextItem => match self.focus {
+                Focus::Gpus => self.next_gpu(),
+                Focus::Procs => self.proc_scroll = self.proc_scroll.saturating_add(1),
+            },
+            Action::PrevItem => match self.focus {
+                Focus::Gpus => self.prev_gpu(),
+                Focus::Procs => self.proc_scroll = self.proc_scroll.saturating_sub(1),
+            },
+            Action::NextGpu => self.next_gpu(),
+            Action::PrevGpu => self.prev_gpu(),
             Action::TickFaster => self.tick_ms = (self.tick_ms / 2).max(100),
             Action::TickSlower => self.tick_ms = (self.tick_ms * 2).min(10_000),
-            Action::ToggleFold(i) => {
-                if i < self.gpus.len() && !self.folded.remove(&i) {
-                    self.folded.insert(i);
+            Action::Digit(i) => {
+                if i < self.gpus.len() {
+                    if self.focus == Focus::Gpus && self.selected == i {
+                        // Second press on the selected GPU folds it.
+                        if !self.folded.remove(&i) {
+                            self.folded.insert(i);
+                        }
+                    } else {
+                        self.focus = Focus::Gpus;
+                        self.selected = i;
+                    }
                 }
             }
+            Action::FocusProcs => self.focus = Focus::Procs,
             Action::ProcScrollDown => self.proc_scroll = self.proc_scroll.saturating_add(1),
             Action::ProcScrollUp => self.proc_scroll = self.proc_scroll.saturating_sub(1),
         }
         false
+    }
+
+    fn next_gpu(&mut self) {
+        if !self.gpus.is_empty() {
+            self.selected = (self.selected + 1) % self.gpus.len();
+        }
+    }
+
+    fn prev_gpu(&mut self) {
+        if !self.gpus.is_empty() {
+            self.selected = (self.selected + self.gpus.len() - 1) % self.gpus.len();
+        }
     }
 }

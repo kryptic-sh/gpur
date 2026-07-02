@@ -10,6 +10,11 @@ and this project adheres to
 
 ### Added
 
+- Pane focus model: `p` focuses the process list, digits 0-9 focus the GPU list
+  and select that GPU (same digit again folds/unfolds), arrows/j/k act on the
+  focused pane, left click focuses the pane under the cursor (and selects the
+  clicked GPU card); pause moved to Space; focused process pane gets the accent
+  border.
 - Mouse wheel support: scrolling over the process pane scrolls the table, over
   the GPU area moves the selection (mouse capture on, released at exit).
 - Dynamic layout: process pane sizes to content capped at 30% of the body with

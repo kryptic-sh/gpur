@@ -9,11 +9,12 @@ mod ui;
 
 use anyhow::Result;
 use app::App;
+use app::Focus;
 use clap::Parser;
 use cli::Cli;
 use config::GpurConfig;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
 };
 use keys::Action;
 use ratatui::layout::Position;
@@ -79,18 +80,38 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                         continue;
                     }
                     let pos = Position::new(m.column, m.row);
+                    let in_procs = app.proc_rect.contains(pos);
+                    let in_gpus = app.gpus_rect.contains(pos);
                     let action = match m.kind {
-                        MouseEventKind::ScrollDown if app.proc_rect.contains(pos) => {
+                        // Wheel and click both focus the pane under the cursor.
+                        MouseEventKind::ScrollDown if in_procs => {
+                            app.focus = Focus::Procs;
                             Some(Action::ProcScrollDown)
                         }
-                        MouseEventKind::ScrollUp if app.proc_rect.contains(pos) => {
+                        MouseEventKind::ScrollUp if in_procs => {
+                            app.focus = Focus::Procs;
                             Some(Action::ProcScrollUp)
                         }
-                        MouseEventKind::ScrollDown if app.gpus_rect.contains(pos) => {
+                        MouseEventKind::ScrollDown if in_gpus => {
+                            app.focus = Focus::Gpus;
                             Some(Action::NextGpu)
                         }
-                        MouseEventKind::ScrollUp if app.gpus_rect.contains(pos) => {
+                        MouseEventKind::ScrollUp if in_gpus => {
+                            app.focus = Focus::Gpus;
                             Some(Action::PrevGpu)
+                        }
+                        MouseEventKind::Down(MouseButton::Left) if in_procs => {
+                            app.focus = Focus::Procs;
+                            None
+                        }
+                        MouseEventKind::Down(MouseButton::Left) if in_gpus => {
+                            app.focus = Focus::Gpus;
+                            if let Some(&(_, i)) =
+                                app.card_rects.iter().find(|(rect, _)| rect.contains(pos))
+                            {
+                                app.selected = i;
+                            }
+                            None
                         }
                         _ => None,
                     };

@@ -12,11 +12,18 @@ pub enum Mode {
 pub enum Action {
     Quit,
     TogglePause,
+    /// Move down/up within the focused pane (GPU selection or process rows).
+    NextItem,
+    PrevItem,
+    /// Explicit GPU selection regardless of focus (mouse wheel routing).
     NextGpu,
     PrevGpu,
     TickFaster,
     TickSlower,
-    ToggleFold(usize),
+    /// Focus the GPU pane and select GPU N; pressed again on the already
+    /// selected GPU it folds/unfolds the card.
+    Digit(usize),
+    FocusProcs,
     ProcScrollDown,
     ProcScrollUp,
 }
@@ -27,11 +34,12 @@ pub fn default_keymap() -> Keymap<Action, Mode> {
         ("q", Action::Quit, "quit"),
         ("<Esc>", Action::Quit, "quit"),
         ("<C-c>", Action::Quit, "quit"),
-        ("p", Action::TogglePause, "pause/resume polling"),
-        ("j", Action::NextGpu, "select next GPU"),
-        ("<Down>", Action::NextGpu, "select next GPU"),
-        ("k", Action::PrevGpu, "select previous GPU"),
-        ("<Up>", Action::PrevGpu, "select previous GPU"),
+        ("<Space>", Action::TogglePause, "pause/resume polling"),
+        ("p", Action::FocusProcs, "focus process list"),
+        ("j", Action::NextItem, "move down in focused list"),
+        ("<Down>", Action::NextItem, "move down in focused list"),
+        ("k", Action::PrevItem, "move up in focused list"),
+        ("<Up>", Action::PrevItem, "move up in focused list"),
         ("+", Action::TickFaster, "poll faster"),
         ("-", Action::TickSlower, "poll slower"),
         ("J", Action::ProcScrollDown, "scroll process list down"),
@@ -51,8 +59,8 @@ pub fn default_keymap() -> Keymap<Action, Mode> {
         km.add(
             Mode::Normal,
             &d.to_string(),
-            Action::ToggleFold(d),
-            "fold/unfold GPU card",
+            Action::Digit(d),
+            "focus/select GPU N, again to fold",
         )
         .expect("static chord parses");
     }

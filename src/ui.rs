@@ -59,7 +59,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_processes(frame, proc_area, app);
 
     frame.render_widget(
-        Paragraph::new(" q quit  p pause  j/k select  0-9 fold  J/K procs  +/- poll rate")
+        Paragraph::new(" q quit  ␣ pause  p procs  0-9 gpu (again folds)  j/k move  +/- poll rate")
             .style(app.theme.dim),
         footer,
     );
@@ -95,6 +95,7 @@ fn draw_gpus(frame: &mut Frame, area: Rect, app: &mut App) {
             }
         }))
         .split(area);
+        app.card_rects = rows.iter().copied().zip(0..n).collect();
         for (i, gpu) in app.gpus.iter().enumerate() {
             if app.folded.contains(&i) {
                 draw_gpu_folded(frame, rows[i], app, gpu, i);
@@ -144,6 +145,7 @@ fn draw_gpus(frame: &mut Frame, area: Rect, app: &mut App) {
         }
     }))
     .split(cards);
+    app.card_rects = rows.iter().copied().zip(window.iter().copied()).collect();
     for (slot, &i) in rows.iter().zip(&window) {
         let gpu = &app.gpus[i];
         if app.folded.contains(&i) {
@@ -478,11 +480,16 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
         format!("{total}")
     };
     let t = &app.theme;
+    let border = if app.focus == crate::app::Focus::Procs {
+        t.border_selected
+    } else {
+        t.border
+    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(caption("processes".into(), t.title, t.border))
-        .title_top(caption(counter, t.dim, t.border).right_aligned())
-        .border_style(t.border);
+        .title(caption("processes".into(), t.title, border))
+        .title_top(caption(counter, t.dim, border).right_aligned())
+        .border_style(border);
 
     if app.procs.is_empty() {
         let inner = block.inner(area);
