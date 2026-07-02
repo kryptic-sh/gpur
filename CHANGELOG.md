@@ -10,6 +10,9 @@ and this project adheres to
 
 ### Added
 
+- Container attribution: process rows show a CONTAINER column (docker/podman/k8s
+  runtime + short id from /proc cgroups, Linux) whenever any GPU process is
+  containerized; the filter matches it too.
 - Replay mode: `--replay session.jsonl` re-drives the full TUI (or `--json`
   snapshot) from a `--log` recording — recorded user/command enrichment is
   preserved instead of resolving foreign pids; last frame holds at EOF. Makes

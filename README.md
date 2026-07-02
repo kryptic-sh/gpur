@@ -111,7 +111,12 @@ Planned depth: Apple temperature/power (SMC/IOReport), Windows AMD ADLX
 The process table (PID, user, device, type, GPU%, GPU memory, CPU%, host memory,
 command) works on Linux (AMD + Intel via `/proc` fdinfo — same-user processes
 unless run as root), NVIDIA everywhere (NVML), and Windows (PDH per-pid
-counters). macOS has no public per-process GPU API.
+counters). macOS has no public per-process GPU API. On Linux, containerized
+processes get a CONTAINER column (docker/podman/k8s id from cgroups).
+
+Recorded sessions replay: `gpur --log run.jsonl` while it happens, then
+`gpur --replay run.jsonl` anywhere — including machines with no GPU — with the
+recorded process attribution intact. Ideal for bug reports.
 
 ## License
 

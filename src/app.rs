@@ -132,6 +132,54 @@ impl SessionStats {
     }
 }
 
+/// Identify a container from /proc/<pid>/cgroup content: docker, podman,
+/// cri-containerd (k8s), and crio scopes, cgroup v1 and v2 layouts.
+fn container_of_cgroup(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let path = line.rsplit(':').next().unwrap_or("");
+        for (marker, runtime) in [
+            ("docker-", "docker"),
+            ("libpod-", "podman"),
+            ("cri-containerd-", "k8s"),
+            ("crio-", "k8s"),
+        ] {
+            if let Some(rest) = path.split('/').find_map(|seg| seg.strip_prefix(marker)) {
+                let id: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .take(12)
+                    .collect();
+                if id.len() == 12 {
+                    return Some(format!("{runtime}:{id}"));
+                }
+            }
+        }
+        // cgroup v1 flat layout: .../docker/<id>
+        if let Some(idx) = path.find("/docker/") {
+            let id: String = path[idx + 8..]
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .take(12)
+                .collect();
+            if id.len() == 12 {
+                return Some(format!("docker:{id}"));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn container_of_pid(pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    container_of_cgroup(&text)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn container_of_pid(_pid: u32) -> Option<String> {
+    None
+}
+
 /// One row of the process table: GPU stats + host-side enrichment.
 #[derive(Clone, serde::Serialize)]
 pub struct ProcRow {
@@ -144,6 +192,8 @@ pub struct ProcRow {
     pub cpu_pct: f32,
     pub host_mem_bytes: u64,
     pub command: String,
+    /// Container runtime + short id ("docker:ab12cd34ef56"), Linux only.
+    pub container: Option<String>,
 }
 
 /// UI state persisted across runs (folded cards, sort, poll rate) — the
@@ -453,6 +503,7 @@ impl App {
                         .clone()
                         .or(p.map(command_of))
                         .unwrap_or_else(|| "?".into()),
+                    container: container_of_pid(gp.pid),
                     pid: gp.pid,
                     gpu_index: gp.gpu_index,
                     kind: gp.kind,
@@ -478,6 +529,9 @@ impl App {
                     || p.command.to_lowercase().contains(&needle)
                     || p.user.to_lowercase().contains(&needle)
                     || p.pid.to_string().contains(&needle)
+                    || p.container
+                        .as_deref()
+                        .is_some_and(|c| c.to_lowercase().contains(&needle))
             })
             .cloned()
             .collect();
@@ -614,5 +668,43 @@ impl App {
 
     fn prev_gpu(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::container_of_cgroup;
+
+    #[test]
+    fn cgroup_container_detection() {
+        assert_eq!(
+            container_of_cgroup(
+                "0::/system.slice/docker-abcdef123456789000000000000000000000000000000000000000000000dead.scope"
+            )
+            .as_deref(),
+            Some("docker:abcdef123456")
+        );
+        assert_eq!(
+            container_of_cgroup("0::/machine.slice/libpod-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope")
+                .as_deref(),
+            Some("podman:0123456789ab")
+        );
+        assert_eq!(
+            container_of_cgroup("0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1234.slice/cri-containerd-fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210.scope")
+                .as_deref(),
+            Some("k8s:fedcba987654")
+        );
+        assert_eq!(
+            container_of_cgroup(
+                "12:pids:/docker/00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff"
+            )
+            .as_deref(),
+            Some("docker:00ff00ff00ff")
+        );
+        assert_eq!(
+            container_of_cgroup("0::/user.slice/user-1000.slice/session-2.scope"),
+            None
+        );
+        assert_eq!(container_of_cgroup("0::/system.slice/sshd.service"), None);
     }
 }

@@ -830,22 +830,23 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
         }
     };
     use crate::app::SortBy;
-    let header = Row::new(
-        [
-            mark("PID", app.sort_by == SortBy::Pid),
-            "USER".into(),
-            "DEV".into(),
-            "TYPE".into(),
-            mark("GPU%", app.sort_by == SortBy::GpuUtil),
-            mark("GPU MEM", app.sort_by == SortBy::GpuMem),
-            mark("CPU%", app.sort_by == SortBy::Cpu),
-            mark("HOST MEM", app.sort_by == SortBy::HostMem),
-            "COMMAND".into(),
-        ]
-        .into_iter()
-        .map(Cell::from),
-    )
-    .style(t.title);
+    // CONTAINER column only when any visible row is containerized.
+    let show_container = app.procs.iter().any(|p| p.container.is_some());
+    let mut header_cells = vec![
+        mark("PID", app.sort_by == SortBy::Pid),
+        "USER".into(),
+        "DEV".into(),
+        "TYPE".into(),
+        mark("GPU%", app.sort_by == SortBy::GpuUtil),
+        mark("GPU MEM", app.sort_by == SortBy::GpuMem),
+        mark("CPU%", app.sort_by == SortBy::Cpu),
+        mark("HOST MEM", app.sort_by == SortBy::HostMem),
+    ];
+    if show_container {
+        header_cells.push("CONTAINER".into());
+    }
+    header_cells.push("COMMAND".into());
+    let header = Row::new(header_cells.into_iter().map(Cell::from)).style(t.title);
 
     let proc_sel = app.proc_sel;
     let selection = t.selection;
@@ -858,7 +859,7 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 Style::default()
             };
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(p.pid.to_string()),
                 Cell::from(p.user.clone()),
                 Cell::from(p.gpu_index.to_string()),
@@ -871,27 +872,31 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
                 Cell::from(format!("{}MiB", p.gpu_mem_bytes / 1024 / 1024)),
                 Cell::from(format!("{:>3.0}%", p.cpu_pct)),
                 Cell::from(format!("{}MiB", p.host_mem_bytes / 1024 / 1024)),
-                Cell::from(p.command.clone()),
-            ])
-            .style(row_style)
+            ];
+            if show_container {
+                cells.push(Cell::from(
+                    p.container.clone().unwrap_or_else(|| "-".into()),
+                ));
+            }
+            cells.push(Cell::from(p.command.clone()));
+            Row::new(cells).style(row_style)
         });
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(8),
-            Constraint::Length(10),
-            Constraint::Length(3),
-            Constraint::Length(8),
-            Constraint::Length(5),
-            Constraint::Length(9),
-            Constraint::Length(5),
-            Constraint::Length(9),
-            Constraint::Fill(1),
-        ],
-    )
-    .header(header)
-    .block(block);
+    let mut widths = vec![
+        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Length(3),
+        Constraint::Length(8),
+        Constraint::Length(5),
+        Constraint::Length(9),
+        Constraint::Length(5),
+        Constraint::Length(9),
+    ];
+    if show_container {
+        widths.push(Constraint::Length(19));
+    }
+    widths.push(Constraint::Fill(1));
+    let table = Table::new(rows, widths).header(header).block(block);
     frame.render_widget(table, area);
 
     if max_scroll > 0 {
