@@ -48,23 +48,56 @@ pub fn draw(frame: &mut Frame, app: &App) {
             gpus_area,
         );
     } else {
-        let rows = Layout::vertical(
-            app.gpus
-                .iter()
-                .map(|_| Constraint::Ratio(1, app.gpus.len() as u32)),
-        )
+        let rows = Layout::vertical(app.gpus.iter().enumerate().map(|(i, _)| {
+            if app.folded.contains(&i) {
+                Constraint::Length(1)
+            } else {
+                Constraint::Fill(1)
+            }
+        }))
         .split(gpus_area);
         for (i, gpu) in app.gpus.iter().enumerate() {
-            draw_gpu(frame, rows[i], app, gpu, i);
+            if app.folded.contains(&i) {
+                draw_gpu_folded(frame, rows[i], app, gpu, i);
+            } else {
+                draw_gpu(frame, rows[i], app, gpu, i);
+            }
         }
     }
 
     draw_processes(frame, proc_area, app);
 
     frame.render_widget(
-        Paragraph::new(" q quit  p pause  j/k select  +/- poll rate").style(t.dim),
+        Paragraph::new(" q quit  p pause  j/k select  0-9 fold  +/- poll rate").style(t.dim),
         footer,
     );
+}
+
+/// One-line summary for a folded GPU card: `▸ 0·name  GPU 3%  MEM 8G/24G ...`
+fn draw_gpu_folded(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: usize) {
+    let t = &app.theme;
+    let selected = idx == app.selected;
+    let marker = if selected { t.border_selected } else { t.dim };
+    let mut line = vec![
+        Span::styled(" ▸ ", marker),
+        Span::styled(format!("{idx}·{}  ", gpu.name), t.title),
+        Span::styled(format!("GPU {:>3.0}%  ", gpu.utilization_pct), t.spark_util),
+        Span::styled(
+            format!(
+                "MEM {}/{}  ",
+                human_bytes(gpu.vram_used_bytes),
+                human_bytes(gpu.vram_total_bytes)
+            ),
+            Style::new().fg(t.accent),
+        ),
+    ];
+    if let Some(c) = gpu.temperature_c {
+        line.push(Span::styled(format!("{c:.0}°C  "), t.temp_style(c)));
+    }
+    if let Some(w) = gpu.power_w {
+        line.push(Span::styled(format!("{w:.0}W  "), t.spark_power));
+    }
+    frame.render_widget(Paragraph::new(Line::from(line)), area);
 }
 
 /// btop-style border caption: `┐ text ┌` sitting in the border line.

@@ -57,6 +57,8 @@ pub struct App {
     pub splash_path: Vec<(u8, u8, char)>,
     pub splash_skipped: bool,
     pub procs: Vec<ProcRow>,
+    /// GPU indices folded to a one-line summary (digit keys toggle).
+    pub folded: std::collections::HashSet<usize>,
     sys: System,
     users: Users,
 }
@@ -82,6 +84,7 @@ impl App {
             splash_path: crate::splash::build_path(),
             splash_skipped: no_splash,
             procs: Vec::new(),
+            folded: std::collections::HashSet::new(),
             sys: System::new(),
             users: Users::new_with_refreshed_list(),
         }
@@ -183,6 +186,11 @@ impl App {
             }
             Action::TickFaster => self.tick_ms = (self.tick_ms / 2).max(100),
             Action::TickSlower => self.tick_ms = (self.tick_ms * 2).min(10_000),
+            Action::ToggleFold(i) => {
+                if i < self.gpus.len() && !self.folded.remove(&i) {
+                    self.folded.insert(i);
+                }
+            }
         }
         false
     }

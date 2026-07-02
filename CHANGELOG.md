@@ -10,6 +10,8 @@ and this project adheres to
 
 ### Added
 
+- Digit keys 0-9 fold/unfold a GPU card to a one-line summary
+  (`▸ 0·name GPU% MEM temp power`); remaining cards absorb the space.
 - btop-inspired chrome: `┐caption┌` titles embedded in borders (GPU name left,
   PCIe/integrated right, process count on the table), `■■■·····` meters with
   position gradient replacing the gauges, inline 5-cell braille mini-sparks next

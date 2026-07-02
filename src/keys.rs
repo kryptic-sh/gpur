@@ -16,6 +16,7 @@ pub enum Action {
     PrevGpu,
     TickFaster,
     TickSlower,
+    ToggleFold(usize),
 }
 
 pub fn default_keymap() -> Keymap<Action, Mode> {
@@ -35,6 +36,15 @@ pub fn default_keymap() -> Keymap<Action, Mode> {
     for (chord, action, desc) in binds {
         km.add(Mode::Normal, chord, action.clone(), desc)
             .expect("static chord parses");
+    }
+    for d in 0..10usize {
+        km.add(
+            Mode::Normal,
+            &d.to_string(),
+            Action::ToggleFold(d),
+            "fold/unfold GPU card",
+        )
+        .expect("static chord parses");
     }
     km
 }
