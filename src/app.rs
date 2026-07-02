@@ -12,6 +12,7 @@ pub struct History {
     pub util: Vec<u64>,
     pub vram: Vec<u64>,
     pub power: Vec<u64>,
+    pub temp: Vec<u64>,
 }
 
 /// Full command line like nvtop; falls back to the process name for
@@ -103,11 +104,14 @@ impl App {
             hist.util.push(gpu.utilization_pct.round() as u64);
             hist.vram.push(gpu.vram_pct().round() as u64);
             hist.power.push(gpu.power_w.unwrap_or(0.0).round() as u64);
+            hist.temp
+                .push(gpu.temperature_c.unwrap_or(0.0).round() as u64);
             let overflow = hist.util.len().saturating_sub(self.history_len);
             if overflow > 0 {
                 hist.util.drain(..overflow);
                 hist.vram.drain(..overflow);
                 hist.power.drain(..overflow);
+                hist.temp.drain(..overflow);
             }
         }
         self.refresh_processes();

@@ -13,7 +13,6 @@ pub struct UiTheme {
     pub border_selected: Style,
     pub title: Style,
     pub dim: Style,
-    pub gauge_util: Style,
     pub gauge_vram: Style,
     pub spark_util: Style,
     pub spark_power: Style,
@@ -59,7 +58,6 @@ impl UiTheme {
                 .fg(accent.to_ratatui())
                 .add_modifier(Modifier::BOLD),
             dim: Style::new().fg(dim.to_ratatui()),
-            gauge_util: Style::new().fg(green.to_ratatui()),
             gauge_vram: Style::new().fg(blue.to_ratatui()),
             spark_util: Style::new().fg(green.to_ratatui()),
             spark_power: Style::new().fg(teal.to_ratatui()),
@@ -68,6 +66,24 @@ impl UiTheme {
             temp_crit: Style::new().fg(red.to_ratatui()),
             accent: accent.to_ratatui(),
         }
+    }
+
+    /// Gradient stops for utilization-like meters/graphs: cool at the start,
+    /// hot at the end.
+    pub fn util_stops(&self) -> [(u8, u8, u8); 3] {
+        [
+            rgb_of(self.spark_util.fg, (0xa6, 0xe3, 0xa1)),
+            rgb_of(self.temp_warn.fg, (0xf9, 0xe2, 0xaf)),
+            rgb_of(self.temp_crit.fg, (0xf3, 0x8b, 0xa8)),
+        ]
+    }
+
+    /// Gradient stops for memory meters/graphs.
+    pub fn vram_stops(&self) -> [(u8, u8, u8); 2] {
+        [
+            rgb_of(self.gauge_vram.fg, (0x89, 0xb4, 0xfa)),
+            rgb_of(Some(self.accent), (0xcb, 0xa6, 0xf7)),
+        ]
     }
 
     pub fn temp_style(&self, c: f64) -> Style {
@@ -79,6 +95,23 @@ impl UiTheme {
             self.temp_ok
         }
     }
+}
+
+pub fn rgb_of(c: Option<RColor>, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
+    match c {
+        Some(RColor::Rgb(r, g, b)) => (r, g, b),
+        _ => fallback,
+    }
+}
+
+/// Piecewise-linear interpolation through `stops` at `frac` in 0..=1.
+pub fn gradient(stops: &[(u8, u8, u8)], frac: f64) -> RColor {
+    let seg = frac.clamp(0.0, 1.0) * (stops.len() - 1) as f64;
+    let i = (seg.floor() as usize).min(stops.len().saturating_sub(2));
+    let f = seg - i as f64;
+    let (a, b) = (stops[i], stops[i + 1]);
+    let lerp = |x: u8, y: u8| -> u8 { (x as f64 + (y as f64 - x as f64) * f).round() as u8 };
+    RColor::Rgb(lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
 }
 
 fn pal(t: &Theme, names: &[&str], fallback: Color) -> Color {

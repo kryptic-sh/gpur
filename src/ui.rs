@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, Gauge, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -67,29 +67,39 @@ pub fn draw(frame: &mut Frame, app: &App) {
     );
 }
 
+/// btop-style border caption: `┐ text ┌` sitting in the border line.
+fn caption<'a>(text: String, text_style: Style, border: Style) -> Line<'a> {
+    Line::from(vec![
+        Span::styled("┐", border),
+        Span::styled(text, text_style),
+        Span::styled("┌", border),
+    ])
+}
+
 fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: usize) {
     let t = &app.theme;
     let selected = idx == app.selected;
-    let mut title = vec![Span::styled(format!(" {idx} · {} ", gpu.name), t.title)];
-    if gpu.integrated {
-        title.push(Span::styled("integrated ", t.dim));
-    } else if let (Some(g), Some(width)) = (gpu.pcie_gen, gpu.pcie_width) {
-        title.push(Span::styled(format!("PCIe {g}.0@{width}x "), t.dim));
-    }
-    if let (Some(rx), Some(tx)) = (gpu.pcie_rx_kbs, gpu.pcie_tx_kbs) {
-        title.push(Span::styled(
-            format!("RX {} TX {} ", kbs(rx), kbs(tx)),
-            t.dim,
-        ));
-    }
-    let block = Block::bordered()
+    let border = if selected {
+        t.border_selected
+    } else {
+        t.border
+    };
+
+    let right_text = if gpu.integrated {
+        "integrated".to_string()
+    } else {
+        match (gpu.pcie_gen, gpu.pcie_width) {
+            (Some(g), Some(w)) => format!("PCIe {g}.0@{w}x"),
+            _ => String::new(),
+        }
+    };
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(Line::from(title))
-        .border_style(if selected {
-            t.border_selected
-        } else {
-            t.border
-        });
+        .border_style(border)
+        .title(caption(format!("{idx}·{}", gpu.name), t.title, border));
+    if !right_text.is_empty() {
+        block = block.title_top(caption(right_text, t.dim, border).right_aligned());
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 {
@@ -104,58 +114,146 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
     ])
     .areas(inner);
 
-    frame.render_widget(
-        Gauge::default()
-            .ratio((gpu.utilization_pct / 100.0).clamp(0.0, 1.0))
-            .label(format!("GPU {:>3.0}%", gpu.utilization_pct))
-            .gauge_style(t.gauge_util)
-            .use_unicode(true),
+    let hist = app.history.get(idx);
+    draw_meter(
+        frame,
         util_row,
+        "GPU ",
+        gpu.utilization_pct / 100.0,
+        format!(" {:>3.0}% ", gpu.utilization_pct),
+        &t.util_stops(),
+        t,
     );
-
-    frame.render_widget(
-        Gauge::default()
-            .ratio((gpu.vram_pct() / 100.0).clamp(0.0, 1.0))
-            .label(format!(
-                "VRAM {:.1}/{:.1} GiB",
-                gib(gpu.vram_used_bytes),
-                gib(gpu.vram_total_bytes)
-            ))
-            .gauge_style(t.gauge_vram)
-            .use_unicode(true),
+    draw_meter(
+        frame,
         vram_row,
+        "MEM ",
+        gpu.vram_pct() / 100.0,
+        format!(
+            " {}/{} ",
+            human_bytes(gpu.vram_used_bytes),
+            human_bytes(gpu.vram_total_bytes)
+        ),
+        &t.vram_stops(),
+        t,
     );
 
     if spark_row.height >= 2
-        && let Some(hist) = app.history.get(idx)
+        && let Some(hist) = hist
     {
         draw_waveform(frame, spark_row, &hist.util, &hist.vram, t);
     }
 
-    let mut info: Vec<Span> = Vec::new();
+    let mut info: Vec<Span> = vec![Span::raw(" ")];
     if let Some(c) = gpu.temperature_c {
-        info.push(Span::styled(format!(" {c:.0}°C "), t.temp_style(c)));
+        if let Some(h) = hist {
+            info.push(Span::styled(mini_spark(&h.temp, 100), t.dim));
+        }
+        info.push(Span::styled(format!(" {c:.0}°C  "), t.temp_style(c)));
     }
     if let Some(w) = gpu.power_w {
+        let max_w = gpu.power_limit_w.unwrap_or(0.0).max(w).max(1.0) as u64;
+        if let Some(h) = hist {
+            info.push(Span::styled(mini_spark(&h.power, max_w), t.dim));
+        }
         let limit = gpu
             .power_limit_w
             .map(|l| format!("/{l:.0}"))
             .unwrap_or_default();
-        info.push(Span::styled(format!("⚡{w:.0}{limit}W "), t.spark_power));
+        info.push(Span::styled(format!(" {w:.0}{limit}W  "), t.spark_power));
+    }
+    if let (Some(rx), Some(tx)) = (gpu.pcie_rx_kbs, gpu.pcie_tx_kbs) {
+        info.push(Span::styled(format!("▼{} ▲{}  ", kbs(rx), kbs(tx)), t.dim));
     }
     if let Some(f) = gpu.fan_pct {
-        info.push(Span::styled(format!("fan {f:.0}% "), t.dim));
+        info.push(Span::styled(format!("fan {f:.0}%  "), t.dim));
     }
     if let Some(c) = gpu.clock_mhz {
-        info.push(Span::styled(format!("core {c}MHz "), t.dim));
+        info.push(Span::styled(format!("core {c}MHz  "), t.dim));
     }
     if let Some(m) = gpu.mem_clock_mhz {
-        info.push(Span::styled(format!("mem {m}MHz "), t.dim));
+        info.push(Span::styled(format!("mem {m}MHz  "), t.dim));
     }
     if let Some(mb) = gpu.mem_util_pct {
-        info.push(Span::styled(format!("membus {mb:.0}% "), t.dim));
+        info.push(Span::styled(format!("membus {mb:.0}%  "), t.dim));
     }
     frame.render_widget(Paragraph::new(Line::from(info)), info_row);
+}
+
+/// btop-style meter: `LABEL ■■■■■■■■····  42%` with a position gradient over
+/// the filled squares.
+fn draw_meter(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    frac: f64,
+    value: String,
+    stops: &[(u8, u8, u8)],
+    t: &UiTheme,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let mut spans = vec![Span::styled(label.to_string(), Style::new().fg(t.fg))];
+    let meter_w = (area.width as usize)
+        .saturating_sub(label.chars().count() + value.chars().count())
+        .max(1);
+    let filled = (frac.clamp(0.0, 1.0) * meter_w as f64).round() as usize;
+    for i in 0..meter_w {
+        let pos = if meter_w > 1 {
+            i as f64 / (meter_w - 1) as f64
+        } else {
+            0.0
+        };
+        if i < filled {
+            spans.push(Span::styled(
+                "■",
+                Style::new().fg(crate::theme::gradient(stops, pos)),
+            ));
+        } else {
+            spans.push(Span::styled("·", t.dim));
+        }
+    }
+    spans.push(Span::styled(value, Style::new().fg(t.fg)));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Five-cell inline braille sparkline of the last ten samples, scaled to
+/// `max` — the `⣀⣀⣀⣠⣤` blips btop puts next to temps and power draws.
+fn mini_spark(data: &[u64], max: u64) -> String {
+    const CELLS: usize = 5;
+    let n = CELLS * 2;
+    let max = max.max(1);
+    let mut out = String::with_capacity(CELLS * 3);
+    for c in 0..CELLS {
+        let mut bits = 0u8;
+        for (s, bit_col) in DOT_BITS.iter().enumerate() {
+            let i = c * 2 + s;
+            let v = if data.len() >= n {
+                data[data.len() - n + i]
+            } else {
+                let pad = n - data.len();
+                if i < pad { 0 } else { data[i - pad] }
+            };
+            let dots = ((v.min(max) as usize * 4).div_ceil(max as usize)).clamp(1, 4);
+            for d in 0..dots {
+                bits |= bit_col[3 - d];
+            }
+        }
+        out.push(char::from_u32(BRAILLE_BASE + bits as u32).unwrap_or('⠀'));
+    }
+    out
+}
+
+fn human_bytes(b: u64) -> String {
+    let g = b as f64 / (1024.0 * 1024.0 * 1024.0);
+    if g >= 10.0 {
+        format!("{g:.0}G")
+    } else if g >= 1.0 {
+        format!("{g:.1}G")
+    } else {
+        format!("{}M", b / 1024 / 1024)
+    }
 }
 
 const BRAILLE_BASE: u32 = 0x2800;
@@ -176,15 +274,8 @@ fn draw_waveform(frame: &mut Frame, area: Rect, up_data: &[u64], down_data: &[u6
     let cols = area.width as usize;
     let n = cols * 2; // braille doubles horizontal resolution
 
-    let up_stops = [
-        rgb_of(t.spark_util.fg, (0xa6, 0xe3, 0xa1)),
-        rgb_of(t.temp_warn.fg, (0xf9, 0xe2, 0xaf)),
-        rgb_of(t.temp_crit.fg, (0xf3, 0x8b, 0xa8)),
-    ];
-    let down_stops = [
-        rgb_of(t.gauge_vram.fg, (0x89, 0xb4, 0xfa)),
-        rgb_of(Some(t.accent), (0xcb, 0xa6, 0xf7)),
-    ];
+    let up_stops = t.util_stops();
+    let down_stops = t.vram_stops();
 
     // Newest sample at the right edge; missing history reads as 0.
     let sample = |data: &[u64], i: usize| -> u64 {
@@ -218,7 +309,7 @@ fn draw_waveform(frame: &mut Frame, area: Rect, up_data: &[u64], down_data: &[u6
             } else {
                 0.0
             };
-            let color = gradient(stops, frac);
+            let color = crate::theme::gradient(stops, frac);
             for cx in 0..cols {
                 let mut bits = 0u8;
                 for (s, bit_col) in DOT_BITS.iter().enumerate() {
@@ -244,30 +335,16 @@ fn draw_waveform(frame: &mut Frame, area: Rect, up_data: &[u64], down_data: &[u6
     buf.set_string(area.x, area.y + area.height - 1, "vram%", t.dim);
 }
 
-fn rgb_of(c: Option<ratatui::style::Color>, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
-    match c {
-        Some(ratatui::style::Color::Rgb(r, g, b)) => (r, g, b),
-        _ => fallback,
-    }
-}
-
-fn gradient(stops: &[(u8, u8, u8)], frac: f64) -> ratatui::style::Color {
-    let seg = frac.clamp(0.0, 1.0) * (stops.len() - 1) as f64;
-    let i = (seg.floor() as usize).min(stops.len().saturating_sub(2));
-    let f = seg - i as f64;
-    let (a, b) = (stops[i], stops[i + 1]);
-    let lerp = |x: u8, y: u8| -> u8 { (x as f64 + (y as f64 - x as f64) * f).round() as u8 };
-    ratatui::style::Color::Rgb(lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
-}
-
 fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     if area.height < 3 {
         return;
     }
+    let shown = (area.height.saturating_sub(3) as usize).min(app.procs.len());
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(Span::styled(" processes ", t.title))
+        .title(caption("processes".into(), t.title, t.border))
+        .title_top(caption(format!("{shown}/{}", app.procs.len()), t.dim, t.border).right_aligned())
         .border_style(t.border);
 
     if app.procs.is_empty() {
@@ -336,8 +413,4 @@ fn kbs(v: u64) -> String {
     } else {
         format!("{v}KiB/s")
     }
-}
-
-fn gib(bytes: u64) -> f64 {
-    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }

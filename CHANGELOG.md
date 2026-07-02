@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Added
 
+- btop-inspired chrome: `┐caption┌` titles embedded in borders (GPU name left,
+  PCIe/integrated right, process count on the table), `■■■·····` meters with
+  position gradient replacing the gauges, inline 5-cell braille mini-sparks next
+  to temp and power, PCIe RX/TX moved to the info line as `▼/▲`.
 - btop-style mirrored braille waveform per GPU: gpu% grows up from the midline,
   vram% mirrors down, vertical color gradient toward the edges (green→yellow→red
   / blue→accent), idle keeps a thin center line; rounded borders on all panes.
