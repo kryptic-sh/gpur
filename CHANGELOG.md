@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-02
+
 ### Added
 
 - Intel Linux backend (i915 + xe): device utilization aggregated from per-client
@@ -98,5 +100,6 @@ and this project adheres to
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.1.0
