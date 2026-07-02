@@ -20,6 +20,8 @@ pub struct UiTheme {
     pub temp_warn: Style,
     pub temp_crit: Style,
     pub accent: RColor,
+    /// Cursor-row highlight for lists.
+    pub selection: Style,
 }
 
 pub fn load(path: Option<&Path>) -> anyhow::Result<UiTheme> {
@@ -65,6 +67,9 @@ impl UiTheme {
             temp_warn: Style::new().fg(yellow.to_ratatui()),
             temp_crit: Style::new().fg(red.to_ratatui()),
             accent: accent.to_ratatui(),
+            selection: Style::new()
+                .bg(pal(t, &["surface1", "surface0"], Color::rgb(0x45, 0x47, 0x5a)).to_ratatui())
+                .add_modifier(Modifier::BOLD),
         }
     }
 

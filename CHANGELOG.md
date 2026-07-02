@@ -10,6 +10,12 @@ and this project adheres to
 
 ### Added
 
+- Process table row cursor: j/k/arrows (and wheel/J/K) move a highlighted row
+  when the pane is focused, viewport follows, click selects a row; highlight
+  uses the theme surface color.
+- Fixed scrollbars: ScrollbarState now gets total item count + viewport length
+  (thumb size/travel were distorted), process track no longer overlaps the
+  header row.
 - Pane focus model: `p` focuses the process list, digits 0-9 focus the GPU list
   and select that GPU (same digit again folds/unfolds), arrows/j/k act on the
   focused pane, left click focuses the pane under the cursor (and selects the

@@ -155,8 +155,11 @@ fn draw_gpus(frame: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
-    let max_scroll = n.saturating_sub(shown);
-    let mut sb = ScrollbarState::new(max_scroll).position(app.gpu_scroll.min(max_scroll));
+    // content_length is the TOTAL item count; the thumb size comes from the
+    // viewport/content ratio.
+    let mut sb = ScrollbarState::new(n)
+        .position(app.gpu_scroll)
+        .viewport_content_length(shown);
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
@@ -469,6 +472,13 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
     let total = app.procs.len();
     let visible = (area.height.saturating_sub(3) as usize).min(total);
     let max_scroll = total - visible;
+    // Viewport follows the cursor row.
+    app.proc_sel = app.proc_sel.min(total.saturating_sub(1));
+    if app.proc_sel < app.proc_scroll {
+        app.proc_scroll = app.proc_sel;
+    } else if visible > 0 && app.proc_sel >= app.proc_scroll + visible {
+        app.proc_scroll = app.proc_sel + 1 - visible;
+    }
     app.proc_scroll = app.proc_scroll.min(max_scroll);
     let counter = if max_scroll > 0 {
         format!(
@@ -511,9 +521,17 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
     )
     .style(t.title);
 
+    let proc_sel = app.proc_sel;
+    let selection = t.selection;
     let rows = app.procs[app.proc_scroll..app.proc_scroll + visible]
         .iter()
-        .map(|p| {
+        .enumerate()
+        .map(|(vi, p)| {
+            let row_style = if app.proc_scroll + vi == proc_sel {
+                selection
+            } else {
+                Style::default()
+            };
             Row::new(vec![
                 Cell::from(p.pid.to_string()),
                 Cell::from(p.user.clone()),
@@ -529,6 +547,7 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
                 Cell::from(format!("{}MiB", p.host_mem_bytes / 1024 / 1024)),
                 Cell::from(p.command.clone()),
             ])
+            .style(row_style)
         });
 
     let table = Table::new(
@@ -550,16 +569,22 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(table, area);
 
     if max_scroll > 0 {
-        let mut sb = ScrollbarState::new(max_scroll).position(app.proc_scroll);
+        // Track spans the data rows only (skip borders + header line).
+        let track = Rect::new(
+            area.x,
+            area.y + 2,
+            area.width,
+            area.height.saturating_sub(3),
+        );
+        let mut sb = ScrollbarState::new(total)
+            .position(app.proc_scroll)
+            .viewport_content_length(visible);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None)
                 .style(app.theme.dim),
-            area.inner(ratatui::layout::Margin {
-                vertical: 1,
-                horizontal: 0,
-            }),
+            track,
             &mut sb,
         );
     }

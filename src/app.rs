@@ -69,6 +69,8 @@ pub struct App {
     pub gpu_scroll: usize,
     /// First visible process row when the table overflows (clamped in draw).
     pub proc_scroll: usize,
+    /// Cursor row in the process table (index into procs).
+    pub proc_sel: usize,
     /// Pane rectangles from the last draw, for routing mouse wheel events.
     pub gpus_rect: ratatui::layout::Rect,
     pub proc_rect: ratatui::layout::Rect,
@@ -104,6 +106,7 @@ impl App {
             folded: std::collections::HashSet::new(),
             gpu_scroll: 0,
             proc_scroll: 0,
+            proc_sel: 0,
             gpus_rect: ratatui::layout::Rect::default(),
             proc_rect: ratatui::layout::Rect::default(),
             focus: Focus::Gpus,
@@ -199,11 +202,11 @@ impl App {
             Action::TogglePause => self.paused = !self.paused,
             Action::NextItem => match self.focus {
                 Focus::Gpus => self.next_gpu(),
-                Focus::Procs => self.proc_scroll = self.proc_scroll.saturating_add(1),
+                Focus::Procs => self.proc_down(),
             },
             Action::PrevItem => match self.focus {
                 Focus::Gpus => self.prev_gpu(),
-                Focus::Procs => self.proc_scroll = self.proc_scroll.saturating_sub(1),
+                Focus::Procs => self.proc_up(),
             },
             Action::NextGpu => self.next_gpu(),
             Action::PrevGpu => self.prev_gpu(),
@@ -223,10 +226,18 @@ impl App {
                 }
             }
             Action::FocusProcs => self.focus = Focus::Procs,
-            Action::ProcScrollDown => self.proc_scroll = self.proc_scroll.saturating_add(1),
-            Action::ProcScrollUp => self.proc_scroll = self.proc_scroll.saturating_sub(1),
+            Action::ProcScrollDown => self.proc_down(),
+            Action::ProcScrollUp => self.proc_up(),
         }
         false
+    }
+
+    fn proc_down(&mut self) {
+        self.proc_sel = (self.proc_sel + 1).min(self.procs.len().saturating_sub(1));
+    }
+
+    fn proc_up(&mut self) {
+        self.proc_sel = self.proc_sel.saturating_sub(1);
     }
 
     fn next_gpu(&mut self) {

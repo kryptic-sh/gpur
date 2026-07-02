@@ -102,6 +102,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                         }
                         MouseEventKind::Down(MouseButton::Left) if in_procs => {
                             app.focus = Focus::Procs;
+                            // Rows start after the top border + header line.
+                            let first_row_y = app.proc_rect.y + 2;
+                            if m.row >= first_row_y {
+                                let clicked = app.proc_scroll + (m.row - first_row_y) as usize;
+                                if clicked < app.procs.len() {
+                                    app.proc_sel = clicked;
+                                }
+                            }
                             None
                         }
                         MouseEventKind::Down(MouseButton::Left) if in_gpus => {
