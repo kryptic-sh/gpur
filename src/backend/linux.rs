@@ -32,18 +32,20 @@ impl FdClient {
         self.engine_ns.values().sum()
     }
 
-    /// Busiest xe engine utilization for the cycle deltas between `prev`
-    /// and `self`, as a fraction 0..=1.
-    pub fn xe_util_since(&self, prev: &FdClient) -> Option<f64> {
-        let mut best: Option<f64> = None;
+    /// Busiest matching xe engine's cycles/total-cycles ratio since `prev`,
+    /// as a fraction 0..=1. `pred` filters by engine name.
+    pub fn xe_ratio(&self, prev: &FdClient, pred: impl Fn(&str) -> bool) -> f64 {
+        let mut best = 0.0f64;
         for (name, (cyc, total)) in &self.cycles {
+            if !pred(name) {
+                continue;
+            }
             let (pcyc, ptotal) = prev.cycles.get(name).copied().unwrap_or((0, 0));
             let dt = total.saturating_sub(ptotal);
             if dt == 0 {
                 continue;
             }
-            let f = cyc.saturating_sub(pcyc) as f64 / dt as f64;
-            best = Some(best.map_or(f, |b: f64| b.max(f)));
+            best = best.max(cyc.saturating_sub(pcyc) as f64 / dt as f64);
         }
         best
     }
@@ -290,10 +292,11 @@ drm-resident-vram0:\t4096 KiB
         let prev = parse_fdinfo(XE_FDINFO).unwrap();
         let mut cur = parse_fdinfo(XE_FDINFO).unwrap();
         cur.cycles.insert("rcs".into(), (800, 2000));
-        cur.cycles.insert("vcs".into(), (10, 2000));
-        // rcs: (800-500)/(2000-1000) = 0.3 ; vcs: 0/1000 = 0 -> max 0.3
-        let u = cur.xe_util_since(&prev).unwrap();
-        assert!((u - 0.3).abs() < 1e-9);
+        cur.cycles.insert("vcs".into(), (110, 2000));
+        // rcs: (800-500)/(2000-1000) = 0.3 ; vcs: (110-10)/1000 = 0.1
+        assert!((cur.xe_ratio(&prev, |_| true) - 0.3).abs() < 1e-9);
+        // video-only filter picks the vcs engine
+        assert!((cur.xe_ratio(&prev, |n| n.starts_with("vcs")) - 0.1).abs() < 1e-9);
         assert_eq!(cur.memory["vram0"], 4096 * 1024);
     }
 

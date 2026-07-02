@@ -23,6 +23,14 @@ pub struct GpuSnapshot {
     pub utilization_pct: f64,
     /// Memory-controller busy %, distinct from VRAM fill level.
     pub mem_util_pct: Option<f64>,
+    /// Video engine busy % — unified (VCN/media) engines report here.
+    pub video_util_pct: Option<f64>,
+    /// Split encoder/decoder utilization where the vendor separates them.
+    pub enc_util_pct: Option<f64>,
+    pub dec_util_pct: Option<f64>,
+    /// Active clock-throttle cause ("thermal", "power-limit", ...), when
+    /// known or confidently derivable.
+    pub throttle: Option<String>,
     pub vram_used_bytes: u64,
     pub vram_total_bytes: u64,
     pub temperature_c: Option<f64>,

@@ -127,9 +127,17 @@ mod win {
                     }
                 }
             }
-            // Busiest engine type per adapter = Task Manager's GPU %.
+            // Busiest engine type per adapter = Task Manager's GPU %; the
+            // video engine types feed the enc/dec readouts.
             let mut util_by_luid: HashMap<String, f64> = HashMap::new();
-            for ((luid, _), v) in engine {
+            let mut enc_by_luid: HashMap<String, f64> = HashMap::new();
+            let mut dec_by_luid: HashMap<String, f64> = HashMap::new();
+            for ((luid, eng), v) in engine {
+                if eng.contains("videoencode") {
+                    *enc_by_luid.entry(luid.clone()).or_default() += v;
+                } else if eng.contains("videodecode") {
+                    *dec_by_luid.entry(luid.clone()).or_default() += v;
+                }
                 let e = util_by_luid.entry(luid).or_default();
                 *e = e.max(v);
             }
@@ -230,6 +238,8 @@ mod win {
                             .copied()
                             .unwrap_or(0.0)
                             .clamp(0.0, 100.0),
+                        enc_util_pct: enc_by_luid.get(&a.luid_key).map(|v| v.clamp(0.0, 100.0)),
+                        dec_util_pct: dec_by_luid.get(&a.luid_key).map(|v| v.clamp(0.0, 100.0)),
                         vram_used_bytes: used,
                         vram_total_bytes: a.vram_total,
                         ..Default::default()

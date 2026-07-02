@@ -366,6 +366,9 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
     }
 
     let mut info: Vec<Span> = vec![Span::raw(" ")];
+    if let Some(reason) = &gpu.throttle {
+        info.push(Span::styled(format!("⚠{reason}  "), t.temp_crit));
+    }
     if let Some(c) = gpu.temperature_c {
         if let Some(h) = hist {
             info.push(Span::styled(
@@ -403,6 +406,15 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
     }
     if let Some(mb) = gpu.mem_util_pct {
         info.push(Span::styled(format!("membus {mb:.0}%  "), t.dim));
+    }
+    if let Some(v) = gpu.video_util_pct {
+        info.push(Span::styled(format!("video {v:.0}%  "), t.dim));
+    }
+    if let Some(e) = gpu.enc_util_pct {
+        info.push(Span::styled(format!("enc {e:.0}%  "), t.dim));
+    }
+    if let Some(d) = gpu.dec_util_pct {
+        info.push(Span::styled(format!("dec {d:.0}%  "), t.dim));
     }
     frame.render_widget(Paragraph::new(Line::from(info)), info_row);
 }

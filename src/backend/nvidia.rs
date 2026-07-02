@@ -4,6 +4,7 @@
 use super::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind};
 use anyhow::Result;
 use nvml_wrapper::Nvml;
+use nvml_wrapper::bitmasks::device::ThrottleReasons;
 use nvml_wrapper::enum_wrappers::device::{Clock, PcieUtilCounter, TemperatureSensor};
 use nvml_wrapper::enums::device::UsedGpuMemory;
 use nvml_wrapper::struct_wrappers::device::ProcessInfo;
@@ -47,6 +48,10 @@ impl GpuBackend for NvmlBackend {
                 integrated: false,
                 utilization_pct: util.as_ref().map(|u| u.gpu as f64).unwrap_or(0.0),
                 mem_util_pct: util.as_ref().map(|u| u.memory as f64),
+                video_util_pct: None,
+                enc_util_pct: dev.encoder_utilization().ok().map(|u| u.utilization as f64),
+                dec_util_pct: dev.decoder_utilization().ok().map(|u| u.utilization as f64),
+                throttle: dev.current_throttle_reasons().ok().and_then(throttle_label),
                 vram_used_bytes: memory.as_ref().map(|m| m.used).unwrap_or(0),
                 vram_total_bytes: memory.as_ref().map(|m| m.total).unwrap_or(0),
                 temperature_c: dev
@@ -106,6 +111,26 @@ impl GpuBackend for NvmlBackend {
             }));
         }
         out
+    }
+}
+
+/// Collapse NVML's throttle bitmask into a short human label; idle and
+/// applications-clocks states aren't interesting throttles.
+fn throttle_label(r: ThrottleReasons) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    if r.intersects(ThrottleReasons::SW_THERMAL_SLOWDOWN | ThrottleReasons::HW_THERMAL_SLOWDOWN) {
+        parts.push("thermal");
+    }
+    if r.intersects(ThrottleReasons::SW_POWER_CAP | ThrottleReasons::HW_POWER_BRAKE_SLOWDOWN) {
+        parts.push("power-limit");
+    }
+    if r.contains(ThrottleReasons::HW_SLOWDOWN) {
+        parts.push("hw-slowdown");
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("+"))
     }
 }
 

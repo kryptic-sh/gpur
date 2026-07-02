@@ -58,8 +58,8 @@ mod linux_impl {
 
     struct IntelBackend {
         devices: Vec<IntelDevice>,
-        /// (pid, client-id) -> cumulative engine ns (i915 accounting).
-        i915_state: HashMap<(u32, u64), (u64, Instant)>,
+        /// (pid, client-id) -> (total ns, video ns) (i915 accounting).
+        i915_state: HashMap<(u32, u64), (u64, u64, Instant)>,
         /// (pid, client-id) -> last cycles snapshot (xe accounting).
         xe_state: HashMap<(u32, u64), FdClient>,
         /// gpu index -> (energy µJ, at) for power-from-energy deltas.
@@ -75,7 +75,7 @@ mod linux_impl {
 
         fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
             // One fdinfo sweep feeds device utilization AND the process table.
-            let (mut device_util, mut device_mem, procs) = self.sweep_clients();
+            let (mut device_util, mut device_mem, mut device_video, procs) = self.sweep_clients();
             self.last_procs = procs;
 
             let now = Instant::now();
@@ -94,6 +94,10 @@ mod linux_impl {
                         integrated: d.integrated,
                         utilization_pct: device_util.remove(&i).unwrap_or(0.0).clamp(0.0, 100.0),
                         mem_util_pct: None,
+                        video_util_pct: device_video.remove(&i).map(|v| v.clamp(0.0, 100.0)),
+                        enc_util_pct: None,
+                        dec_util_pct: None,
+                        throttle: None,
                         // No total VRAM in sysfs for iGPUs; report the summed
                         // client-resident local memory as "used".
                         vram_used_bytes: device_mem.remove(&i).unwrap_or(0),
@@ -128,10 +132,17 @@ mod linux_impl {
 
     impl IntelBackend {
         /// Scan all processes' Intel DRM clients once. Returns per-device
-        /// utilization (sum of client utils), per-device local-memory bytes,
-        /// and the process rows.
+        /// utilization (sum of client utils), local-memory bytes, video
+        /// engine utilization, and the process rows.
         #[allow(clippy::type_complexity)]
-        fn sweep_clients(&mut self) -> (HashMap<usize, f64>, HashMap<usize, u64>, Vec<GpuProcess>) {
+        fn sweep_clients(
+            &mut self,
+        ) -> (
+            HashMap<usize, f64>,
+            HashMap<usize, u64>,
+            HashMap<usize, f64>,
+            Vec<GpuProcess>,
+        ) {
             let pdev_to_gpu: HashMap<String, usize> = self
                 .devices
                 .iter()
@@ -147,9 +158,13 @@ mod linux_impl {
 
             let mut device_util: HashMap<usize, f64> = HashMap::new();
             let mut device_mem: HashMap<usize, u64> = HashMap::new();
+            let mut device_video: HashMap<usize, f64> = HashMap::new();
             let mut agg: HashMap<(u32, usize), (f64, u64, bool)> = HashMap::new();
             let mut seen: HashSet<(u32, u64)> = HashSet::new();
             let now = Instant::now();
+            // i915 names media engines "video"/"video-enhance"; xe "vcs"/"vecs".
+            let is_video =
+                |k: &str| k.starts_with("video") || k.starts_with("vcs") || k.starts_with("vecs");
 
             for pid in linux::proc_pids() {
                 for driver in ["i915", "xe"] {
@@ -165,30 +180,47 @@ mod linux_impl {
                             continue;
                         }
 
-                        let util = if driver == "xe" {
-                            let prev = self.xe_state.get(&(pid, client.id));
-                            let u =
-                                prev.and_then(|p| client.xe_util_since(p)).unwrap_or(0.0) * 100.0;
+                        let (util, vutil) = if driver == "xe" {
+                            let (u, v) = match self.xe_state.get(&(pid, client.id)) {
+                                Some(prev) => (
+                                    client.xe_ratio(prev, |_| true) * 100.0,
+                                    client.xe_ratio(prev, is_video) * 100.0,
+                                ),
+                                None => (0.0, 0.0),
+                            };
                             self.xe_state
                                 .insert((pid, client.id), client_snapshot(&client));
-                            u
+                            (u, v)
                         } else {
                             let engine_ns = client.total_engine_ns();
-                            let u = match self.i915_state.get(&(pid, client.id)) {
-                                Some((prev_ns, prev_at)) => {
+                            let video_ns: u64 = client
+                                .engine_ns
+                                .iter()
+                                .filter(|(k, _)| is_video(k))
+                                .map(|(_, v)| *v)
+                                .sum();
+                            let (u, v) = match self.i915_state.get(&(pid, client.id)) {
+                                Some((prev_ns, prev_video, prev_at)) => {
                                     let wall = now.duration_since(*prev_at).as_nanos() as f64;
                                     if wall > 0.0 {
-                                        engine_ns.saturating_sub(*prev_ns) as f64 / wall * 100.0
+                                        (
+                                            engine_ns.saturating_sub(*prev_ns) as f64 / wall
+                                                * 100.0,
+                                            video_ns.saturating_sub(*prev_video) as f64 / wall
+                                                * 100.0,
+                                        )
                                     } else {
-                                        0.0
+                                        (0.0, 0.0)
                                     }
                                 }
-                                None => 0.0,
+                                None => (0.0, 0.0),
                             };
-                            self.i915_state.insert((pid, client.id), (engine_ns, now));
-                            u
-                        }
-                        .clamp(0.0, 100.0);
+                            self.i915_state
+                                .insert((pid, client.id), (engine_ns, video_ns, now));
+                            (u, v)
+                        };
+                        let util = util.clamp(0.0, 100.0);
+                        let vutil = vutil.clamp(0.0, 100.0);
 
                         // "local*"/"vram*" = device memory (dGPU); ignore
                         // system/gtt so iGPU numbers don't count plain RAM.
@@ -203,6 +235,7 @@ mod linux_impl {
 
                         *device_util.entry(gpu).or_default() += util;
                         *device_mem.entry(gpu).or_default() += mem;
+                        *device_video.entry(gpu).or_default() += vutil;
                         let e = agg.entry((pid, gpu)).or_insert((0.0, 0, false));
                         e.0 += util;
                         e.1 += mem;
@@ -228,7 +261,7 @@ mod linux_impl {
                     gpu_mem_bytes: mem,
                 })
                 .collect();
-            (device_util, device_mem, procs)
+            (device_util, device_mem, device_video, procs)
         }
 
         /// Watts from the hwmon cumulative energy counter (µJ) delta, with a
@@ -249,7 +282,7 @@ mod linux_impl {
         }
     }
 
-    /// Keep only what xe_util_since needs from a client.
+    /// Keep only what the cycle-ratio math needs from a client.
     fn client_snapshot(c: &FdClient) -> FdClient {
         FdClient {
             cycles: c.cycles.clone(),

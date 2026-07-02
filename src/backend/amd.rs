@@ -33,6 +33,7 @@ mod linux_impl {
         Some(Box::new(AmdBackend {
             devices,
             engine_state: HashMap::new(),
+            last_procs: Vec::new(),
         }))
     }
 
@@ -42,12 +43,25 @@ mod linux_impl {
         hwmon: Option<PathBuf>,
         /// PCI address ("0000:75:00.0"), matched against fdinfo drm-pdev.
         pdev: Option<String>,
+        /// Critical edge temperature (°C), for the throttle heuristic.
+        temp_crit_c: Option<f64>,
     }
 
     struct AmdBackend {
         devices: Vec<AmdDevice>,
-        /// (pid, drm-client-id) -> cumulative engine ns at last scan.
-        engine_state: HashMap<(u32, u64), (u64, Instant)>,
+        /// (pid, drm-client-id) -> (total engine ns, video engine ns) at last scan.
+        engine_state: HashMap<(u32, u64), (u64, u64, Instant)>,
+        /// Built during poll's fdinfo sweep, served by processes().
+        last_procs: Vec<GpuProcess>,
+    }
+
+    /// VCN/media engines in amdgpu fdinfo naming.
+    fn is_video_engine(name: &str) -> bool {
+        name.starts_with("dec")
+            || name.starts_with("enc")
+            || name.starts_with("jpeg")
+            || name.starts_with("vcn")
+            || name.starts_with("vpe")
     }
 
     impl GpuBackend for AmdBackend {
@@ -56,10 +70,25 @@ mod linux_impl {
         }
 
         fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
-            Ok(self.devices.iter().map(sample).collect())
+            // One fdinfo sweep per poll: per-process rows + device video util
+            // (sysfs has gpu_busy_percent but nothing for the VCN engines).
+            let video_util = self.sweep_clients();
+            Ok(self
+                .devices
+                .iter()
+                .enumerate()
+                .map(|(i, d)| sample(d, video_util.get(&i).copied()))
+                .collect())
         }
 
         fn processes(&mut self) -> Vec<GpuProcess> {
+            self.last_procs.clone()
+        }
+    }
+
+    impl AmdBackend {
+        /// Returns per-device video-engine utilization; refreshes last_procs.
+        fn sweep_clients(&mut self) -> HashMap<usize, f64> {
             let pdev_to_gpu: HashMap<&str, usize> = self
                 .devices
                 .iter()
@@ -69,6 +98,7 @@ mod linux_impl {
 
             // (pid, gpu) -> aggregated stats across that process's DRM clients.
             let mut agg: HashMap<(u32, usize), (f64, u64, bool)> = HashMap::new();
+            let mut video_util: HashMap<usize, f64> = HashMap::new();
             let mut seen_clients: HashSet<(u32, u64)> = HashSet::new();
             let now = Instant::now();
 
@@ -82,20 +112,32 @@ mod linux_impl {
                         continue;
                     }
                     let engine_ns = client.total_engine_ns();
-                    let util = match self.engine_state.get(&(pid, client.id)) {
-                        Some((prev_ns, prev_at)) => {
+                    let video_ns: u64 = client
+                        .engine_ns
+                        .iter()
+                        .filter(|(k, _)| is_video_engine(k))
+                        .map(|(_, v)| *v)
+                        .sum();
+                    let (util, vutil) = match self.engine_state.get(&(pid, client.id)) {
+                        Some((prev_ns, prev_video, prev_at)) => {
                             let wall = now.duration_since(*prev_at).as_nanos() as f64;
                             if wall > 0.0 {
-                                (engine_ns.saturating_sub(*prev_ns) as f64 / wall * 100.0)
-                                    .clamp(0.0, 100.0)
+                                (
+                                    (engine_ns.saturating_sub(*prev_ns) as f64 / wall * 100.0)
+                                        .clamp(0.0, 100.0),
+                                    (video_ns.saturating_sub(*prev_video) as f64 / wall * 100.0)
+                                        .clamp(0.0, 100.0),
+                                )
                             } else {
-                                0.0
+                                (0.0, 0.0)
                             }
                         }
-                        None => 0.0,
+                        None => (0.0, 0.0),
                     };
-                    self.engine_state.insert((pid, client.id), (engine_ns, now));
+                    self.engine_state
+                        .insert((pid, client.id), (engine_ns, video_ns, now));
 
+                    *video_util.entry(gpu).or_default() += vutil;
                     let e = agg.entry((pid, gpu)).or_insert((0.0, 0, false));
                     e.0 += util;
                     e.1 += client.memory.get("vram").copied().unwrap_or(0);
@@ -106,7 +148,8 @@ mod linux_impl {
             // Forget clients that vanished so the map doesn't grow forever.
             self.engine_state.retain(|k, _| seen_clients.contains(k));
 
-            agg.into_iter()
+            self.last_procs = agg
+                .into_iter()
                 .map(|((pid, gpu_index), (util, vram, graphics))| GpuProcess {
                     pid,
                     gpu_index,
@@ -118,7 +161,8 @@ mod linux_impl {
                     gpu_util_pct: Some(util.min(100.0)),
                     gpu_mem_bytes: vram,
                 })
-                .collect()
+                .collect();
+            video_util
         }
     }
 
@@ -129,36 +173,68 @@ mod linux_impl {
                 let name = card_name(&dev, idx, "1002", "AMD");
                 let hwmon = first_dir(&dev.join("hwmon"));
                 let pdev = pdev_of(&dev);
+                let temp_crit_c = hwmon
+                    .as_deref()
+                    .and_then(|h| read_u64(&h.join("temp1_crit")))
+                    .map(|v| v as f64 / 1000.0);
                 AmdDevice {
                     name,
                     dev,
                     hwmon,
                     pdev,
+                    temp_crit_c,
                 }
             })
             .collect()
     }
 
-    fn sample(d: &AmdDevice) -> GpuSnapshot {
+    fn sample(d: &AmdDevice, video_util: Option<f64>) -> GpuSnapshot {
         let h = d.hwmon.as_deref();
+        let temperature_c = hwmon_u64(h, "temp1_input").map(|v| v as f64 / 1000.0);
+        let power_w = hwmon_u64(h, "power1_average")
+            .or_else(|| hwmon_u64(h, "power1_input"))
+            .map(|v| v as f64 / 1e6);
+        let power_limit_w = hwmon_u64(h, "power1_cap")
+            .filter(|v| *v > 0)
+            .or_else(|| hwmon_u64(h, "power1_cap_default").filter(|v| *v > 0))
+            .map(|v| v as f64 / 1e6);
+
+        // Heuristic (amdgpu's real throttle bits live in the versioned
+        // gpu_metrics blob): flag when pinned at the power cap or within a
+        // few degrees of the critical temperature.
+        let mut throttle_parts: Vec<&str> = Vec::new();
+        if let (Some(t), Some(crit)) = (temperature_c, d.temp_crit_c)
+            && t >= crit - 3.0
+        {
+            throttle_parts.push("thermal");
+        }
+        if let (Some(w), Some(cap)) = (power_w, power_limit_w)
+            && w >= cap * 0.99
+        {
+            throttle_parts.push("power-limit");
+        }
+        let throttle = if throttle_parts.is_empty() {
+            None
+        } else {
+            Some(throttle_parts.join("+"))
+        };
+
         GpuSnapshot {
             name: d.name.clone(),
             integrated: is_apu(&d.dev),
             utilization_pct: read_u64(&d.dev.join("gpu_busy_percent")).unwrap_or(0) as f64,
             mem_util_pct: read_u64(&d.dev.join("mem_busy_percent")).map(|v| v as f64),
+            video_util_pct: video_util.map(|v| v.min(100.0)),
+            enc_util_pct: None,
+            dec_util_pct: None,
+            throttle,
             vram_used_bytes: read_u64(&d.dev.join("mem_info_vram_used")).unwrap_or(0),
             vram_total_bytes: read_u64(&d.dev.join("mem_info_vram_total")).unwrap_or(0),
-            // Millidegrees C. temp1 is the "edge" sensor on amdgpu.
-            temperature_c: hwmon_u64(h, "temp1_input").map(|v| v as f64 / 1000.0),
-            // Microwatts; power1_average is absent on APUs (power1_input instead).
-            power_w: hwmon_u64(h, "power1_average")
-                .or_else(|| hwmon_u64(h, "power1_input"))
-                .map(|v| v as f64 / 1e6),
-            // A cap of 0 means "not reporting" (seen on idle Navi 31), not 0 W.
-            power_limit_w: hwmon_u64(h, "power1_cap")
-                .filter(|v| *v > 0)
-                .or_else(|| hwmon_u64(h, "power1_cap_default").filter(|v| *v > 0))
-                .map(|v| v as f64 / 1e6),
+            // temp1 = edge sensor (millidegrees); power in microwatts with
+            // the APU fallback and cap-of-0 handling done above.
+            temperature_c,
+            power_w,
+            power_limit_w,
             fan_pct: fan_pct(h),
             // Hz. Reads 0 when the clock domain is power-gated at idle.
             clock_mhz: hwmon_u64(h, "freq1_input")

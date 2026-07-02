@@ -95,8 +95,13 @@ Extras: each GPU card shows session peaks/averages (util, temp, power) when tall
 enough, and the PCIe caption flags a link running below its maximum
 (`PCIe 3.0@8x (max 4.0@16x)`) — a classic symptom of a bad riser or wrong slot.
 
+Encoder/decoder activity shows in each card (split `enc`/`dec` on
+NVIDIA/Windows, unified `video` on AMD/Intel), and a red throttle badge appears
+when the GPU is thermal- or power-limited (real reasons on NVIDIA, at-limit
+heuristic on AMD).
+
 Planned depth: Apple temperature/power (SMC/IOReport), Windows AMD ADLX
-(temps/fans/clocks), encoder/decoder utilization display.
+(temps/fans/clocks).
 
 ## Per-process GPU attribution
 

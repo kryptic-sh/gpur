@@ -10,6 +10,16 @@ and this project adheres to
 
 ### Added
 
+- Video engine utilization in the info line: NVIDIA shows split `enc`/`dec`
+  (NVML), AMD shows unified VCN `video %` (fdinfo engine deltas), Intel shows
+  media-engine `video %` (i915 video/video-enhance ns, xe vcs/vecs cycles),
+  Windows shows `enc`/`dec` from the PDH videoencode/videodecode engine types.
+- Throttle badge: red `⚠thermal`/`⚠power-limit` in the card info line. NVIDIA
+  uses the real NVML throttle-reason mask; AMD uses an at-limit heuristic (power
+  ≥99% of cap, or temp within 3°C of the hwmon critical trip).
+- AMD backend now does its fdinfo sweep once per poll (Intel-style), halving
+  /proc scanning and enabling the device-level VCN readout.
+
 - Graph glyph fallback: `graphs = "braille"|"block"|"ascii"` in config (or
   `--graphs`) switches the waveform, mini-sparks, and meters — block for
   terminals with patchy braille fonts, ascii for the Linux console.
