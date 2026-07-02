@@ -29,4 +29,13 @@ pub struct Cli {
     /// Skip the startup splash
     #[arg(long)]
     pub no_splash: bool,
+
+    /// Print one snapshot (two quick polls so utilization deltas are real)
+    /// and exit — no TUI
+    #[arg(long)]
+    pub once: bool,
+
+    /// Like --once but machine-readable JSON on stdout
+    #[arg(long)]
+    pub json: bool,
 }

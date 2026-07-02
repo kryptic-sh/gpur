@@ -172,6 +172,10 @@ mod linux_impl {
                 .as_deref()
                 .and_then(gts_to_gen),
             pcie_width: read_trim(&d.dev.join("current_link_width")).and_then(|w| w.parse().ok()),
+            pcie_max_gen: read_trim(&d.dev.join("max_link_speed"))
+                .as_deref()
+                .and_then(gts_to_gen),
+            pcie_max_width: read_trim(&d.dev.join("max_link_width")).and_then(|w| w.parse().ok()),
             // amdgpu does not expose PCIe throughput counters.
             pcie_rx_kbs: None,
             pcie_tx_kbs: None,

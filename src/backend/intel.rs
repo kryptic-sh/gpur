@@ -111,6 +111,8 @@ mod linux_impl {
                         mem_clock_mhz: None,
                         pcie_gen: None,
                         pcie_width: None,
+                        pcie_max_gen: None,
+                        pcie_max_width: None,
                         pcie_rx_kbs: None,
                         pcie_tx_kbs: None,
                     }

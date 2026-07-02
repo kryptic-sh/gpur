@@ -14,7 +14,7 @@ pub use mock::MockBackend;
 use anyhow::Result;
 
 /// One sample of one GPU at one instant.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct GpuSnapshot {
     pub name: String,
     /// Integrated (APU/iGPU) as opposed to a discrete card.
@@ -35,6 +35,9 @@ pub struct GpuSnapshot {
     pub pcie_gen: Option<u8>,
     /// Current PCIe lane count.
     pub pcie_width: Option<u32>,
+    /// Maximum supported PCIe generation/width, for downgrade detection.
+    pub pcie_max_gen: Option<u8>,
+    pub pcie_max_width: Option<u32>,
     /// PCIe throughput, KiB/s.
     pub pcie_rx_kbs: Option<u64>,
     pub pcie_tx_kbs: Option<u64>,
@@ -49,7 +52,7 @@ impl GpuSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ProcKind {
     Graphics,
     Compute,

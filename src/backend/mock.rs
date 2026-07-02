@@ -54,8 +54,11 @@ impl GpuBackend for MockBackend {
                     fan_pct: Some((util * 0.9).min(100.0)),
                     clock_mhz: Some(1200 + (util * 12.0) as u64),
                     mem_clock_mhz: Some(9000),
-                    pcie_gen: Some(4),
-                    pcie_width: Some(16),
+                    // GPU 1 demos the PCIe downgrade warning.
+                    pcie_gen: if i == 1 { Some(3) } else { Some(4) },
+                    pcie_width: if i == 1 { Some(8) } else { Some(16) },
+                    pcie_max_gen: Some(4),
+                    pcie_max_width: Some(16),
                     pcie_rx_kbs: Some((util * 8000.0) as u64),
                     pcie_tx_kbs: Some((util * 3000.0) as u64),
                 }

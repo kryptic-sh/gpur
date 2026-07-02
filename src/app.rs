@@ -77,8 +77,42 @@ fn command_of(p: &sysinfo::Process) -> String {
     }
 }
 
+/// Running min/max/avg per GPU since launch (HWiNFO-style session stats).
+#[derive(Default, Clone, serde::Serialize)]
+pub struct SessionStats {
+    pub max_util_pct: f64,
+    pub max_temp_c: f64,
+    pub max_power_w: f64,
+    sum_util: f64,
+    sum_power: f64,
+    samples: u64,
+}
+
+impl SessionStats {
+    fn add(&mut self, g: &GpuSnapshot) {
+        self.max_util_pct = self.max_util_pct.max(g.utilization_pct);
+        if let Some(t) = g.temperature_c {
+            self.max_temp_c = self.max_temp_c.max(t);
+        }
+        if let Some(w) = g.power_w {
+            self.max_power_w = self.max_power_w.max(w);
+        }
+        self.sum_util += g.utilization_pct;
+        self.sum_power += g.power_w.unwrap_or(0.0);
+        self.samples += 1;
+    }
+
+    pub fn avg_util_pct(&self) -> f64 {
+        self.sum_util / self.samples.max(1) as f64
+    }
+
+    pub fn avg_power_w(&self) -> f64 {
+        self.sum_power / self.samples.max(1) as f64
+    }
+}
+
 /// One row of the process table: GPU stats + host-side enrichment.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 pub struct ProcRow {
     pub pid: u32,
     pub gpu_index: usize,
@@ -95,6 +129,8 @@ pub struct App {
     pub backend: Box<dyn GpuBackend>,
     pub gpus: Vec<GpuSnapshot>,
     pub history: Vec<History>,
+    /// Per-GPU peaks/averages since launch.
+    pub session: Vec<SessionStats>,
     pub history_len: usize,
     pub selected: usize,
     pub paused: bool,
@@ -151,6 +187,7 @@ impl App {
             backend,
             gpus: Vec::new(),
             history: Vec::new(),
+            session: Vec::new(),
             history_len,
             selected: 0,
             paused: false,
@@ -217,8 +254,13 @@ impl App {
             }
         }
         self.history.resize_with(self.gpus.len(), History::default);
+        self.session
+            .resize_with(self.gpus.len(), SessionStats::default);
         if self.selected >= self.gpus.len() {
             self.selected = self.gpus.len().saturating_sub(1);
+        }
+        for (gpu, sess) in self.gpus.iter().zip(&mut self.session) {
+            sess.add(gpu);
         }
         for (gpu, hist) in self.gpus.iter().zip(&mut self.history) {
             hist.util.push(gpu.utilization_pct.round() as u64);

@@ -26,3 +26,18 @@ fn unknown_flag_fails() {
     let out = bin().arg("--definitely-not-a-flag").output().unwrap();
     assert!(!out.status.success());
 }
+
+#[test]
+fn json_snapshot_emits_valid_shape() {
+    let out = bin()
+        .args(["--mock", "--json", "--tick-ms", "100"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+    assert_eq!(v["backend"], "mock");
+    assert_eq!(v["gpus"].as_array().unwrap().len(), 2);
+    assert!(v["gpus"][0]["utilization_pct"].is_number());
+    assert!(v["processes"].as_array().is_some());
+}

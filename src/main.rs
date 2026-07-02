@@ -37,6 +37,10 @@ fn main() -> Result<()> {
     let mut app = App::new(backend, theme, tick_ms, cfg.history_len, cli.no_splash);
     app.poll();
 
+    if cli.once || cli.json {
+        return snapshot(&mut app, cli.json, tick_ms);
+    }
+
     let mut terminal = ratatui::init();
     hjkl_kitty::enable(&mut stdout())?;
     crossterm::execute!(stdout(), EnableMouseCapture)?;
@@ -45,6 +49,53 @@ fn main() -> Result<()> {
     let _ = hjkl_kitty::disable(&mut stdout());
     ratatui::restore();
     result
+}
+
+/// Headless one-shot: a second poll after a short gap makes the delta-based
+/// utilizations (Intel, per-process) real instead of zero.
+fn snapshot(app: &mut App, json: bool, tick_ms: u64) -> Result<()> {
+    std::thread::sleep(Duration::from_millis(tick_ms.clamp(100, 1000)));
+    app.poll();
+
+    if json {
+        let out = serde_json::json!({
+            "backend": app.backend.name(),
+            "gpus": app.gpus,
+            "processes": app.procs,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    for (i, g) in app.gpus.iter().enumerate() {
+        let mut line = format!(
+            "{i}  {}  util {:>3.0}%  vram {}/{}MiB",
+            g.name,
+            g.utilization_pct,
+            g.vram_used_bytes / 1024 / 1024,
+            g.vram_total_bytes / 1024 / 1024,
+        );
+        if let Some(t) = g.temperature_c {
+            line.push_str(&format!("  {t:.0}°C"));
+        }
+        if let Some(w) = g.power_w {
+            line.push_str(&format!("  {w:.0}W"));
+        }
+        println!("{line}");
+    }
+    for p in &app.procs {
+        println!(
+            "  pid {:>7}  gpu {}  {:>4}  {:>5}MiB  {}",
+            p.pid,
+            p.gpu_index,
+            p.gpu_util_pct
+                .map(|u| format!("{u:.0}%"))
+                .unwrap_or_else(|| "-".into()),
+            p.gpu_mem_bytes / 1024 / 1024,
+            p.command,
+        );
+    }
+    Ok(())
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {

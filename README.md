@@ -29,6 +29,8 @@ Debian/RPM packages, musl builds, and an Alpine `.apk` are attached to each
 gpur              # real GPUs
 gpur --mock       # fake GPUs, works anywhere
 gpur --mock 6     # demo a 6-GPU rig
+gpur --once       # one text snapshot, no TUI (scripts, quick checks)
+gpur --json       # machine-readable snapshot (waybar/polybar, monitoring)
 ```
 
 ## Keys & mouse
@@ -83,6 +85,10 @@ utilization and memory only.
 
 Backend poll failures degrade gracefully: the last snapshot stays on screen with
 a header warning until polling recovers — a driver reset won't kill the monitor.
+
+Extras: each GPU card shows session peaks/averages (util, temp, power) when tall
+enough, and the PCIe caption flags a link running below its maximum
+(`PCIe 3.0@8x (max 4.0@16x)`) — a classic symptom of a bad riser or wrong slot.
 
 Planned depth: Apple temperature/power (SMC/IOReport), Windows AMD ADLX
 (temps/fans/clocks), encoder/decoder utilization display.

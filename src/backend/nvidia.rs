@@ -61,6 +61,8 @@ impl GpuBackend for NvmlBackend {
                 mem_clock_mhz: dev.clock_info(Clock::Memory).ok().map(u64::from),
                 pcie_gen: dev.current_pcie_link_gen().ok().map(|g| g as u8),
                 pcie_width: dev.current_pcie_link_width().ok(),
+                pcie_max_gen: dev.max_pcie_link_gen().ok().map(|g| g as u8),
+                pcie_max_width: dev.max_pcie_link_width().ok(),
                 pcie_rx_kbs: dev
                     .pcie_throughput(PcieUtilCounter::Receive)
                     .ok()

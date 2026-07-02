@@ -271,20 +271,28 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         t.border
     };
 
-    let right_text = if gpu.integrated {
-        "integrated".to_string()
-    } else {
-        match (gpu.pcie_gen, gpu.pcie_width) {
-            (Some(g), Some(w)) => format!("PCIe {g}.0@{w}x"),
-            _ => String::new(),
+    // PCIe caption; a link running below its max (bad riser, wrong slot,
+    // power saving stuck) gets a yellow "(max …)" flag.
+    let mut right_spans: Vec<Span> = Vec::new();
+    if gpu.integrated {
+        right_spans.push(Span::styled("integrated", t.dim));
+    } else if let (Some(g), Some(w)) = (gpu.pcie_gen, gpu.pcie_width) {
+        right_spans.push(Span::styled(format!("PCIe {g}.0@{w}x"), t.dim));
+        if let (Some(mg), Some(mw)) = (gpu.pcie_max_gen, gpu.pcie_max_width)
+            && (g < mg || w < mw)
+        {
+            right_spans.push(Span::styled(format!(" (max {mg}.0@{mw}x)"), t.temp_warn));
         }
-    };
+    }
     let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(border)
         .title(caption(format!("{idx}·{}", gpu.name), t.title, border));
-    if !right_text.is_empty() {
-        block = block.title_top(caption(right_text, t.dim, border).right_aligned());
+    if !right_spans.is_empty() {
+        let mut line = vec![Span::styled("┐", border)];
+        line.extend(right_spans);
+        line.push(Span::styled("┌", border));
+        block = block.title_top(Line::from(line).right_aligned());
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -292,13 +300,38 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         return;
     }
 
-    let [util_row, vram_row, spark_row, info_row] = Layout::vertical([
+    // Session-stats line only when the card has breathing room.
+    let show_session = inner.height >= 7 && app.session.get(idx).is_some();
+    let [util_row, vram_row, spark_row, session_row, info_row] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Fill(1),
+        Constraint::Length(if show_session { 1 } else { 0 }),
         Constraint::Length(1),
     ])
     .areas(inner);
+
+    if show_session && let Some(sess) = app.session.get(idx) {
+        let line = Line::from(vec![
+            Span::styled(" session ", t.dim),
+            Span::styled(
+                format!(
+                    "peak {:>3.0}%  {:>3.0}°C  {:>3.0}W   ",
+                    sess.max_util_pct, sess.max_temp_c, sess.max_power_w
+                ),
+                Style::new().fg(t.fg),
+            ),
+            Span::styled(
+                format!(
+                    "avg {:>3.0}%  {:>3.0}W",
+                    sess.avg_util_pct(),
+                    sess.avg_power_w()
+                ),
+                t.dim,
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), session_row);
+    }
 
     let hist = app.history.get(idx);
     draw_meter(

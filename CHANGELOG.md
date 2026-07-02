@@ -10,6 +10,14 @@ and this project adheres to
 
 ### Added
 
+- Headless snapshot mode: `--once` prints one text snapshot, `--json` emits
+  machine-readable JSON (backend, gpus, processes) — two quick polls so
+  delta-based utilizations are real; built for waybar/polybar and scripting.
+- PCIe downgrade indicator: yellow `(max X.0@Nx)` in the card caption when the
+  link runs below its maximum (AMD sysfs + NVML max-link data).
+- Session stats per GPU: peak util/temp/power and averages since launch, shown
+  as a card line when space allows.
+
 - `=` is an unshifted alias for `+` (poll faster).
 
 ## [0.3.0] - 2026-07-02
