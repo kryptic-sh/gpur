@@ -107,6 +107,26 @@ jobs:
       - run: cargo build --locked
       - run: cargo run --locked -- --version
       - run: cargo run --locked -- --help
+      # Probe the REAL backends (no --mock): partial hardware validation for
+      # free. Runners mostly have no usable GPU, which must take the graceful
+      # "no supported GPU backend" exit — a panic or any other failure is a
+      # real bug. macOS arm64 runners expose a paravirt IOAccelerator and may
+      # return actual data.
+      - name: Probe real backends (tolerant)
+        shell: bash
+        run: |
+          set +e
+          out=$(cargo run --locked -- --once --tick-ms 100 2>&1)
+          code=$?
+          echo "$out"
+          if [ $code -eq 0 ]; then
+            echo "== real backend returned data =="
+          elif echo "$out" | grep -q "no supported GPU backend"; then
+            echo "== graceful no-backend path OK =="
+          else
+            echo "== unexpected failure (exit $code) =="
+            exit 1
+          fi
 
   # Runs on every main push (dry-run) and every v* tag / dispatch. Skips
   # PRs. Artifact upload happens always; publishing to the GitHub Release
