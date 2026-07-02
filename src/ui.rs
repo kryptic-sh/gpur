@@ -41,6 +41,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         if app.paused {
             head.push(Span::styled("PAUSED ", t.temp_warn));
         }
+        if let Some(err) = &app.poll_error {
+            head.push(Span::styled(format!("⚠ {err} "), t.temp_crit));
+        }
         frame.render_widget(Paragraph::new(Line::from(head)), header);
     }
 

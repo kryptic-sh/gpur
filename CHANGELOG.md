@@ -10,6 +10,20 @@ and this project adheres to
 
 ### Added
 
+- Intel Linux backend (i915 + xe): device utilization aggregated from per-client
+  fdinfo engine counters (i915 busy-ns deltas, xe cycles ratios — the nvtop
+  approach, since Intel has no sysfs busy%), power from the hwmon cumulative
+  energy-counter delta, gt clock (i915 + xe paths), pci.ids names, Arc dGPU vs
+  iGPU detection via `lmem_total_bytes`. Probe order is now nvml → amdgpu →
+  intel → ioaccel → pdh.
+- Shared Linux DRM module (`backend/linux.rs`): generic fdinfo client parser
+  (engine-ns, xe cycles, memory regions with drm-resident fallback), pci.ids
+  lookup, card scanning — amdgpu backend refactored onto it; fixture unit tests
+  for amdgpu/i915/xe fdinfo formats.
+- Graceful poll degradation: a backend poll failure keeps the last snapshot on
+  screen and shows a red header warning, cleared on the next successful poll —
+  driver resets no longer exit the TUI. `GPUR_MOCK_FAIL=N` fails every Nth mock
+  poll to exercise the path.
 - Process table row cursor: j/k/arrows (and wheel/J/K) move a highlighted row
   when the pane is focused, viewport follows, click selects a row; highlight
   uses the theme surface color.

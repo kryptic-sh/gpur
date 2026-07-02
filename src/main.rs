@@ -35,7 +35,7 @@ fn main() -> Result<()> {
     let backend = backend::detect(cli.mock)?;
 
     let mut app = App::new(backend, theme, tick_ms, cfg.history_len, cli.no_splash);
-    app.poll()?;
+    app.poll();
 
     let mut terminal = ratatui::init();
     hjkl_kitty::enable(&mut stdout())?;
@@ -132,7 +132,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
         }
 
         if last_poll.elapsed() >= Duration::from_millis(app.tick_ms) {
-            app.poll()?;
+            app.poll();
             last_poll = Instant::now();
         }
     }

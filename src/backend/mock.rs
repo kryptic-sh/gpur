@@ -26,6 +26,16 @@ impl GpuBackend for MockBackend {
 
     fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
         self.tick += 1;
+        // Test hook: GPUR_MOCK_FAIL=N fails every Nth poll to exercise the
+        // graceful-degradation path.
+        if let Some(n) = std::env::var("GPUR_MOCK_FAIL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            && n > 0
+            && self.tick.is_multiple_of(n)
+        {
+            anyhow::bail!("simulated driver reset (tick {})", self.tick);
+        }
         let total = 16 * 1024 * 1024 * 1024u64;
         let gpus = (0..self.count)
             .map(|i| {

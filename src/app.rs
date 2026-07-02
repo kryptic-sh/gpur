@@ -1,7 +1,6 @@
 use crate::backend::{GpuBackend, GpuSnapshot, ProcKind};
 use crate::keys::Action;
 use crate::theme::UiTheme;
-use anyhow::Result;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
 
@@ -76,6 +75,8 @@ pub struct App {
     pub proc_rect: ratatui::layout::Rect,
     /// Which pane arrow keys act on.
     pub focus: Focus,
+    /// Last backend poll failure; shown in the header, cleared on success.
+    pub poll_error: Option<String>,
     /// (rect, gpu index) of each card drawn last frame, for click hit-tests.
     pub card_rects: Vec<(ratatui::layout::Rect, usize)>,
     sys: System,
@@ -110,6 +111,7 @@ impl App {
             gpus_rect: ratatui::layout::Rect::default(),
             proc_rect: ratatui::layout::Rect::default(),
             focus: Focus::Gpus,
+            poll_error: None,
             card_rects: Vec::new(),
             sys: System::new(),
             users: Users::new_with_refreshed_list(),
@@ -120,11 +122,23 @@ impl App {
         !self.splash_skipped && self.started.elapsed() < Duration::from_millis(SPLASH_MS)
     }
 
-    pub fn poll(&mut self) -> Result<()> {
+    /// Poll the backend. Failures degrade gracefully: the last good snapshot
+    /// stays on screen and the error shows in the header until a poll
+    /// succeeds again — a driver reset must not kill the monitor.
+    pub fn poll(&mut self) {
         if self.paused {
-            return Ok(());
+            return;
         }
-        self.gpus = self.backend.poll()?;
+        match self.backend.poll() {
+            Ok(gpus) => {
+                self.gpus = gpus;
+                self.poll_error = None;
+            }
+            Err(e) => {
+                self.poll_error = Some(format!("poll failed: {e:#}"));
+                return; // keep previous snapshot and history
+            }
+        }
         self.history.resize_with(self.gpus.len(), History::default);
         if self.selected >= self.gpus.len() {
             self.selected = self.gpus.len().saturating_sub(1);
@@ -144,7 +158,6 @@ impl App {
             }
         }
         self.refresh_processes();
-        Ok(())
     }
 
     fn refresh_processes(&mut self) {

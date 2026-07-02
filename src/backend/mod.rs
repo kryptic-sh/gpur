@@ -2,6 +2,9 @@
 
 mod amd;
 mod apple;
+mod intel;
+#[cfg(target_os = "linux")]
+mod linux;
 mod mock;
 mod nvidia;
 mod windows;
@@ -95,6 +98,9 @@ pub fn detect(mock: Option<usize>) -> Result<Box<dyn GpuBackend>> {
         return Ok(b);
     }
     if let Some(b) = amd::probe() {
+        return Ok(b);
+    }
+    if let Some(b) = intel::probe() {
         return Ok(b);
     }
     if let Some(b) = apple::probe() {
