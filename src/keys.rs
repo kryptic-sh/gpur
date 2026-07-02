@@ -49,6 +49,8 @@ pub fn default_keymap() -> Keymap<Action, Mode> {
         ("k", Action::PrevItem, "move up in focused list"),
         ("<Up>", Action::PrevItem, "move up in focused list"),
         ("+", Action::TickFaster, "poll faster"),
+        // Unshifted alias: = shares the key with + on most layouts.
+        ("=", Action::TickFaster, "poll faster"),
         ("-", Action::TickSlower, "poll slower"),
         ("s", Action::SortCycle, "cycle process sort column"),
         ("r", Action::SortReverse, "reverse process sort"),

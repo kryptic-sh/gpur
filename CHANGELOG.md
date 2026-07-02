@@ -8,6 +8,10 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- `=` is an unshifted alias for `+` (poll faster).
+
 ## [0.3.0] - 2026-07-02
 
 ### Added

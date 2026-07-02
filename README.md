@@ -44,7 +44,7 @@ gpur --mock 6     # demo a 6-GPU rig
 | `s` / `r`          | cycle process sort column / reverse it                   |
 | `/`                | filter processes (Enter applies, empty clears)           |
 | `x` / `X`          | SIGTERM / SIGKILL the selected process (with confirm)    |
-| `+` / `-`          | poll rate faster/slower                                  |
+| `+`/`=` / `-`      | poll rate faster/slower                                  |
 | wheel / click      | scroll + focus the pane under the cursor; click selects  |
 
 ## Configuration
