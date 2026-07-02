@@ -5,11 +5,12 @@ use anyhow::Result;
 
 pub struct MockBackend {
     tick: u64,
+    count: usize,
 }
 
 impl MockBackend {
-    pub fn new() -> Self {
-        Self { tick: 0 }
+    pub fn new(count: usize) -> Self {
+        Self { tick: 0, count }
     }
 
     fn wave(&self, phase: f64, period: f64) -> f64 {
@@ -26,7 +27,7 @@ impl GpuBackend for MockBackend {
     fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
         self.tick += 1;
         let total = 16 * 1024 * 1024 * 1024u64;
-        let gpus = (0..2)
+        let gpus = (0..self.count)
             .map(|i| {
                 let util = self.wave(i as f64 * 1.3, 37.0 + 11.0 * i as f64);
                 let vram = self.wave(i as f64 * 2.1 + 0.7, 97.0);
@@ -55,21 +56,19 @@ impl GpuBackend for MockBackend {
 
     fn processes(&mut self) -> Vec<GpuProcess> {
         let util = self.wave(0.4, 53.0);
-        vec![
-            GpuProcess {
-                pid: std::process::id(),
-                gpu_index: 0,
-                kind: ProcKind::Graphics,
-                gpu_util_pct: Some(util * 0.7),
-                gpu_mem_bytes: 512 * 1024 * 1024 + (util * 1e7) as u64,
-            },
-            GpuProcess {
-                pid: 1,
-                gpu_index: 1,
-                kind: ProcKind::Compute,
-                gpu_util_pct: Some(util * 0.3),
-                gpu_mem_bytes: 2048 * 1024 * 1024,
-            },
-        ]
+        // A few rows per GPU so the table can overflow and scroll in demos.
+        (0..self.count * 3)
+            .map(|i| GpuProcess {
+                pid: if i == 0 { std::process::id() } else { i as u32 },
+                gpu_index: i % self.count,
+                kind: if i % 3 == 0 {
+                    ProcKind::Graphics
+                } else {
+                    ProcKind::Compute
+                },
+                gpu_util_pct: Some((util * (0.9 - 0.1 * i as f64)).max(0.0)),
+                gpu_mem_bytes: (3000 >> i.min(8)) as u64 * 1024 * 1024 + 64 * 1024 * 1024,
+            })
+            .collect()
     }
 }

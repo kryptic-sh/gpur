@@ -17,6 +17,8 @@ pub enum Action {
     TickFaster,
     TickSlower,
     ToggleFold(usize),
+    ProcScrollDown,
+    ProcScrollUp,
 }
 
 pub fn default_keymap() -> Keymap<Action, Mode> {
@@ -32,6 +34,14 @@ pub fn default_keymap() -> Keymap<Action, Mode> {
         ("<Up>", Action::PrevGpu, "select previous GPU"),
         ("+", Action::TickFaster, "poll faster"),
         ("-", Action::TickSlower, "poll slower"),
+        ("J", Action::ProcScrollDown, "scroll process list down"),
+        (
+            "<PageDown>",
+            Action::ProcScrollDown,
+            "scroll process list down",
+        ),
+        ("K", Action::ProcScrollUp, "scroll process list up"),
+        ("<PageUp>", Action::ProcScrollUp, "scroll process list up"),
     ];
     for (chord, action, desc) in binds {
         km.add(Mode::Normal, chord, action.clone(), desc)

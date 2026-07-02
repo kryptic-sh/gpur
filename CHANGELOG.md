@@ -10,6 +10,11 @@ and this project adheres to
 
 ### Added
 
+- Dynamic layout: process pane sizes to content capped at 30% of the body with
+  J/K + PgUp/PgDn scrolling and a scrollbar; GPU card list scrolls whole cards
+  with a scrollbar when they overflow (selection stays visible, visible cards
+  stretch to fill). `--mock` now takes an optional GPU count (`--mock 6`) and
+  fakes 3 processes per GPU for demoing overflow.
 - Digit keys 0-9 fold/unfold a GPU card to a one-line summary
   (`▸ 0·name GPU% MEM temp power`); remaining cards absorb the space.
 - btop-inspired chrome: `┐caption┌` titles embedded in borders (GPU name left,

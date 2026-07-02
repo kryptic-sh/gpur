@@ -59,6 +59,10 @@ pub struct App {
     pub procs: Vec<ProcRow>,
     /// GPU indices folded to a one-line summary (digit keys toggle).
     pub folded: std::collections::HashSet<usize>,
+    /// First visible GPU card when the card list overflows (clamped in draw).
+    pub gpu_scroll: usize,
+    /// First visible process row when the table overflows (clamped in draw).
+    pub proc_scroll: usize,
     sys: System,
     users: Users,
 }
@@ -85,6 +89,8 @@ impl App {
             splash_skipped: no_splash,
             procs: Vec::new(),
             folded: std::collections::HashSet::new(),
+            gpu_scroll: 0,
+            proc_scroll: 0,
             sys: System::new(),
             users: Users::new_with_refreshed_list(),
         }
@@ -191,6 +197,8 @@ impl App {
                     self.folded.insert(i);
                 }
             }
+            Action::ProcScrollDown => self.proc_scroll = self.proc_scroll.saturating_add(1),
+            Action::ProcScrollUp => self.proc_scroll = self.proc_scroll.saturating_sub(1),
         }
         false
     }

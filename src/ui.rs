@@ -5,15 +5,22 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{
+    Block, BorderType, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+};
 
-pub fn draw(frame: &mut Frame, app: &App) {
+/// Minimum rows for an unfolded GPU card (borders + meters + info + waveform).
+const CARD_MIN: u16 = 8;
+
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let t = &app.theme;
-    frame.render_widget(Block::new().style(Style::new().bg(t.bg).fg(t.fg)), area);
+    frame.render_widget(
+        Block::new().style(Style::new().bg(app.theme.bg).fg(app.theme.fg)),
+        area,
+    );
 
     if app.splash_active() {
-        crate::splash::render(frame, area, app.started, &app.splash_path, t);
+        crate::splash::render(frame, area, app.started, &app.splash_path, &app.theme);
         return;
     }
 
@@ -24,38 +31,68 @@ pub fn draw(frame: &mut Frame, app: &App) {
     ])
     .areas(area);
 
-    let mut head = vec![
-        Span::styled(format!(" gpur v{} ", env!("CARGO_PKG_VERSION")), t.title),
-        Span::styled(format!("[{}] ", app.backend.name()), t.dim),
-        Span::styled(format!("{}ms ", app.tick_ms), t.dim),
-    ];
-    if app.paused {
-        head.push(Span::styled("PAUSED ", t.temp_warn));
+    {
+        let t = &app.theme;
+        let mut head = vec![
+            Span::styled(format!(" gpur v{} ", env!("CARGO_PKG_VERSION")), t.title),
+            Span::styled(format!("[{}] ", app.backend.name()), t.dim),
+            Span::styled(format!("{}ms ", app.tick_ms), t.dim),
+        ];
+        if app.paused {
+            head.push(Span::styled("PAUSED ", t.temp_warn));
+        }
+        frame.render_widget(Paragraph::new(Line::from(head)), header);
     }
-    frame.render_widget(Paragraph::new(Line::from(head)), header);
 
-    // Process pane: sized to content, capped at ~40% of the body. Careful on
-    // tiny terminals: the cap can drop below the 4-row minimum.
+    // Process pane takes only what it needs, up to 30% of the body; the GPU
+    // cards get the rest. Careful on tiny terminals: the cap can drop below
+    // the 4-row minimum.
     let want = app.procs.len() as u16 + 3;
-    let cap = ((body.height * 2) / 5).max(4);
+    let cap = ((body.height * 3) / 10).max(4);
     let proc_height = want.min(cap).min(body.height);
     let [gpus_area, proc_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(proc_height)]).areas(body);
 
+    draw_gpus(frame, gpus_area, app);
+    draw_processes(frame, proc_area, app);
+
+    frame.render_widget(
+        Paragraph::new(" q quit  p pause  j/k select  0-9 fold  J/K procs  +/- poll rate")
+            .style(app.theme.dim),
+        footer,
+    );
+}
+
+/// GPU card region. When every card fits it behaves like a plain vertical
+/// split; when it overflows (many GPUs / small terminal) it becomes a
+/// scrolled list of fixed-height cards with a scrollbar, keeping the
+/// selected card visible.
+fn draw_gpus(frame: &mut Frame, area: Rect, app: &mut App) {
+    let t = &app.theme;
     if app.gpus.is_empty() {
         frame.render_widget(
             Paragraph::new("no GPUs reported by backend").style(t.dim),
-            gpus_area,
+            area,
         );
-    } else {
-        let rows = Layout::vertical(app.gpus.iter().enumerate().map(|(i, _)| {
+        return;
+    }
+
+    let height_of =
+        |app: &App, i: usize| -> u16 { if app.folded.contains(&i) { 1 } else { CARD_MIN } };
+    let n = app.gpus.len();
+    let needed: u16 = (0..n).map(|i| height_of(app, i)).sum();
+
+    if needed <= area.height {
+        // Everything fits: unfolded cards stretch to share the space.
+        app.gpu_scroll = 0;
+        let rows = Layout::vertical((0..n).map(|i| {
             if app.folded.contains(&i) {
                 Constraint::Length(1)
             } else {
                 Constraint::Fill(1)
             }
         }))
-        .split(gpus_area);
+        .split(area);
         for (i, gpu) in app.gpus.iter().enumerate() {
             if app.folded.contains(&i) {
                 draw_gpu_folded(frame, rows[i], app, gpu, i);
@@ -63,13 +100,66 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 draw_gpu(frame, rows[i], app, gpu, i);
             }
         }
+        return;
     }
 
-    draw_processes(frame, proc_area, app);
+    // Overflow: scroll whole cards so the selection stays visible.
+    app.gpu_scroll = app.gpu_scroll.min(n - 1).min(app.selected);
+    loop {
+        let visible_span: u16 = (app.gpu_scroll..=app.selected)
+            .map(|i| height_of(app, i))
+            .sum();
+        if visible_span <= area.height || app.gpu_scroll >= app.selected {
+            break;
+        }
+        app.gpu_scroll += 1;
+    }
 
-    frame.render_widget(
-        Paragraph::new(" q quit  p pause  j/k select  0-9 fold  +/- poll rate").style(t.dim),
-        footer,
+    // How many whole cards fit at their minimum height...
+    let mut shown = 0usize;
+    let mut used = 0u16;
+    for i in app.gpu_scroll..n {
+        let h = height_of(app, i);
+        if used + h > area.height {
+            break;
+        }
+        used += h;
+        shown += 1;
+    }
+    let shown = shown.max(1);
+
+    // ...then let that window stretch to fill the area — no dead gap.
+    let cards = Rect {
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+    let window: Vec<usize> = (app.gpu_scroll..(app.gpu_scroll + shown).min(n)).collect();
+    let rows = Layout::vertical(window.iter().map(|i| {
+        if app.folded.contains(i) {
+            Constraint::Length(1)
+        } else {
+            Constraint::Fill(1)
+        }
+    }))
+    .split(cards);
+    for (slot, &i) in rows.iter().zip(&window) {
+        let gpu = &app.gpus[i];
+        if app.folded.contains(&i) {
+            draw_gpu_folded(frame, *slot, app, gpu, i);
+        } else {
+            draw_gpu(frame, *slot, app, gpu, i);
+        }
+    }
+
+    let max_scroll = n.saturating_sub(shown);
+    let mut sb = ScrollbarState::new(max_scroll).position(app.gpu_scroll.min(max_scroll));
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .style(app.theme.dim),
+        area,
+        &mut sb,
     );
 }
 
@@ -368,16 +458,28 @@ fn draw_waveform(frame: &mut Frame, area: Rect, up_data: &[u64], down_data: &[u6
     buf.set_string(area.x, area.y + area.height - 1, "vram%", t.dim);
 }
 
-fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
-    let t = &app.theme;
+fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
     if area.height < 3 {
         return;
     }
-    let shown = (area.height.saturating_sub(3) as usize).min(app.procs.len());
+    let total = app.procs.len();
+    let visible = (area.height.saturating_sub(3) as usize).min(total);
+    let max_scroll = total - visible;
+    app.proc_scroll = app.proc_scroll.min(max_scroll);
+    let counter = if max_scroll > 0 {
+        format!(
+            "{}-{}/{total}",
+            app.proc_scroll + 1,
+            app.proc_scroll + visible
+        )
+    } else {
+        format!("{total}")
+    };
+    let t = &app.theme;
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .title(caption("processes".into(), t.title, t.border))
-        .title_top(caption(format!("{shown}/{}", app.procs.len()), t.dim, t.border).right_aligned())
+        .title_top(caption(counter, t.dim, t.border).right_aligned())
         .border_style(t.border);
 
     if app.procs.is_empty() {
@@ -400,23 +502,25 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
     )
     .style(t.title);
 
-    let rows = app.procs.iter().map(|p| {
-        Row::new(vec![
-            Cell::from(p.pid.to_string()),
-            Cell::from(p.user.clone()),
-            Cell::from(p.gpu_index.to_string()),
-            Cell::from(p.kind.label()),
-            Cell::from(
-                p.gpu_util_pct
-                    .map(|u| format!("{u:>3.0}%"))
-                    .unwrap_or_else(|| "N/A".into()),
-            ),
-            Cell::from(format!("{}MiB", p.gpu_mem_bytes / 1024 / 1024)),
-            Cell::from(format!("{:>3.0}%", p.cpu_pct)),
-            Cell::from(format!("{}MiB", p.host_mem_bytes / 1024 / 1024)),
-            Cell::from(p.command.clone()),
-        ])
-    });
+    let rows = app.procs[app.proc_scroll..app.proc_scroll + visible]
+        .iter()
+        .map(|p| {
+            Row::new(vec![
+                Cell::from(p.pid.to_string()),
+                Cell::from(p.user.clone()),
+                Cell::from(p.gpu_index.to_string()),
+                Cell::from(p.kind.label()),
+                Cell::from(
+                    p.gpu_util_pct
+                        .map(|u| format!("{u:>3.0}%"))
+                        .unwrap_or_else(|| "N/A".into()),
+                ),
+                Cell::from(format!("{}MiB", p.gpu_mem_bytes / 1024 / 1024)),
+                Cell::from(format!("{:>3.0}%", p.cpu_pct)),
+                Cell::from(format!("{}MiB", p.host_mem_bytes / 1024 / 1024)),
+                Cell::from(p.command.clone()),
+            ])
+        });
 
     let table = Table::new(
         rows,
@@ -435,6 +539,21 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
     .header(header)
     .block(block);
     frame.render_widget(table, area);
+
+    if max_scroll > 0 {
+        let mut sb = ScrollbarState::new(max_scroll).position(app.proc_scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .style(app.theme.dim),
+            area.inner(ratatui::layout::Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut sb,
+        );
+    }
 }
 
 /// KiB/s -> human rate, matching nvtop's per-direction PCIe readout.

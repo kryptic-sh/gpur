@@ -87,9 +87,9 @@ pub trait GpuBackend {
 }
 
 /// Pick the first backend that reports usable devices on this machine.
-pub fn detect(force_mock: bool) -> Result<Box<dyn GpuBackend>> {
-    if force_mock {
-        return Ok(Box::new(MockBackend::new()));
+pub fn detect(mock: Option<usize>) -> Result<Box<dyn GpuBackend>> {
+    if let Some(n) = mock {
+        return Ok(Box::new(MockBackend::new(n.clamp(1, 16))));
     }
     if let Some(b) = nvidia::probe() {
         return Ok(b);

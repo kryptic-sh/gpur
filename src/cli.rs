@@ -9,9 +9,10 @@ use std::path::PathBuf;
     before_help = include_str!("art.txt")
 )]
 pub struct Cli {
-    /// Use deterministic mock GPUs (demo the UI without hardware)
-    #[arg(long)]
-    pub mock: bool,
+    /// Use deterministic mock GPUs (demo the UI without hardware).
+    /// Optionally pass how many, e.g. `--mock 6`.
+    #[arg(long, num_args = 0..=1, default_missing_value = "2", value_name = "N")]
+    pub mock: Option<usize>,
 
     /// Path to config.toml (default: $XDG_CONFIG_HOME/gpur/config.toml)
     #[arg(long, short)]
