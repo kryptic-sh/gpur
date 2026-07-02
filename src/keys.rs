@@ -26,6 +26,14 @@ pub enum Action {
     FocusProcs,
     ProcScrollDown,
     ProcScrollUp,
+    /// Cycle the process-table sort column / flip its direction.
+    SortCycle,
+    SortReverse,
+    /// Open the process filter input.
+    FilterOpen,
+    /// SIGTERM / SIGKILL the process under the cursor (with confirmation).
+    KillTerm,
+    KillForce,
 }
 
 pub fn default_keymap() -> Keymap<Action, Mode> {
@@ -42,6 +50,11 @@ pub fn default_keymap() -> Keymap<Action, Mode> {
         ("<Up>", Action::PrevItem, "move up in focused list"),
         ("+", Action::TickFaster, "poll faster"),
         ("-", Action::TickSlower, "poll slower"),
+        ("s", Action::SortCycle, "cycle process sort column"),
+        ("r", Action::SortReverse, "reverse process sort"),
+        ("/", Action::FilterOpen, "filter processes"),
+        ("x", Action::KillTerm, "terminate selected process"),
+        ("X", Action::KillForce, "kill -9 selected process"),
         ("J", Action::ProcScrollDown, "scroll process list down"),
         (
             "<PageDown>",

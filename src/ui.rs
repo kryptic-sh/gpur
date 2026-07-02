@@ -44,6 +44,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         if let Some(err) = &app.poll_error {
             head.push(Span::styled(format!("⚠ {err} "), t.temp_crit));
         }
+        if let Some(msg) = app.status_line() {
+            head.push(Span::styled(format!("· {msg} "), t.spark_power));
+        }
         frame.render_widget(Paragraph::new(Line::from(head)), header);
     }
 
@@ -61,11 +64,58 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_gpus(frame, gpus_area, app);
     draw_processes(frame, proc_area, app);
 
-    frame.render_widget(
-        Paragraph::new(" q quit  ␣ pause  p procs  0-9 gpu (again folds)  j/k move  +/- poll rate")
-            .style(app.theme.dim),
-        footer,
+    let footer_line = if app.input_mode == crate::app::InputMode::Filter {
+        Line::from(vec![
+            Span::styled(" filter> ", app.theme.title),
+            Span::styled(app.filter_input.clone(), Style::new().fg(app.theme.fg)),
+            Span::styled("█", app.theme.title),
+            Span::styled("  (Enter apply · empty clears · Esc cancel)", app.theme.dim),
+        ])
+    } else {
+        Line::styled(
+            " q quit  ␣ pause  p procs  0-9 gpu  j/k move  s sort  r rev  / filter  x/X kill  +/- rate",
+            app.theme.dim,
+        )
+    };
+    frame.render_widget(Paragraph::new(footer_line), footer);
+
+    draw_confirm_popup(frame, area, app);
+}
+
+/// Centered y/N dialog for a pending kill.
+fn draw_confirm_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let Some((pid, force, cmd)) = &app.pending_kill else {
+        return;
+    };
+    let t = &app.theme;
+    let sig = if *force { "SIGKILL" } else { "SIGTERM" };
+    let text = format!("send {sig} to {pid}?");
+    let w = (text.len().max(cmd.len()) as u16 + 6).min(area.width);
+    let h = 5u16.min(area.height);
+    let popup = Rect::new(
+        area.x + (area.width.saturating_sub(w)) / 2,
+        area.y + (area.height.saturating_sub(h)) / 2,
+        w,
+        h,
     );
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(t.temp_crit)
+        .title(caption("confirm".into(), t.temp_crit, t.temp_crit));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let lines = vec![
+        Line::styled(text, Style::new().fg(t.fg)),
+        Line::styled(cmd.clone(), t.dim),
+        Line::from(vec![
+            Span::styled("y", t.temp_crit),
+            Span::styled(" confirm · ", t.dim),
+            Span::styled("any other key", Style::new().fg(t.fg)),
+            Span::styled(" cancels", t.dim),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// GPU card region. When every card fits it behaves like a plain vertical
@@ -486,15 +536,20 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
         app.proc_scroll = app.proc_sel + 1 - visible;
     }
     app.proc_scroll = app.proc_scroll.min(max_scroll);
-    let counter = if max_scroll > 0 {
-        format!(
-            "{}-{}/{total}",
+    let arrow = if app.sort_desc { "↓" } else { "↑" };
+    let mut counter = format!("{}{arrow}", app.sort_by.label());
+    if !app.filter.is_empty() {
+        counter = format!("filter:{} · {counter}", app.filter);
+    }
+    if max_scroll > 0 {
+        counter.push_str(&format!(
+            " · {}-{}/{total}",
             app.proc_scroll + 1,
             app.proc_scroll + visible
-        )
+        ));
     } else {
-        format!("{total}")
-    };
+        counter.push_str(&format!(" · {total}"));
+    }
     let t = &app.theme;
     let border = if app.focus == crate::app::Focus::Procs {
         t.border_selected
@@ -518,9 +573,26 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
+    let arrow = if app.sort_desc { "↓" } else { "↑" };
+    let mark = |label: &str, is: bool| -> String {
+        if is {
+            format!("{label}{arrow}")
+        } else {
+            label.to_string()
+        }
+    };
+    use crate::app::SortBy;
     let header = Row::new(
         [
-            "PID", "USER", "DEV", "TYPE", "GPU%", "GPU MEM", "CPU%", "HOST MEM", "COMMAND",
+            mark("PID", app.sort_by == SortBy::Pid),
+            "USER".into(),
+            "DEV".into(),
+            "TYPE".into(),
+            mark("GPU%", app.sort_by == SortBy::GpuUtil),
+            mark("GPU MEM", app.sort_by == SortBy::GpuMem),
+            mark("CPU%", app.sort_by == SortBy::Cpu),
+            mark("HOST MEM", app.sort_by == SortBy::HostMem),
+            "COMMAND".into(),
         ]
         .into_iter()
         .map(Cell::from),

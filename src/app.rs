@@ -5,11 +5,52 @@ use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
 
 const SPLASH_MS: u64 = 1500;
+const STATUS_MS: u64 = 4000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Gpus,
     Procs,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    Normal,
+    /// Typing in the process filter; raw keys go to the input buffer.
+    Filter,
+    /// Kill confirmation pending; y confirms, anything else cancels.
+    Confirm,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortBy {
+    GpuMem,
+    GpuUtil,
+    Cpu,
+    HostMem,
+    Pid,
+}
+
+impl SortBy {
+    pub fn next(self) -> Self {
+        match self {
+            SortBy::GpuMem => SortBy::GpuUtil,
+            SortBy::GpuUtil => SortBy::Cpu,
+            SortBy::Cpu => SortBy::HostMem,
+            SortBy::HostMem => SortBy::Pid,
+            SortBy::Pid => SortBy::GpuMem,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortBy::GpuMem => "gpu-mem",
+            SortBy::GpuUtil => "gpu%",
+            SortBy::Cpu => "cpu%",
+            SortBy::HostMem => "host-mem",
+            SortBy::Pid => "pid",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -37,6 +78,7 @@ fn command_of(p: &sysinfo::Process) -> String {
 }
 
 /// One row of the process table: GPU stats + host-side enrichment.
+#[derive(Clone)]
 pub struct ProcRow {
     pub pid: u32,
     pub gpu_index: usize,
@@ -61,6 +103,7 @@ pub struct App {
     pub started: Instant,
     pub splash_path: Vec<(u8, u8, char)>,
     pub splash_skipped: bool,
+    /// Filtered + sorted view of the process rows.
     pub procs: Vec<ProcRow>,
     /// GPU indices folded to a one-line summary (digit keys toggle).
     pub folded: std::collections::HashSet<usize>,
@@ -77,8 +120,21 @@ pub struct App {
     pub focus: Focus,
     /// Last backend poll failure; shown in the header, cleared on success.
     pub poll_error: Option<String>,
+    pub input_mode: InputMode,
+    /// Committed process filter (substring, case-insensitive).
+    pub filter: String,
+    /// Live edit buffer while `input_mode == Filter`.
+    pub filter_input: String,
+    pub sort_by: SortBy,
+    pub sort_desc: bool,
+    /// (pid, force, command) awaiting y/N confirmation.
+    pub pending_kill: Option<(u32, bool, String)>,
+    /// Transient header status (kill results), with expiry.
+    pub status: Option<(String, Instant)>,
     /// (rect, gpu index) of each card drawn last frame, for click hit-tests.
     pub card_rects: Vec<(ratatui::layout::Rect, usize)>,
+    /// Unfiltered process rows; `procs` is the filtered+sorted view.
+    all_procs: Vec<ProcRow>,
     sys: System,
     users: Users,
 }
@@ -112,7 +168,15 @@ impl App {
             proc_rect: ratatui::layout::Rect::default(),
             focus: Focus::Gpus,
             poll_error: None,
+            input_mode: InputMode::Normal,
+            filter: String::new(),
+            filter_input: String::new(),
+            sort_by: SortBy::GpuMem,
+            sort_desc: true,
+            pending_kill: None,
+            status: None,
             card_rects: Vec::new(),
+            all_procs: Vec::new(),
             sys: System::new(),
             users: Users::new_with_refreshed_list(),
         }
@@ -120,6 +184,19 @@ impl App {
 
     pub fn splash_active(&self) -> bool {
         !self.splash_skipped && self.started.elapsed() < Duration::from_millis(SPLASH_MS)
+    }
+
+    pub fn status_line(&self) -> Option<&str> {
+        match &self.status {
+            Some((msg, at)) if at.elapsed() < Duration::from_millis(STATUS_MS) => {
+                Some(msg.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    fn set_status(&mut self, msg: String) {
+        self.status = Some((msg, Instant::now()));
     }
 
     /// Poll the backend. Failures degrade gracefully: the last good snapshot
@@ -179,7 +256,7 @@ impl App {
                 .with_cmd(UpdateKind::OnlyIfNotSet),
         );
 
-        let mut rows: Vec<ProcRow> = gpu_procs
+        self.all_procs = gpu_procs
             .into_iter()
             .map(|gp| {
                 let p = self.sys.process(Pid::from_u32(gp.pid));
@@ -200,12 +277,81 @@ impl App {
                 }
             })
             .collect();
+        self.rebuild_proc_view();
+    }
+
+    /// Re-apply filter + sort to the raw rows, keeping the cursor on the
+    /// same (pid, gpu) when it survives the rebuild.
+    pub fn rebuild_proc_view(&mut self) {
+        let cursor_key = self.procs.get(self.proc_sel).map(|p| (p.pid, p.gpu_index));
+
+        let needle = self.filter.to_lowercase();
+        let mut rows: Vec<ProcRow> = self
+            .all_procs
+            .iter()
+            .filter(|p| {
+                needle.is_empty()
+                    || p.command.to_lowercase().contains(&needle)
+                    || p.user.to_lowercase().contains(&needle)
+                    || p.pid.to_string().contains(&needle)
+            })
+            .cloned()
+            .collect();
+
         rows.sort_by(|a, b| {
-            b.gpu_mem_bytes
-                .cmp(&a.gpu_mem_bytes)
-                .then(a.pid.cmp(&b.pid))
+            let ord = match self.sort_by {
+                SortBy::GpuMem => a.gpu_mem_bytes.cmp(&b.gpu_mem_bytes),
+                SortBy::GpuUtil => a
+                    .gpu_util_pct
+                    .unwrap_or(0.0)
+                    .total_cmp(&b.gpu_util_pct.unwrap_or(0.0)),
+                SortBy::Cpu => a.cpu_pct.total_cmp(&b.cpu_pct),
+                SortBy::HostMem => a.host_mem_bytes.cmp(&b.host_mem_bytes),
+                SortBy::Pid => a.pid.cmp(&b.pid),
+            };
+            let ord = if self.sort_desc { ord.reverse() } else { ord };
+            ord.then(a.pid.cmp(&b.pid))
         });
         self.procs = rows;
+
+        self.proc_sel = cursor_key
+            .and_then(|key| self.procs.iter().position(|p| (p.pid, p.gpu_index) == key))
+            .unwrap_or_else(|| self.proc_sel.min(self.procs.len().saturating_sub(1)));
+    }
+
+    /// Commit the filter edit buffer (Enter in filter mode).
+    pub fn commit_filter(&mut self) {
+        self.filter = self.filter_input.trim().to_string();
+        self.input_mode = InputMode::Normal;
+        self.rebuild_proc_view();
+    }
+
+    /// Send the pending signal (y in confirm mode).
+    pub fn confirm_kill(&mut self) {
+        let Some((pid, force, cmd)) = self.pending_kill.take() else {
+            return;
+        };
+        self.input_mode = InputMode::Normal;
+        let sig_name = if force { "SIGKILL" } else { "SIGTERM" };
+        let Some(p) = self.sys.process(Pid::from_u32(pid)) else {
+            self.set_status(format!("kill: pid {pid} no longer exists"));
+            return;
+        };
+        // kill_with returns None when the signal isn't supported on this
+        // platform (e.g. Term on Windows) — fall back to plain kill().
+        let sig = if force {
+            sysinfo::Signal::Kill
+        } else {
+            sysinfo::Signal::Term
+        };
+        let ok = p.kill_with(sig).unwrap_or_else(|| p.kill());
+        if ok {
+            self.set_status(format!("sent {sig_name} to {pid} ({cmd})"));
+        } else {
+            self.set_status(format!(
+                "{sig_name} to {pid} failed (permission? try as root)"
+            ));
+        }
     }
 
     /// Apply a key action. Returns true when the app should quit.
@@ -241,6 +387,29 @@ impl App {
             Action::FocusProcs => self.focus = Focus::Procs,
             Action::ProcScrollDown => self.proc_down(),
             Action::ProcScrollUp => self.proc_up(),
+            Action::SortCycle => {
+                self.sort_by = self.sort_by.next();
+                self.rebuild_proc_view();
+            }
+            Action::SortReverse => {
+                self.sort_desc = !self.sort_desc;
+                self.rebuild_proc_view();
+            }
+            Action::FilterOpen => {
+                self.focus = Focus::Procs;
+                self.filter_input = self.filter.clone();
+                self.input_mode = InputMode::Filter;
+            }
+            Action::KillTerm | Action::KillForce => {
+                if let Some(row) = self.procs.get(self.proc_sel) {
+                    self.pending_kill = Some((
+                        row.pid,
+                        matches!(action, Action::KillForce),
+                        row.command.chars().take(40).collect(),
+                    ));
+                    self.input_mode = InputMode::Confirm;
+                }
+            }
         }
         false
     }

@@ -8,11 +8,11 @@ mod theme;
 mod ui;
 
 use anyhow::Result;
-use app::App;
-use app::Focus;
+use app::{App, Focus, InputMode};
 use clap::Parser;
 use cli::Cli;
 use config::GpurConfig;
+use crossterm::event::KeyCode;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
 };
@@ -68,10 +68,33 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                         app.splash_skipped = true;
                         continue;
                     }
-                    if let Some(action) = keys::resolve(&mut keymap, key)
-                        && app.apply(action)
-                    {
-                        return Ok(());
+                    match app.input_mode {
+                        // Filter editing: raw input, bypasses the keymap.
+                        InputMode::Filter => match key.code {
+                            KeyCode::Enter => app.commit_filter(),
+                            KeyCode::Esc => app.input_mode = InputMode::Normal,
+                            KeyCode::Backspace => {
+                                app.filter_input.pop();
+                            }
+                            KeyCode::Char(c) => app.filter_input.push(c),
+                            _ => {}
+                        },
+                        // Kill confirmation: y confirms, anything else cancels.
+                        InputMode::Confirm => {
+                            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                                app.confirm_kill();
+                            } else {
+                                app.pending_kill = None;
+                                app.input_mode = InputMode::Normal;
+                            }
+                        }
+                        InputMode::Normal => {
+                            if let Some(action) = keys::resolve(&mut keymap, key)
+                                && app.apply(action)
+                            {
+                                return Ok(());
+                            }
+                        }
                     }
                 }
                 Event::Mouse(m) => {

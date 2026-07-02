@@ -8,6 +8,15 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Process actions: `s` cycles the sort column (gpu-mem → gpu% → cpu% → host-mem
+  → pid, arrow shown in the header and caption), `r` reverses, `/` opens a
+  filter input (case-insensitive substring on command/user/pid, Enter applies,
+  empty clears, Esc cancels), `x`/`X` send SIGTERM/SIGKILL to the selected
+  process behind a y/N confirmation popup; results show as a transient header
+  status. Cursor stays on the same process across re-sorts/filters.
+
 ## [0.2.0] - 2026-07-02
 
 ### Added
