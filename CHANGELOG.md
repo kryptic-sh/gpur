@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Added
 
+- AMD backend (Linux): sysfs/amdgpu — utilization (`gpu_busy_percent`), VRAM
+  (`mem_info_vram_*`), edge temperature, power draw + cap, PWM fan %, core/mem
+  clocks via hwmon; multi-card (iGPU + dGPU), marketing names from `pci.ids`.
+  Zero power caps and gated clocks at idle are handled.
 - Initial scaffold: `GpuBackend` trait with nvidia/amd/apple probe stubs and a
   deterministic mock backend (`--mock`).
 - btop-style ratatui dashboard: per-GPU utilization/VRAM gauges, history

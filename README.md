@@ -5,12 +5,13 @@ everywhere: NVIDIA, AMD, and Apple Silicon GPUs on Linux, macOS, and Windows.
 
 ## Status
 
-Early scaffold. The TUI, theming, config, and keybinding plumbing are in place;
-vendor backends are stubs. Run with `--mock` to see the dashboard with fake
-GPUs.
+Early days. The TUI, theming, config, and keybinding plumbing are in place. AMD
+GPUs work on Linux (iGPU + dGPU, multi-card); NVIDIA and Apple backends are
+stubs. Run with `--mock` to see the dashboard with fake GPUs.
 
 ```sh
-cargo run -- --mock
+cargo run            # real GPUs (AMD on Linux)
+cargo run -- --mock  # fake GPUs, works anywhere
 ```
 
 ## Keys
@@ -43,7 +44,7 @@ Themes use the [hjkl-theme](https://crates.io/crates/hjkl-theme) schema:
 | Backend | Platform              | Source                         | Status  |
 | ------- | --------------------- | ------------------------------ | ------- |
 | nvml    | Linux, Windows        | NVML                           | planned |
-| amdgpu  | Linux                 | sysfs `/sys/class/drm`         | planned |
+| amdgpu  | Linux                 | sysfs `/sys/class/drm`         | done    |
 | adlx    | Windows               | ADLX                           | planned |
 | metal   | macOS (Apple Silicon) | IOReport/IOKit                 | planned |
 | mock    | all                   | deterministic waves (`--mock`) | done    |
