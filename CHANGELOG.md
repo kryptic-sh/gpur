@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-02
+
 ### Added
 
 - Org-style release pipeline in `ci.yml`: 7-target build matrix (linux gnu/musl
@@ -43,4 +45,5 @@ and this project adheres to
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/commits/main
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.1.0
