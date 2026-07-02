@@ -10,6 +10,19 @@ and this project adheres to
 
 ### Added
 
+- NVIDIA backend: NVML via `nvml-wrapper` (Linux/Windows) — utilization, VRAM,
+  temperature, power + limit, fan, core/mem clocks, PCIe gen/width and RX/TX
+  throughput. Driver library loaded dynamically; probe fails soft.
+- Apple backend (macOS): IOKit IOAccelerator `PerformanceStatistics` —
+  utilization + memory for Apple Silicon (AGX, SoC-derived name with GPU core
+  count, unified-memory totals) and Intel-Mac GPUs.
+- Windows generic backend: PDH `GPU Engine`/`GPU Adapter Memory` counters (Task
+  Manager semantics: busiest-engine sum per adapter LUID) + DXGI for names/VRAM
+  totals; covers AMD/Intel where NVML is absent.
+- nvtop-style header details: integrated-GPU tag, PCIe gen@width, PCIe RX/TX,
+  memory-controller busy %, plus a second per-GPU VRAM% sparkline.
+- AMD: APU detection via `gpu_metrics` format revision, PCIe link speed/width
+  from sysfs, APU memory clock via `pp_dpm_mclk` active level.
 - AMD backend (Linux): sysfs/amdgpu — utilization (`gpu_busy_percent`), VRAM
   (`mem_info_vram_*`), edge temperature, power draw + cap, PWM fan %, core/mem
   clocks via hwmon; multi-card (iGPU + dGPU), marketing names from `pci.ids`.

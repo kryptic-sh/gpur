@@ -5,12 +5,12 @@ everywhere: NVIDIA, AMD, and Apple Silicon GPUs on Linux, macOS, and Windows.
 
 ## Status
 
-Early days. The TUI, theming, config, and keybinding plumbing are in place. AMD
-GPUs work on Linux (iGPU + dGPU, multi-card); NVIDIA and Apple backends are
-stubs. Run with `--mock` to see the dashboard with fake GPUs.
+All platforms have a working backend: NVML (NVIDIA), sysfs/amdgpu (AMD Linux),
+IOKit (macOS), PDH counters (Windows AMD/Intel). Depth varies — see the backend
+table below.
 
 ```sh
-cargo run            # real GPUs (AMD on Linux)
+cargo run            # real GPUs
 cargo run -- --mock  # fake GPUs, works anywhere
 ```
 
@@ -41,13 +41,18 @@ Themes use the [hjkl-theme](https://crates.io/crates/hjkl-theme) schema:
 
 ## Backends
 
-| Backend | Platform              | Source                         | Status  |
-| ------- | --------------------- | ------------------------------ | ------- |
-| nvml    | Linux, Windows        | NVML                           | planned |
-| amdgpu  | Linux                 | sysfs `/sys/class/drm`         | done    |
-| adlx    | Windows               | ADLX                           | planned |
-| metal   | macOS (Apple Silicon) | IOReport/IOKit                 | planned |
-| mock    | all                   | deterministic waves (`--mock`) | done    |
+| Backend | Platform       | Source                           | Status |
+| ------- | -------------- | -------------------------------- | ------ |
+| nvml    | Linux, Windows | NVML (dynamic load)              | done   |
+| amdgpu  | Linux          | sysfs `/sys/class/drm`           | done   |
+| pdh     | Windows        | GPU Engine/Adapter Memory + DXGI | done   |
+| ioaccel | macOS          | IOAccelerator PerfStats (IOKit)  | done   |
+| mock    | all            | deterministic waves (`--mock`)   | done   |
+
+Probe order: nvml → amdgpu → ioaccel → pdh. PDH is the vendor-generic Windows
+fallback (Task Manager's counters) covering AMD/Intel; it reports utilization
+and memory only. Apple temperature/power (SMC/IOReport) and Windows AMD ADLX
+(temps/fans/clocks) are planned.
 
 ## License
 

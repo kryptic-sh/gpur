@@ -4,6 +4,7 @@ mod amd;
 mod apple;
 mod mock;
 mod nvidia;
+mod windows;
 
 pub use mock::MockBackend;
 
@@ -13,8 +14,12 @@ use anyhow::Result;
 #[derive(Debug, Clone, Default)]
 pub struct GpuSnapshot {
     pub name: String,
+    /// Integrated (APU/iGPU) as opposed to a discrete card.
+    pub integrated: bool,
     /// Core utilization, 0..=100.
     pub utilization_pct: f64,
+    /// Memory-controller busy %, distinct from VRAM fill level.
+    pub mem_util_pct: Option<f64>,
     pub vram_used_bytes: u64,
     pub vram_total_bytes: u64,
     pub temperature_c: Option<f64>,
@@ -23,6 +28,13 @@ pub struct GpuSnapshot {
     pub fan_pct: Option<f64>,
     pub clock_mhz: Option<u64>,
     pub mem_clock_mhz: Option<u64>,
+    /// Current PCIe generation (1..=7).
+    pub pcie_gen: Option<u8>,
+    /// Current PCIe lane count.
+    pub pcie_width: Option<u32>,
+    /// PCIe throughput, KiB/s.
+    pub pcie_rx_kbs: Option<u64>,
+    pub pcie_tx_kbs: Option<u64>,
 }
 
 impl GpuSnapshot {
@@ -54,6 +66,10 @@ pub fn detect(force_mock: bool) -> Result<Box<dyn GpuBackend>> {
         return Ok(b);
     }
     if let Some(b) = apple::probe() {
+        return Ok(b);
+    }
+    // Vendor-generic Windows fallback (Task Manager counters).
+    if let Some(b) = windows::probe() {
         return Ok(b);
     }
     anyhow::bail!("no supported GPU backend found (run with --mock to demo the UI)")

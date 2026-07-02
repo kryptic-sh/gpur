@@ -59,8 +59,20 @@ pub fn draw(frame: &mut Frame, app: &App) {
 fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: usize) {
     let t = &app.theme;
     let selected = idx == app.selected;
+    let mut title = vec![Span::styled(format!(" {idx} · {} ", gpu.name), t.title)];
+    if gpu.integrated {
+        title.push(Span::styled("integrated ", t.dim));
+    } else if let (Some(g), Some(width)) = (gpu.pcie_gen, gpu.pcie_width) {
+        title.push(Span::styled(format!("PCIe {g}.0@{width}x "), t.dim));
+    }
+    if let (Some(rx), Some(tx)) = (gpu.pcie_rx_kbs, gpu.pcie_tx_kbs) {
+        title.push(Span::styled(
+            format!("RX {} TX {} ", kbs(rx), kbs(tx)),
+            t.dim,
+        ));
+    }
     let block = Block::bordered()
-        .title(Span::styled(format!(" {idx} · {} ", gpu.name), t.title))
+        .title(Line::from(title))
         .border_style(if selected {
             t.border_selected
         } else {
@@ -105,11 +117,24 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
     if spark_row.height > 0
         && let Some(hist) = app.history.get(idx)
     {
-        let width = spark_row.width as usize;
-        let data = tail(&hist.util, width);
+        let [util_spark, vram_spark] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(spark_row);
         frame.render_widget(
-            Sparkline::default().data(data).style(t.spark_util),
-            spark_row,
+            Sparkline::default()
+                .data(tail(&hist.util, util_spark.width as usize))
+                .max(100)
+                .style(t.spark_util)
+                .block(Block::new().title(Span::styled("gpu%", t.dim))),
+            util_spark,
+        );
+        frame.render_widget(
+            Sparkline::default()
+                .data(tail(&hist.vram, vram_spark.width as usize))
+                .max(100)
+                .style(t.gauge_vram)
+                .block(Block::new().title(Span::styled("vram%", t.dim))),
+            vram_spark,
         );
     }
 
@@ -133,7 +158,21 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
     if let Some(m) = gpu.mem_clock_mhz {
         info.push(Span::styled(format!("mem {m}MHz "), t.dim));
     }
+    if let Some(mb) = gpu.mem_util_pct {
+        info.push(Span::styled(format!("membus {mb:.0}% "), t.dim));
+    }
     frame.render_widget(Paragraph::new(Line::from(info)), info_row);
+}
+
+/// KiB/s -> human rate, matching nvtop's per-direction PCIe readout.
+fn kbs(v: u64) -> String {
+    if v >= 1024 * 1024 {
+        format!("{:.1}GiB/s", v as f64 / (1024.0 * 1024.0))
+    } else if v >= 1024 {
+        format!("{:.1}MiB/s", v as f64 / 1024.0)
+    } else {
+        format!("{v}KiB/s")
+    }
 }
 
 fn gib(bytes: u64) -> f64 {

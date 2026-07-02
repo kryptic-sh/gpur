@@ -9,6 +9,7 @@ const SPLASH_MS: u64 = 1500;
 #[derive(Default)]
 pub struct History {
     pub util: Vec<u64>,
+    pub vram: Vec<u64>,
     pub power: Vec<u64>,
 }
 
@@ -64,10 +65,12 @@ impl App {
         }
         for (gpu, hist) in self.gpus.iter().zip(&mut self.history) {
             hist.util.push(gpu.utilization_pct.round() as u64);
+            hist.vram.push(gpu.vram_pct().round() as u64);
             hist.power.push(gpu.power_w.unwrap_or(0.0).round() as u64);
             let overflow = hist.util.len().saturating_sub(self.history_len);
             if overflow > 0 {
                 hist.util.drain(..overflow);
+                hist.vram.drain(..overflow);
                 hist.power.drain(..overflow);
             }
         }

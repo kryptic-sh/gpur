@@ -92,7 +92,9 @@ mod linux {
         let h = d.hwmon.as_deref();
         GpuSnapshot {
             name: d.name.clone(),
+            integrated: is_apu(&d.dev),
             utilization_pct: read_u64(&d.dev.join("gpu_busy_percent")).unwrap_or(0) as f64,
+            mem_util_pct: read_u64(&d.dev.join("mem_busy_percent")).map(|v| v as f64),
             vram_used_bytes: read_u64(&d.dev.join("mem_info_vram_used")).unwrap_or(0),
             vram_total_bytes: read_u64(&d.dev.join("mem_info_vram_total")).unwrap_or(0),
             // Millidegrees C. temp1 is the "edge" sensor on amdgpu.
@@ -108,9 +110,59 @@ mod linux {
                 .map(|v| v as f64 / 1e6),
             fan_pct: fan_pct(h),
             // Hz. Reads 0 when the clock domain is power-gated at idle.
-            clock_mhz: hwmon_u64(h, "freq1_input").map(|v| v / 1_000_000),
-            mem_clock_mhz: hwmon_u64(h, "freq2_input").map(|v| v / 1_000_000),
+            clock_mhz: hwmon_u64(h, "freq1_input")
+                .map(|v| v / 1_000_000)
+                .or_else(|| dpm_active_mhz(&d.dev.join("pp_dpm_sclk"))),
+            mem_clock_mhz: hwmon_u64(h, "freq2_input")
+                .map(|v| v / 1_000_000)
+                // APUs have no freq2_input; the active DPM level has it.
+                .or_else(|| dpm_active_mhz(&d.dev.join("pp_dpm_mclk"))),
+            pcie_gen: read_trim(&d.dev.join("current_link_speed"))
+                .as_deref()
+                .and_then(gts_to_gen),
+            pcie_width: read_trim(&d.dev.join("current_link_width")).and_then(|w| w.parse().ok()),
+            // amdgpu does not expose PCIe throughput counters.
+            pcie_rx_kbs: None,
+            pcie_tx_kbs: None,
         }
+    }
+
+    /// gpu_metrics header byte 2 is the format revision: v1_x = discrete,
+    /// v2_x/v3_x = APU. Missing file -> assume discrete.
+    fn is_apu(dev: &Path) -> bool {
+        fs::read(dev.join("gpu_metrics"))
+            .ok()
+            .and_then(|b| b.get(2).copied())
+            .is_some_and(|rev| rev >= 2)
+    }
+
+    /// "16.0 GT/s PCIe" -> Some(4). Gen1=2.5, doubling each gen after Gen2.
+    fn gts_to_gen(speed: &str) -> Option<u8> {
+        let gts: f64 = speed.split_whitespace().next()?.parse().ok()?;
+        Some(match gts {
+            s if s >= 128.0 => 7,
+            s if s >= 64.0 => 6,
+            s if s >= 32.0 => 5,
+            s if s >= 16.0 => 4,
+            s if s >= 8.0 => 3,
+            s if s >= 5.0 => 2,
+            _ => 1,
+        })
+    }
+
+    /// Parse the '*'-marked active level of a pp_dpm_{s,m}clk table:
+    /// "1: 3000Mhz *" -> Some(3000).
+    fn dpm_active_mhz(path: &Path) -> Option<u64> {
+        let table = read_trim(path)?;
+        let active = table.lines().find(|l| l.trim_end().ends_with('*'))?;
+        let digits: String = active
+            .split(':')
+            .nth(1)?
+            .trim()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
     }
 
     fn fan_pct(h: Option<&Path>) -> Option<f64> {
@@ -196,6 +248,26 @@ mod linux {
                 pci_device_name(IDS, "10de", "744c").as_deref(),
                 Some("Not an AMD device")
             );
+        }
+
+        #[test]
+        fn pcie_gen_from_gts_string() {
+            assert_eq!(gts_to_gen("2.5 GT/s PCIe"), Some(1));
+            assert_eq!(gts_to_gen("8.0 GT/s PCIe"), Some(3));
+            assert_eq!(gts_to_gen("16.0 GT/s PCIe"), Some(4));
+            assert_eq!(gts_to_gen("32.0 GT/s PCIe"), Some(5));
+            assert_eq!(gts_to_gen("garbage"), None);
+        }
+
+        #[test]
+        fn dpm_table_active_level_parses() {
+            let dir = std::env::temp_dir().join("gpur-dpm-test");
+            std::fs::create_dir_all(&dir).unwrap();
+            let f = dir.join("pp_dpm_mclk");
+            std::fs::write(&f, "0: 96Mhz\n1: 3000Mhz *\n2: 1249Mhz\n").unwrap();
+            assert_eq!(dpm_active_mhz(&f), Some(3000));
+            std::fs::write(&f, "S: 0Mhz *\n").unwrap();
+            assert_eq!(dpm_active_mhz(&f), Some(0));
         }
 
         #[test]
