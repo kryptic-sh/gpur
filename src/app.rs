@@ -3,7 +3,7 @@ use crate::keys::Action;
 use crate::theme::UiTheme;
 use anyhow::Result;
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, ProcessesToUpdate, System, Users};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
 
 const SPLASH_MS: u64 = 1500;
 
@@ -12,6 +12,22 @@ pub struct History {
     pub util: Vec<u64>,
     pub vram: Vec<u64>,
     pub power: Vec<u64>,
+}
+
+/// Full command line like nvtop; falls back to the process name for
+/// kernel threads and stripped cmdlines.
+fn command_of(p: &sysinfo::Process) -> String {
+    let cmd = p
+        .cmd()
+        .iter()
+        .map(|a| a.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cmd.trim().is_empty() {
+        p.name().to_string_lossy().into_owned()
+    } else {
+        cmd
+    }
 }
 
 /// One row of the process table: GPU stats + host-side enrichment.
@@ -100,9 +116,22 @@ impl App {
 
     fn refresh_processes(&mut self) {
         let gpu_procs = self.backend.processes();
-        let pids: Vec<Pid> = gpu_procs.iter().map(|p| Pid::from_u32(p.pid)).collect();
-        self.sys
-            .refresh_processes(ProcessesToUpdate::Some(&pids), true);
+        // Dedupe: a process on N GPUs appears N times, and sysinfo removes a
+        // process refreshed twice in one pass with remove_dead=true.
+        let mut pids: Vec<Pid> = gpu_procs.iter().map(|p| Pid::from_u32(p.pid)).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        // The plain refresh_processes() kind omits user and cmd — ask for
+        // exactly what the table shows.
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&pids),
+            true,
+            ProcessRefreshKind::nothing()
+                .with_memory()
+                .with_cpu()
+                .with_user(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::OnlyIfNotSet),
+        );
 
         let mut rows: Vec<ProcRow> = gpu_procs
             .into_iter()
@@ -116,9 +145,7 @@ impl App {
                         .unwrap_or_else(|| "-".into()),
                     cpu_pct: p.map(|p| p.cpu_usage()).unwrap_or(0.0),
                     host_mem_bytes: p.map(|p| p.memory()).unwrap_or(0),
-                    command: p
-                        .map(|p| p.name().to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "?".into()),
+                    command: p.map(command_of).unwrap_or_else(|| "?".into()),
                     pid: gp.pid,
                     gpu_index: gp.gpu_index,
                     kind: gp.kind,

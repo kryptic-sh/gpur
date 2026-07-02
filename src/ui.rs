@@ -33,8 +33,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     frame.render_widget(Paragraph::new(Line::from(head)), header);
 
-    // Process pane: sized to content, capped at ~40% of the body.
-    let proc_height = (app.procs.len() as u16 + 3).clamp(4, (body.height * 2) / 5);
+    // Process pane: sized to content, capped at ~40% of the body. Careful on
+    // tiny terminals: the cap can drop below the 4-row minimum.
+    let want = app.procs.len() as u16 + 3;
+    let cap = ((body.height * 2) / 5).max(4);
+    let proc_height = want.min(cap).min(body.height);
     let [gpus_area, proc_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(proc_height)]).areas(body);
 
