@@ -42,8 +42,9 @@ pub enum InputMode {
     Confirm,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum SortBy {
+    #[default]
     GpuMem,
     GpuUtil,
     Cpu,
@@ -145,6 +146,28 @@ pub struct ProcRow {
     pub command: String,
 }
 
+/// UI state persisted across runs (folded cards, sort, poll rate) — the
+/// tikr session.json pattern: auto-saved on clean quit into the cache dir,
+/// never a config file.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+pub struct UiState {
+    pub folded: Vec<usize>,
+    pub sort_by: SortBy,
+    pub sort_desc: bool,
+    pub tick_ms: u64,
+}
+
+fn state_path() -> Option<std::path::PathBuf> {
+    hjkl_config::cache_dir("gpur")
+        .ok()
+        .map(|d| d.join("state.json"))
+}
+
+pub fn load_state() -> Option<UiState> {
+    let text = std::fs::read_to_string(state_path()?).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// Startup knobs for [`App::new`], resolved from CLI + config.
 pub struct AppOptions {
     pub tick_ms: u64,
@@ -197,6 +220,8 @@ pub struct App {
     pub pending_kill: Option<(u32, bool, String)>,
     /// Transient header status (kill results), with expiry.
     pub status: Option<(String, Instant)>,
+    /// Help overlay visible; any key dismisses.
+    pub show_help: bool,
     /// (rect, gpu index) of each card drawn last frame, for click hit-tests.
     pub card_rects: Vec<(ratatui::layout::Rect, usize)>,
     pub graph_style: GraphStyle,
@@ -255,10 +280,35 @@ impl App {
             sort_desc: true,
             pending_kill: None,
             status: None,
+            show_help: false,
             card_rects: Vec::new(),
             all_procs: Vec::new(),
             sys: System::new(),
             users: Users::new_with_refreshed_list(),
+        }
+    }
+
+    pub fn restore_state(&mut self, s: &UiState) {
+        self.folded = s.folded.iter().copied().collect();
+        self.sort_by = s.sort_by;
+        self.sort_desc = s.sort_desc;
+    }
+
+    /// Best-effort save on clean quit; silent on failure (a monitor must
+    /// never refuse to exit over a full disk).
+    pub fn save_state(&self) {
+        let Some(path) = state_path() else { return };
+        let state = UiState {
+            folded: self.folded.iter().copied().collect(),
+            sort_by: self.sort_by,
+            sort_desc: self.sort_desc,
+            tick_ms: self.tick_ms,
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(path, json);
         }
     }
 
@@ -509,6 +559,7 @@ impl App {
                 }
             }
             Action::FocusProcs => self.focus = Focus::Procs,
+            Action::Help => self.show_help = true,
             Action::ProcScrollDown => self.proc_down(),
             Action::ProcScrollUp => self.proc_up(),
             Action::SortCycle => {

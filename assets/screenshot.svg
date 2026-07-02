@@ -1,0 +1,347 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1084" height="636" font-family="'JetBrains Mono','Cascadia Code','DejaVu Sans Mono',monospace" font-size="15">
+<rect width="100%" height="100%" rx="8" fill="#1e1e2e"/>
+<rect x="23.6" y="470.0" width="1036.8" height="19" fill="#45475a"/>
+<text x="14.0" y="28.0" fill="#cba6f7" font-weight="bold"> gpur v0.5.0</text>
+<text x="138.8" y="28.0" fill="#6c7086">[mock] 120ms</text>
+<text x="14.0" y="47.0" fill="#cba6f7" font-weight="bold">╭┐0·Mock GPU 0┌─────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="945.2" y="47.0" fill="#6c7086" font-weight="bold">integrated</text>
+<text x="1041.2" y="47.0" fill="#cba6f7" font-weight="bold">┌╮</text>
+<text x="1060.4" y="47.0" fill="#6c7086">█</text>
+<text x="14.0" y="66.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="23.6" y="66.0" fill="#cdd6f4">GPU</text>
+<text x="62.0" y="66.0" fill="#a6e3a1">■</text>
+<text x="71.6" y="66.0" fill="#a8e3a1">■</text>
+<text x="81.2" y="66.0" fill="#a9e3a2">■</text>
+<text x="90.8" y="66.0" fill="#abe3a2">■</text>
+<text x="100.4" y="66.0" fill="#ade3a2">■</text>
+<text x="110.0" y="66.0" fill="#afe3a2">■</text>
+<text x="119.6" y="66.0" fill="#b0e3a3">■</text>
+<text x="129.2" y="66.0" fill="#b2e3a3">■</text>
+<text x="138.8" y="66.0" fill="#b4e3a3">■</text>
+<text x="148.4" y="66.0" fill="#b6e3a4">■</text>
+<text x="158.0" y="66.0" fill="#b7e3a4">■</text>
+<text x="167.6" y="66.0" fill="#b9e3a4">■</text>
+<text x="177.2" y="66.0" fill="#bbe3a5">■</text>
+<text x="186.8" y="66.0" fill="#bce3a5">■</text>
+<text x="196.4" y="66.0" fill="#bee3a5">■</text>
+<text x="206.0" y="66.0" fill="#c0e3a5">■</text>
+<text x="215.6" y="66.0" fill="#c2e3a6">■</text>
+<text x="225.2" y="66.0" fill="#c3e3a6">■</text>
+<text x="234.8" y="66.0" fill="#c5e3a6">■</text>
+<text x="244.4" y="66.0" fill="#c7e3a7">■</text>
+<text x="254.0" y="66.0" fill="#c9e3a7">■</text>
+<text x="263.6" y="66.0" fill="#cae3a7">■</text>
+<text x="273.2" y="66.0" fill="#cce3a7">■</text>
+<text x="282.8" y="66.0" fill="#cee3a8">■</text>
+<text x="292.4" y="66.0" fill="#d0e3a8">■</text>
+<text x="302.0" y="66.0" fill="#d1e2a8">■</text>
+<text x="311.6" y="66.0" fill="#d3e2a9">■</text>
+<text x="321.2" y="66.0" fill="#d5e2a9">■</text>
+<text x="330.8" y="66.0" fill="#d6e2a9">■</text>
+<text x="340.4" y="66.0" fill="#d8e2a9">■</text>
+<text x="350.0" y="66.0" fill="#dae2aa">■</text>
+<text x="359.6" y="66.0" fill="#dce2aa">■</text>
+<text x="369.2" y="66.0" fill="#dde2aa">■</text>
+<text x="378.8" y="66.0" fill="#dfe2ab">■</text>
+<text x="388.4" y="66.0" fill="#e1e2ab">■</text>
+<text x="398.0" y="66.0" fill="#e3e2ab">■</text>
+<text x="407.6" y="66.0" fill="#e4e2ac">■</text>
+<text x="417.2" y="66.0" fill="#e6e2ac">■</text>
+<text x="426.8" y="66.0" fill="#e8e2ac">■</text>
+<text x="436.4" y="66.0" fill="#e9e2ac">■</text>
+<text x="446.0" y="66.0" fill="#ebe2ad">■</text>
+<text x="455.6" y="66.0" fill="#ede2ad">■</text>
+<text x="465.2" y="66.0" fill="#efe2ad">■</text>
+<text x="474.8" y="66.0" fill="#f0e2ae">■</text>
+<text x="484.4" y="66.0" fill="#f2e2ae">■</text>
+<text x="494.0" y="66.0" fill="#f4e2ae">■</text>
+<text x="503.6" y="66.0" fill="#f6e2ae">■</text>
+<text x="513.2" y="66.0" fill="#f7e2af">■</text>
+<text x="522.8" y="66.0" fill="#f9e2af">■</text>
+<text x="532.4" y="66.0" fill="#f9e0af">■</text>
+<text x="542.0" y="66.0" fill="#f9deaf">■</text>
+<text x="551.6" y="66.0" fill="#f9ddaf">■</text>
+<text x="561.2" y="66.0" fill="#f9dbae">■</text>
+<text x="570.8" y="66.0" fill="#f8d9ae">■</text>
+<text x="580.4" y="66.0" fill="#f8d7ae">■</text>
+<text x="590.0" y="66.0" fill="#f8d5ae">■</text>
+<text x="599.6" y="66.0" fill="#f8d4ae">■</text>
+<text x="609.2" y="66.0" fill="#f8d2ae">■</text>
+<text x="618.8" y="66.0" fill="#f8d0ae">■</text>
+<text x="628.4" y="66.0" fill="#f8cead">■</text>
+<text x="638.0" y="66.0" fill="#f8ccad">■</text>
+<text x="647.6" y="66.0" fill="#f7caad">■</text>
+<text x="657.2" y="66.0" fill="#f7c9ad">■</text>
+<text x="666.8" y="66.0" fill="#f7c7ad">■</text>
+<text x="676.4" y="66.0" fill="#f7c5ad">■</text>
+<text x="686.0" y="66.0" fill="#f7c3ad">■</text>
+<text x="695.6" y="66.0" fill="#f7c1ac">■</text>
+<text x="705.2" y="66.0" fill="#f7c0ac">■</text>
+<text x="714.8" y="66.0" fill="#f7beac">■</text>
+<text x="724.4" y="66.0" fill="#f6bcac">■</text>
+<text x="734.0" y="66.0" fill="#f6baac">■</text>
+<text x="743.6" y="66.0" fill="#f6b8ac">■</text>
+<text x="753.2" y="66.0" fill="#f6b7ac">■</text>
+<text x="762.8" y="66.0" fill="#f6b5ab">■</text>
+<text x="772.4" y="66.0" fill="#f6b3ab">■</text>
+<text x="782.0" y="66.0" fill="#f6b1ab">■</text>
+<text x="791.6" y="66.0" fill="#f6afab">■</text>
+<text x="801.2" y="66.0" fill="#f5adab">■</text>
+<text x="810.8" y="66.0" fill="#f5acab">■</text>
+<text x="820.4" y="66.0" fill="#f5aaaa">■</text>
+<text x="830.0" y="66.0" fill="#f5a8aa">■</text>
+<text x="839.6" y="66.0" fill="#f5a6aa">■</text>
+<text x="849.2" y="66.0" fill="#f5a4aa">■</text>
+<text x="858.8" y="66.0" fill="#f5a3aa">■</text>
+<text x="868.4" y="66.0" fill="#f5a1aa">■</text>
+<text x="878.0" y="66.0" fill="#f49faa">■</text>
+<text x="887.6" y="66.0" fill="#f49da9">■</text>
+<text x="897.2" y="66.0" fill="#6c7086">··········</text>
+<text x="993.2" y="66.0" fill="#cdd6f4">  90%</text>
+<text x="1050.8" y="66.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="1060.4" y="66.0" fill="#6c7086">█</text>
+<text x="14.0" y="85.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="23.6" y="85.0" fill="#cdd6f4">MEM</text>
+<text x="62.0" y="85.0" fill="#89b4fa">■</text>
+<text x="71.6" y="85.0" fill="#8ab4fa">■■</text>
+<text x="90.8" y="85.0" fill="#8bb4fa">■</text>
+<text x="100.4" y="85.0" fill="#8cb3fa">■</text>
+<text x="110.0" y="85.0" fill="#8db3fa">■■</text>
+<text x="129.2" y="85.0" fill="#8eb3fa">■</text>
+<text x="138.8" y="85.0" fill="#8fb3fa">■■</text>
+<text x="158.0" y="85.0" fill="#90b2fa">■</text>
+<text x="167.6" y="85.0" fill="#91b2fa">■</text>
+<text x="177.2" y="85.0" fill="#92b2fa">■</text>
+<text x="186.8" y="85.0" fill="#6c7086">················································································</text>
+<text x="954.8" y="85.0" fill="#cdd6f4"> 2.3G/16G</text>
+<text x="1050.8" y="85.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="1060.4" y="85.0" fill="#6c7086">█</text>
+<text x="14.0" y="104.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="23.6" y="104.0" fill="#6c7086">gpu%</text>
+<text x="810.8" y="104.0" fill="#f38ba8">⢀⣠⣶⣶⣿⣶⣦⣄⡀</text>
+<text x="993.2" y="104.0" fill="#f38ba8">⣀⣴⣶⣾⣷⣶</text>
+<text x="1050.8" y="104.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="1060.4" y="104.0" fill="#6c7086">█</text>
+<text x="14.0" y="123.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="23.6" y="123.0" fill="#a6e3a1">⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⣄⣀⣀⣀⣀⣀⣠⣴⣿⣿⣿⣿⣿⣿⣿</text>
+<text x="1050.8" y="123.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="1060.4" y="123.0" fill="#6c7086">█</text>
+<text x="14.0" y="142.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="23.6" y="142.0" fill="#89b4fa">⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠟⠛⠋</text>
+<text x="1050.8" y="142.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="1060.4" y="142.0" fill="#6c7086">█</text>
+<text x="14.0" y="161.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="810.8" y="161.0" fill="#aaadf9">⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠟⠋⠉</text>
+<text x="1050.8" y="161.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="1060.4" y="161.0" fill="#6c7086">█</text>
+<text x="14.0" y="180.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="23.6" y="180.0" fill="#6c7086">vram%</text>
+<text x="810.8" y="180.0" fill="#cba6f7">⠛⠛⠿⠿⠿⢿⣿⡿⠿⠿⠿⠛⠛⠉⠁</text>
+<text x="1050.8" y="180.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="1060.4" y="180.0" fill="#6c7086">█</text>
+<text x="14.0" y="199.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="23.6" y="199.0" fill="#6c7086"> session</text>
+<text x="110.0" y="199.0" fill="#cdd6f4">peak 100%   85°C  300W</text>
+<text x="350.0" y="199.0" fill="#6c7086">avg  60%  203W</text>
+<text x="1050.8" y="199.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="1060.4" y="199.0" fill="#6c7086">█</text>
+<text x="14.0" y="218.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="33.2" y="218.0" fill="#6c7086">⣿⣿⣿⣿⣿</text>
+<text x="81.2" y="218.0" fill="#f9e2af" font-weight="bold"> 81°C</text>
+<text x="148.4" y="218.0" fill="#6c7086">⣿⣿⣿⣿⣿</text>
+<text x="196.4" y="218.0" fill="#94e2d5"> 276/320W</text>
+<text x="302.0" y="218.0" fill="#6c7086">▼704.7MiB/s ▲264.3MiB/s  fan 81%  core 2282MHz  mem 9000MHz  membus 54%  video</text>
+<text x="1050.8" y="218.0" fill="#cba6f7" font-weight="bold">│</text>
+<text x="1060.4" y="218.0" fill="#6c7086">█</text>
+<text x="14.0" y="237.0" fill="#cba6f7" font-weight="bold">╰───────────────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+<text x="1060.4" y="237.0" fill="#6c7086">█</text>
+<text x="14.0" y="256.0" fill="#6c7086">╭┐</text>
+<text x="33.2" y="256.0" fill="#cba6f7" font-weight="bold">1·Mock GPU 1</text>
+<text x="148.4" y="256.0" fill="#6c7086">┌──────────────────────────────────────────────────────────────────┐PCIe 3.0@8x</text>
+<text x="906.8" y="256.0" fill="#f9e2af" font-weight="bold"> (max 4.0@16x)</text>
+<text x="1041.2" y="256.0" fill="#6c7086">┌╮█</text>
+<text x="14.0" y="275.0" fill="#6c7086">│</text>
+<text x="23.6" y="275.0" fill="#cdd6f4">GPU</text>
+<text x="62.0" y="275.0" fill="#a6e3a1">■</text>
+<text x="71.6" y="275.0" fill="#a8e3a1">■</text>
+<text x="81.2" y="275.0" fill="#a9e3a2">■</text>
+<text x="90.8" y="275.0" fill="#abe3a2">■</text>
+<text x="100.4" y="275.0" fill="#ade3a2">■</text>
+<text x="110.0" y="275.0" fill="#afe3a2">■</text>
+<text x="119.6" y="275.0" fill="#b0e3a3">■</text>
+<text x="129.2" y="275.0" fill="#b2e3a3">■</text>
+<text x="138.8" y="275.0" fill="#b4e3a3">■</text>
+<text x="148.4" y="275.0" fill="#b6e3a4">■</text>
+<text x="158.0" y="275.0" fill="#b7e3a4">■</text>
+<text x="167.6" y="275.0" fill="#b9e3a4">■</text>
+<text x="177.2" y="275.0" fill="#bbe3a5">■</text>
+<text x="186.8" y="275.0" fill="#bce3a5">■</text>
+<text x="196.4" y="275.0" fill="#bee3a5">■</text>
+<text x="206.0" y="275.0" fill="#c0e3a5">■</text>
+<text x="215.6" y="275.0" fill="#c2e3a6">■</text>
+<text x="225.2" y="275.0" fill="#c3e3a6">■</text>
+<text x="234.8" y="275.0" fill="#c5e3a6">■</text>
+<text x="244.4" y="275.0" fill="#c7e3a7">■</text>
+<text x="254.0" y="275.0" fill="#c9e3a7">■</text>
+<text x="263.6" y="275.0" fill="#cae3a7">■</text>
+<text x="273.2" y="275.0" fill="#cce3a7">■</text>
+<text x="282.8" y="275.0" fill="#cee3a8">■</text>
+<text x="292.4" y="275.0" fill="#d0e3a8">■</text>
+<text x="302.0" y="275.0" fill="#d1e2a8">■</text>
+<text x="311.6" y="275.0" fill="#d3e2a9">■</text>
+<text x="321.2" y="275.0" fill="#d5e2a9">■</text>
+<text x="330.8" y="275.0" fill="#d6e2a9">■</text>
+<text x="340.4" y="275.0" fill="#d8e2a9">■</text>
+<text x="350.0" y="275.0" fill="#dae2aa">■</text>
+<text x="359.6" y="275.0" fill="#dce2aa">■</text>
+<text x="369.2" y="275.0" fill="#dde2aa">■</text>
+<text x="378.8" y="275.0" fill="#dfe2ab">■</text>
+<text x="388.4" y="275.0" fill="#e1e2ab">■</text>
+<text x="398.0" y="275.0" fill="#e3e2ab">■</text>
+<text x="407.6" y="275.0" fill="#e4e2ac">■</text>
+<text x="417.2" y="275.0" fill="#e6e2ac">■</text>
+<text x="426.8" y="275.0" fill="#e8e2ac">■</text>
+<text x="436.4" y="275.0" fill="#e9e2ac">■</text>
+<text x="446.0" y="275.0" fill="#ebe2ad">■</text>
+<text x="455.6" y="275.0" fill="#ede2ad">■</text>
+<text x="465.2" y="275.0" fill="#efe2ad">■</text>
+<text x="474.8" y="275.0" fill="#f0e2ae">■</text>
+<text x="484.4" y="275.0" fill="#f2e2ae">■</text>
+<text x="494.0" y="275.0" fill="#f4e2ae">■</text>
+<text x="503.6" y="275.0" fill="#f6e2ae">■</text>
+<text x="513.2" y="275.0" fill="#f7e2af">■</text>
+<text x="522.8" y="275.0" fill="#f9e2af">■</text>
+<text x="532.4" y="275.0" fill="#f9e0af">■</text>
+<text x="542.0" y="275.0" fill="#f9deaf">■</text>
+<text x="551.6" y="275.0" fill="#f9ddaf">■</text>
+<text x="561.2" y="275.0" fill="#f9dbae">■</text>
+<text x="570.8" y="275.0" fill="#f8d9ae">■</text>
+<text x="580.4" y="275.0" fill="#f8d7ae">■</text>
+<text x="590.0" y="275.0" fill="#f8d5ae">■</text>
+<text x="599.6" y="275.0" fill="#f8d4ae">■</text>
+<text x="609.2" y="275.0" fill="#f8d2ae">■</text>
+<text x="618.8" y="275.0" fill="#f8d0ae">■</text>
+<text x="628.4" y="275.0" fill="#f8cead">■</text>
+<text x="638.0" y="275.0" fill="#f8ccad">■</text>
+<text x="647.6" y="275.0" fill="#f7caad">■</text>
+<text x="657.2" y="275.0" fill="#f7c9ad">■</text>
+<text x="666.8" y="275.0" fill="#f7c7ad">■</text>
+<text x="676.4" y="275.0" fill="#f7c5ad">■</text>
+<text x="686.0" y="275.0" fill="#f7c3ad">■</text>
+<text x="695.6" y="275.0" fill="#f7c1ac">■</text>
+<text x="705.2" y="275.0" fill="#f7c0ac">■</text>
+<text x="714.8" y="275.0" fill="#f7beac">■</text>
+<text x="724.4" y="275.0" fill="#f6bcac">■</text>
+<text x="734.0" y="275.0" fill="#f6baac">■</text>
+<text x="743.6" y="275.0" fill="#f6b8ac">■</text>
+<text x="753.2" y="275.0" fill="#f6b7ac">■</text>
+<text x="762.8" y="275.0" fill="#f6b5ab">■</text>
+<text x="772.4" y="275.0" fill="#f6b3ab">■</text>
+<text x="782.0" y="275.0" fill="#f6b1ab">■</text>
+<text x="791.6" y="275.0" fill="#f6afab">■</text>
+<text x="801.2" y="275.0" fill="#f5adab">■</text>
+<text x="810.8" y="275.0" fill="#f5acab">■</text>
+<text x="820.4" y="275.0" fill="#f5aaaa">■</text>
+<text x="830.0" y="275.0" fill="#f5a8aa">■</text>
+<text x="839.6" y="275.0" fill="#f5a6aa">■</text>
+<text x="849.2" y="275.0" fill="#f5a4aa">■</text>
+<text x="858.8" y="275.0" fill="#f5a3aa">■</text>
+<text x="868.4" y="275.0" fill="#f5a1aa">■</text>
+<text x="878.0" y="275.0" fill="#f49faa">■</text>
+<text x="887.6" y="275.0" fill="#f49da9">■</text>
+<text x="897.2" y="275.0" fill="#f49ba9">■</text>
+<text x="906.8" y="275.0" fill="#f49aa9">■</text>
+<text x="916.4" y="275.0" fill="#f498a9">■</text>
+<text x="926.0" y="275.0" fill="#f496a9">■</text>
+<text x="935.6" y="275.0" fill="#f494a9">■</text>
+<text x="945.2" y="275.0" fill="#f492a9">■</text>
+<text x="954.8" y="275.0" fill="#f390a8">■</text>
+<text x="964.4" y="275.0" fill="#f38fa8">■</text>
+<text x="974.0" y="275.0" fill="#f38da8">■</text>
+<text x="983.6" y="275.0" fill="#f38ba8">■</text>
+<text x="993.2" y="275.0" fill="#cdd6f4"> 100%</text>
+<text x="1050.8" y="275.0" fill="#6c7086">│█</text>
+<text x="14.0" y="294.0" fill="#6c7086">│</text>
+<text x="23.6" y="294.0" fill="#cdd6f4">MEM</text>
+<text x="62.0" y="294.0" fill="#89b4fa">■</text>
+<text x="71.6" y="294.0" fill="#8ab4fa">■■</text>
+<text x="90.8" y="294.0" fill="#8bb4fa">■</text>
+<text x="100.4" y="294.0" fill="#8cb3fa">■</text>
+<text x="110.0" y="294.0" fill="#8db3fa">■■</text>
+<text x="129.2" y="294.0" fill="#8eb3fa">■</text>
+<text x="138.8" y="294.0" fill="#8fb3fa">■■</text>
+<text x="158.0" y="294.0" fill="#90b2fa">■</text>
+<text x="167.6" y="294.0" fill="#91b2fa">■</text>
+<text x="177.2" y="294.0" fill="#92b2fa">■■</text>
+<text x="196.4" y="294.0" fill="#93b2fa">■</text>
+<text x="206.0" y="294.0" fill="#94b2fa">■</text>
+<text x="215.6" y="294.0" fill="#94b2f9">■</text>
+<text x="225.2" y="294.0" fill="#95b1f9">■</text>
+<text x="234.8" y="294.0" fill="#96b1f9">■</text>
+<text x="244.4" y="294.0" fill="#97b1f9">■■</text>
+<text x="263.6" y="294.0" fill="#98b1f9">■</text>
+<text x="273.2" y="294.0" fill="#99b1f9">■</text>
+<text x="282.8" y="294.0" fill="#9ab1f9">■</text>
+<text x="292.4" y="294.0" fill="#9ab0f9">■</text>
+<text x="302.0" y="294.0" fill="#9bb0f9">■</text>
+<text x="311.6" y="294.0" fill="#9cb0f9">■■</text>
+<text x="330.8" y="294.0" fill="#9db0f9">■</text>
+<text x="340.4" y="294.0" fill="#9eb0f9">■</text>
+<text x="350.0" y="294.0" fill="#9faff9">■■</text>
+<text x="369.2" y="294.0" fill="#a0aff9">■</text>
+<text x="378.8" y="294.0" fill="#a1aff9">■■</text>
+<text x="398.0" y="294.0" fill="#6c7086">··························································</text>
+<text x="954.8" y="294.0" fill="#cdd6f4"> 6.1G/16G</text>
+<text x="1050.8" y="294.0" fill="#6c7086">│█</text>
+<text x="14.0" y="313.0" fill="#6c7086">│gpu%</text>
+<text x="810.8" y="313.0" fill="#f38ba8">⣿⣷⣶⣦⣤⣀</text>
+<text x="993.2" y="313.0" fill="#f38ba8">⢀⣠⣤⣶⣶⣿</text>
+<text x="1050.8" y="313.0" fill="#6c7086">│║</text>
+<text x="14.0" y="332.0" fill="#6c7086">│</text>
+<text x="23.6" y="332.0" fill="#a6e3a1">⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣿⣿⣿⣿⣿⣿⣿⣦⣤⣀⣀⣀⣀⣀⣀⣀⣠⣤⣾⣿⣿⣿⣿⣿⣿</text>
+<text x="1050.8" y="332.0" fill="#6c7086">│║</text>
+<text x="14.0" y="351.0" fill="#6c7086">│</text>
+<text x="23.6" y="351.0" fill="#89b4fa">⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⣿⣿⡿⠿⠟⠛⠋⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠙⠛⠻</text>
+<text x="1050.8" y="351.0" fill="#6c7086">│║</text>
+<text x="14.0" y="370.0" fill="#6c7086">│vram%</text>
+<text x="810.8" y="370.0" fill="#cba6f7">⠁</text>
+<text x="1050.8" y="370.0" fill="#6c7086">│║</text>
+<text x="14.0" y="389.0" fill="#6c7086">│ session</text>
+<text x="110.0" y="389.0" fill="#cdd6f4">peak 100%   85°C  300W</text>
+<text x="350.0" y="389.0" fill="#6c7086">avg  52%  185W</text>
+<text x="1050.8" y="389.0" fill="#6c7086">│║</text>
+<text x="14.0" y="408.0" fill="#6c7086">│</text>
+<text x="33.2" y="408.0" fill="#f38ba8" font-weight="bold">⚠power-limit</text>
+<text x="167.6" y="408.0" fill="#6c7086">⣶⣿⣿⣿⣿</text>
+<text x="215.6" y="408.0" fill="#f9e2af" font-weight="bold"> 85°C</text>
+<text x="282.8" y="408.0" fill="#6c7086">⣶⣿⣿⣿⣿</text>
+<text x="330.8" y="408.0" fill="#94e2d5"> 300/320W</text>
+<text x="436.4" y="408.0" fill="#6c7086">▼781.2MiB/s ▲293.0MiB/s  fan 90%  core 2399MHz  mem 9000MHz  mem│║</text>
+<text x="14.0" y="427.0" fill="#6c7086">╰───────────────────────────────────────────────────────────────────────────────────────────────────────────╯║</text>
+<text x="14.0" y="446.0" fill="#6c7086">╭┐</text>
+<text x="33.2" y="446.0" fill="#cba6f7" font-weight="bold">processes</text>
+<text x="119.6" y="446.0" fill="#6c7086">┌───────────────────────────────────────────────────────────────────────────────┐gpu-mem↓ · 1-6/9┌╮</text>
+<text x="14.0" y="465.0" fill="#6c7086">│</text>
+<text x="23.6" y="465.0" fill="#cba6f7" font-weight="bold">PID      USER       DEV TYPE     GPU%  GPU MEM↓  CPU%  HOST MEM  COMMAND</text>
+<text x="1060.4" y="465.0" fill="#6c7086">│</text>
+<text x="14.0" y="484.0" fill="#6c7086">│</text>
+<text x="23.6" y="484.0" fill="#cdd6f4" font-weight="bold">981105   mxaddict   0   Graphic   47%  3064MiB     0%  5MiB      gpur --mock 3 --no-splash --tick-ms 120</text>
+<text x="1060.4" y="484.0" fill="#6c7086">█</text>
+<text x="14.0" y="503.0" fill="#6c7086">│</text>
+<text x="23.6" y="503.0" fill="#cdd6f4">1        root       1   Compute   42%  1564MiB     0%  8MiB      /usr/lib/systemd/systemd --system --deseria</text>
+<text x="1060.4" y="503.0" fill="#6c7086">█</text>
+<text x="14.0" y="522.0" fill="#6c7086">│</text>
+<text x="23.6" y="522.0" fill="#cdd6f4">2        root       2   Compute   37%  814MiB      0%  0MiB      kthreadd</text>
+<text x="1060.4" y="522.0" fill="#6c7086">█</text>
+<text x="14.0" y="541.0" fill="#6c7086">│</text>
+<text x="23.6" y="541.0" fill="#cdd6f4">3        root       0   Graphic   31%  439MiB      0%  0MiB      pool_workqueue_release</text>
+<text x="1060.4" y="541.0" fill="#6c7086">█</text>
+<text x="14.0" y="560.0" fill="#6c7086">│</text>
+<text x="23.6" y="560.0" fill="#cdd6f4">4        root       1   Compute   26%  251MiB      0%  0MiB      kworker/R-rcu_gp</text>
+<text x="1060.4" y="560.0" fill="#6c7086">║</text>
+<text x="14.0" y="579.0" fill="#6c7086">│</text>
+<text x="23.6" y="579.0" fill="#cdd6f4">5        root       2   Compute   21%  157MiB      0%  0MiB      kworker/R-sync_wq</text>
+<text x="1060.4" y="579.0" fill="#6c7086">║</text>
+<text x="14.0" y="598.0" fill="#6c7086">╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+<text x="14.0" y="617.0" fill="#6c7086"> q quit  ␣ pause  p procs  0-9 gpu  j/k move  s sort  r rev  / filter  x/X kill  +/- rate</text>
+</svg>

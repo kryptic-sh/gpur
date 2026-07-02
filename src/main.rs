@@ -24,11 +24,29 @@ use std::time::{Duration, Instant};
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Packaging helpers (hidden): emit completions / man page and exit.
+    if let Some(shell) = cli.completions {
+        use clap::CommandFactory;
+        clap_complete::generate(shell, &mut Cli::command(), "gpur", &mut stdout());
+        return Ok(());
+    }
+    if cli.man {
+        use clap::CommandFactory;
+        clap_mangen::Man::new(Cli::command()).render(&mut stdout())?;
+        return Ok(());
+    }
+
     let cfg: GpurConfig = match &cli.config {
         Some(path) => hjkl_config::load_from(path)?,
         None => hjkl_config::load()?.0,
     };
-    let tick_ms = cli.tick_ms.unwrap_or(cfg.tick_ms).max(50);
+    // Precedence: CLI flag > last-used (persisted state) > config default.
+    let state = app::load_state();
+    let tick_ms = cli
+        .tick_ms
+        .or(state.as_ref().map(|s| s.tick_ms).filter(|t| *t > 0))
+        .unwrap_or(cfg.tick_ms)
+        .max(50);
     let theme_path = cli.theme.clone().or(cfg.theme.clone());
 
     let theme = theme::load(theme_path.as_deref(), theme::detect_color_mode())?;
@@ -64,6 +82,9 @@ fn main() -> Result<()> {
             log,
         },
     );
+    if let Some(s) = &state {
+        app.restore_state(s);
+    }
     app.poll();
 
     if cli.once || cli.json {
@@ -87,6 +108,7 @@ fn main() -> Result<()> {
     install_signal_teardown();
 
     let result = run(&mut terminal, &mut app);
+    app.save_state();
     restore_extras();
     ratatui::restore();
     result
@@ -119,11 +141,25 @@ fn install_signal_teardown() {
     });
 }
 
-#[cfg(not(unix))]
+/// Windows: console close / logoff / shutdown deliver CTRL_*_EVENTs on a
+/// system thread — the only interception point for a vanishing console.
+/// (Ctrl-C itself arrives as a key event under raw mode.)
+#[cfg(windows)]
 fn install_signal_teardown() {
-    // Windows: Ctrl-C is delivered as a key event under raw mode and
-    // taskkill offers no interception point comparable to Unix signals.
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+
+    unsafe extern "system" fn handler(_ctrl_type: u32) -> windows::core::BOOL {
+        restore_extras();
+        ratatui::restore();
+        std::process::exit(130);
+    }
+    unsafe {
+        let _ = SetConsoleCtrlHandler(Some(handler), true);
+    }
 }
+
+#[cfg(not(any(unix, windows)))]
+fn install_signal_teardown() {}
 
 /// Headless one-shot: a second poll after a short gap makes the delta-based
 /// utilizations (Intel, per-process) real instead of zero.
@@ -214,6 +250,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                             }
                         }
                         InputMode::Normal => {
+                            // Any key dismisses the help overlay.
+                            if app.show_help {
+                                app.show_help = false;
+                                continue;
+                            }
                             if let Some(action) = keys::resolve(&mut keymap, key)
                                 && app.apply(action)
                             {

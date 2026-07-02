@@ -30,6 +30,8 @@ assets = [
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6.7"
+clap_mangen = "0.3.0"
 crossterm = "0.29"
 hjkl-config = "0.33"
 hjkl-keymap = "0.33"
@@ -50,7 +52,7 @@ io-kit-sys = "0.5"
 libc = "0.2"
 
 [target."cfg(windows)".dependencies]
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Performance", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Performance", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
 
 [target."cfg(unix)".dependencies]
 signal-hook = "0.4"

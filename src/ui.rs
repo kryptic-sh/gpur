@@ -80,6 +80,47 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(footer_line), footer);
 
     draw_confirm_popup(frame, area, app);
+    draw_help_popup(frame, area, app);
+}
+
+/// `?` overlay listing every binding; any key closes it.
+fn draw_help_popup(frame: &mut Frame, area: Rect, app: &App) {
+    if !app.show_help {
+        return;
+    }
+    let t = &app.theme;
+    let rows = crate::keys::help_rows();
+    let key_w = rows
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(8) as u16;
+    let w = (key_w + 50).min(area.width);
+    let h = (rows.len() as u16 + 2).min(area.height);
+    let popup = Rect::new(
+        area.x + (area.width.saturating_sub(w)) / 2,
+        area.y + (area.height.saturating_sub(h)) / 2,
+        w,
+        h,
+    );
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(t.border_selected)
+        .title(caption("help".into(), t.title, t.border_selected))
+        .title_top(caption("any key closes".into(), t.dim, t.border_selected).right_aligned());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(k, desc)| {
+            Line::from(vec![
+                Span::styled(format!(" {k:>width$}  ", width = key_w as usize), t.title),
+                Span::styled(*desc, Style::new().fg(t.fg)),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Centered y/N dialog for a pending kill.

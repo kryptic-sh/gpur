@@ -159,6 +159,50 @@ fn quit_restores_terminal_modes() {
 }
 
 #[test]
+fn survives_resize_storm() {
+    let mut t = Tui::spawn(&[]);
+    t.wait_for("cards", |s| s.contains("Mock GPU 0"));
+    // Storm through degenerate sizes; the app must neither crash nor wedge.
+    for (rows, cols) in [
+        (5, 5),
+        (2, 40),
+        (50, 3),
+        (1, 1),
+        (200, 250),
+        (10, 30),
+        (ROWS, COLS),
+    ] {
+        t._master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        t.pump_once(Duration::from_millis(50));
+    }
+    t.parser = vt100::Parser::new(ROWS, COLS, 0);
+    t.wait_for("re-render after storm", |s| s.contains("Mock GPU 0"));
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+#[test]
+fn help_overlay_opens_and_closes() {
+    let mut t = Tui::spawn(&[]);
+    t.wait_for("cards", |s| s.contains("Mock GPU 0"));
+    t.send("?");
+    t.wait_for("help overlay", |s| s.contains("any key closes"));
+    t.send("x"); // closes overlay, must not open the kill dialog
+    t.wait_for("overlay gone", |s| {
+        !s.contains("any key closes") && !s.contains("SIGTERM")
+    });
+    t.send("q");
+    t.wait_exit();
+}
+
+#[test]
 fn sigterm_restores_terminal_modes() {
     let mut t = Tui::spawn(&[]);
     t.wait_for("cards", |s| s.contains("Mock GPU 0"));

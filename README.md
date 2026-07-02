@@ -7,6 +7,8 @@ Mirrored braille waveforms, gradient meters, an nvtop-style process table with
 per-process GPU attribution, mouse support, foldable GPU cards, and theming via
 the hjkl stack.
 
+![gpur running with three mock GPUs](assets/screenshot.svg)
+
 > **Status: beta.** The AMD Linux path is battle-tested on real hardware; the
 > Intel/macOS/Windows backends are implemented and CI-built but still collecting
 > real-hardware mileage. Reports welcome.

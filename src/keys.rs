@@ -34,39 +34,61 @@ pub enum Action {
     /// SIGTERM / SIGKILL the process under the cursor (with confirmation).
     KillTerm,
     KillForce,
+    /// Open the help overlay (any key closes it).
+    Help,
+}
+
+/// Single source of truth: feeds both the keymap and the `?` overlay.
+const BINDS: &[(&str, Action, &str)] = &[
+    ("q", Action::Quit, "quit"),
+    ("<Esc>", Action::Quit, "quit"),
+    ("<C-c>", Action::Quit, "quit"),
+    ("<Space>", Action::TogglePause, "pause/resume polling"),
+    ("p", Action::FocusProcs, "focus process list"),
+    ("j", Action::NextItem, "move down in focused list"),
+    ("<Down>", Action::NextItem, "move down in focused list"),
+    ("k", Action::PrevItem, "move up in focused list"),
+    ("<Up>", Action::PrevItem, "move up in focused list"),
+    ("+", Action::TickFaster, "poll faster"),
+    // Unshifted alias: = shares the key with + on most layouts.
+    ("=", Action::TickFaster, "poll faster"),
+    ("-", Action::TickSlower, "poll slower"),
+    ("s", Action::SortCycle, "cycle process sort column"),
+    ("r", Action::SortReverse, "reverse process sort"),
+    ("/", Action::FilterOpen, "filter processes"),
+    ("x", Action::KillTerm, "terminate selected process"),
+    ("X", Action::KillForce, "kill -9 selected process"),
+    ("J", Action::ProcScrollDown, "scroll process list down"),
+    (
+        "<PageDown>",
+        Action::ProcScrollDown,
+        "scroll process list down",
+    ),
+    ("K", Action::ProcScrollUp, "scroll process list up"),
+    ("<PageUp>", Action::ProcScrollUp, "scroll process list up"),
+    ("?", Action::Help, "show this help"),
+];
+
+/// Rows for the `?` overlay: the bind table (aliases folded together by
+/// description) plus entries the trie can't express.
+pub fn help_rows() -> Vec<(String, &'static str)> {
+    let mut rows: Vec<(String, &'static str)> = Vec::new();
+    for (chord, _, desc) in BINDS {
+        if let Some(row) = rows.iter_mut().find(|(_, d)| d == desc) {
+            row.0.push_str(&format!(" {chord}"));
+        } else {
+            rows.push((chord.to_string(), desc));
+        }
+    }
+    rows.push(("0-9".into(), "focus/select GPU N; same digit folds it"));
+    rows.push(("y".into(), "confirm kill dialog (any other key cancels)"));
+    rows.push(("wheel/click".into(), "scroll + focus pane; click selects"));
+    rows
 }
 
 pub fn default_keymap() -> Keymap<Action, Mode> {
     let mut km = Keymap::new(' ');
-    let binds: &[(&str, Action, &str)] = &[
-        ("q", Action::Quit, "quit"),
-        ("<Esc>", Action::Quit, "quit"),
-        ("<C-c>", Action::Quit, "quit"),
-        ("<Space>", Action::TogglePause, "pause/resume polling"),
-        ("p", Action::FocusProcs, "focus process list"),
-        ("j", Action::NextItem, "move down in focused list"),
-        ("<Down>", Action::NextItem, "move down in focused list"),
-        ("k", Action::PrevItem, "move up in focused list"),
-        ("<Up>", Action::PrevItem, "move up in focused list"),
-        ("+", Action::TickFaster, "poll faster"),
-        // Unshifted alias: = shares the key with + on most layouts.
-        ("=", Action::TickFaster, "poll faster"),
-        ("-", Action::TickSlower, "poll slower"),
-        ("s", Action::SortCycle, "cycle process sort column"),
-        ("r", Action::SortReverse, "reverse process sort"),
-        ("/", Action::FilterOpen, "filter processes"),
-        ("x", Action::KillTerm, "terminate selected process"),
-        ("X", Action::KillForce, "kill -9 selected process"),
-        ("J", Action::ProcScrollDown, "scroll process list down"),
-        (
-            "<PageDown>",
-            Action::ProcScrollDown,
-            "scroll process list down",
-        ),
-        ("K", Action::ProcScrollUp, "scroll process list up"),
-        ("<PageUp>", Action::ProcScrollUp, "scroll process list up"),
-    ];
-    for (chord, action, desc) in binds {
+    for (chord, action, desc) in BINDS {
         km.add(Mode::Normal, chord, action.clone(), desc)
             .expect("static chord parses");
     }

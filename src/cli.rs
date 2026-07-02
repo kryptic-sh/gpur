@@ -47,4 +47,12 @@ pub struct Cli {
     /// Append one JSON line per poll to this file (sensor logging)
     #[arg(long, value_name = "FILE")]
     pub log: Option<PathBuf>,
+
+    /// Print shell completions to stdout and exit
+    #[arg(long, value_enum, value_name = "SHELL", hide = true)]
+    pub completions: Option<clap_complete::Shell>,
+
+    /// Print the man page (troff) to stdout and exit
+    #[arg(long, hide = true)]
+    pub man: bool,
 }
