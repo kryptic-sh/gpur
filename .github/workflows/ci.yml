@@ -307,7 +307,8 @@ jobs:
           path: dist
       - name: Generate completions + man page
         run: |
-          tar -xzf dist/gpur-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz gpur
+          # Archive entries are prefixed ./ (tar -C dist .)
+          tar -xzf dist/gpur-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz ./gpur
           mkdir -p pkgext/completions
           for shell in bash zsh fish powershell elvish; do
             ./gpur --completions "$shell" > "pkgext/completions/gpur.$shell"
