@@ -134,6 +134,7 @@ impl SessionStats {
 
 /// Identify a container from /proc/<pid>/cgroup content: docker, podman,
 /// cri-containerd (k8s), and crio scopes, cgroup v1 and v2 layouts.
+#[cfg(any(target_os = "linux", test))]
 fn container_of_cgroup(text: &str) -> Option<String> {
     for line in text.lines() {
         let path = line.rsplit(':').next().unwrap_or("");
