@@ -213,6 +213,7 @@ mod win {
                     kind,
                     gpu_util_pct: util_by_proc.get(&key).copied(),
                     gpu_mem_bytes: mem,
+                    ..Default::default()
                 };
                 procs.insert(key, p);
             }

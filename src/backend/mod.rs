@@ -7,6 +7,7 @@ mod intel;
 mod linux;
 mod mock;
 mod nvidia;
+mod replay;
 mod windows;
 
 pub use mock::MockBackend;
@@ -14,7 +15,8 @@ pub use mock::MockBackend;
 use anyhow::Result;
 
 /// One sample of one GPU at one instant.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GpuSnapshot {
     pub name: String,
     /// Integrated (APU/iGPU) as opposed to a discrete card.
@@ -60,9 +62,10 @@ impl GpuSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ProcKind {
     Graphics,
+    #[default]
     Compute,
 }
 
@@ -76,7 +79,8 @@ impl ProcKind {
 }
 
 /// One process currently using one GPU.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GpuProcess {
     pub pid: u32,
     /// Index into the snapshot vec returned by `poll`.
@@ -85,6 +89,13 @@ pub struct GpuProcess {
     /// GPU utilization attributable to this process, when the backend knows.
     pub gpu_util_pct: Option<f64>,
     pub gpu_mem_bytes: u64,
+    /// Pre-enriched host data. Live backends leave these None (sysinfo fills
+    /// them in); the replay backend supplies the RECORDED values so playback
+    /// doesn't resolve foreign pids against this host.
+    pub user: Option<String>,
+    pub command: Option<String>,
+    pub cpu_pct: Option<f32>,
+    pub host_mem_bytes: Option<u64>,
 }
 
 /// A source of GPU telemetry. Implementations poll all devices they can see.
@@ -101,7 +112,13 @@ pub trait GpuBackend {
 }
 
 /// Pick the first backend that reports usable devices on this machine.
-pub fn detect(mock: Option<usize>) -> Result<Box<dyn GpuBackend>> {
+pub fn detect(
+    mock: Option<usize>,
+    replay: Option<&std::path::Path>,
+) -> Result<Box<dyn GpuBackend>> {
+    if let Some(path) = replay {
+        return replay::load(path);
+    }
     if let Some(n) = mock {
         return Ok(Box::new(MockBackend::new(n.clamp(1, 16))));
     }

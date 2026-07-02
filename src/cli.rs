@@ -48,6 +48,10 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub log: Option<PathBuf>,
 
+    /// Replay a --log recording instead of live GPUs (one record per tick)
+    #[arg(long, value_name = "FILE", conflicts_with = "mock")]
+    pub replay: Option<PathBuf>,
+
     /// Print shell completions to stdout and exit
     #[arg(long, value_enum, value_name = "SHELL", hide = true)]
     pub completions: Option<clap_complete::Shell>,

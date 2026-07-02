@@ -259,6 +259,7 @@ mod linux_impl {
                     },
                     gpu_util_pct: Some(util.min(100.0)),
                     gpu_mem_bytes: mem,
+                    ..Default::default()
                 })
                 .collect();
             (device_util, device_mem, device_video, procs)

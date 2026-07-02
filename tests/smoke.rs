@@ -22,6 +22,39 @@ fn help_shows_usage_and_art() {
 }
 
 #[test]
+fn replay_round_trips_a_log_recording() {
+    let dir = std::env::temp_dir().join(format!("gpur-replay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("rec.jsonl");
+
+    let rec = bin()
+        .args(["--mock", "--once", "--tick-ms", "100", "--log"])
+        .arg(&log)
+        .output()
+        .unwrap();
+    assert!(rec.status.success());
+
+    let out = bin()
+        .args(["--json", "--tick-ms", "100", "--replay"])
+        .arg(&log)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(v["backend"], "replay");
+    assert_eq!(v["gpus"].as_array().unwrap().len(), 2);
+    // Recorded enrichment must survive playback (no re-resolution of pids).
+    let procs = v["processes"].as_array().unwrap();
+    assert!(
+        procs
+            .iter()
+            .any(|p| p["command"].as_str().unwrap().contains("gpur")),
+        "recorded command lost in replay"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn unknown_flag_fails() {
     let out = bin().arg("--definitely-not-a-flag").output().unwrap();
     assert!(!out.status.success());

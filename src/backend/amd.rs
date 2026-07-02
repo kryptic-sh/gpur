@@ -160,6 +160,7 @@ mod linux_impl {
                     },
                     gpu_util_pct: Some(util.min(100.0)),
                     gpu_mem_bytes: vram,
+                    ..Default::default()
                 })
                 .collect();
             video_util

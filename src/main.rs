@@ -50,7 +50,7 @@ fn main() -> Result<()> {
     let theme_path = cli.theme.clone().or(cfg.theme.clone());
 
     let theme = theme::load(theme_path.as_deref(), theme::detect_color_mode())?;
-    let backend = backend::detect(cli.mock)?;
+    let backend = backend::detect(cli.mock, cli.replay.as_deref())?;
     let graph_style = match cli.graphs {
         Some(s) => s,
         None => app::GraphStyle::from_config(&cfg.graphs).ok_or_else(|| {

@@ -108,6 +108,7 @@ impl GpuBackend for NvmlBackend {
                 kind,
                 gpu_util_pct: util.get(&pid).map(|u| *u as f64),
                 gpu_mem_bytes: mem,
+                ..Default::default()
             }));
         }
         out

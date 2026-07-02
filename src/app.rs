@@ -349,7 +349,7 @@ impl App {
                 // handle (NVML especially). Try a fresh detect every 5th
                 // consecutive failure.
                 if self.poll_failures.is_multiple_of(5)
-                    && let Ok(fresh) = crate::backend::detect(self.mock)
+                    && let Ok(fresh) = crate::backend::detect(self.mock, None)
                 {
                     self.backend = fresh;
                     self.set_status(format!(
@@ -435,14 +435,24 @@ impl App {
             .map(|gp| {
                 let p = self.sys.process(Pid::from_u32(gp.pid));
                 ProcRow {
-                    user: p
-                        .and_then(|p| p.user_id())
-                        .and_then(|uid| self.users.get_user_by_id(uid))
-                        .map(|u| u.name().to_string())
+                    // Live sysinfo enrichment; backend-recorded values (the
+                    // replay path) win because this host's pids are unrelated.
+                    user: gp
+                        .user
+                        .clone()
+                        .or_else(|| {
+                            p.and_then(|p| p.user_id())
+                                .and_then(|uid| self.users.get_user_by_id(uid))
+                                .map(|u| u.name().to_string())
+                        })
                         .unwrap_or_else(|| "-".into()),
-                    cpu_pct: p.map(|p| p.cpu_usage()).unwrap_or(0.0),
-                    host_mem_bytes: p.map(|p| p.memory()).unwrap_or(0),
-                    command: p.map(command_of).unwrap_or_else(|| "?".into()),
+                    cpu_pct: gp.cpu_pct.or(p.map(|p| p.cpu_usage())).unwrap_or(0.0),
+                    host_mem_bytes: gp.host_mem_bytes.or(p.map(|p| p.memory())).unwrap_or(0),
+                    command: gp
+                        .command
+                        .clone()
+                        .or(p.map(command_of))
+                        .unwrap_or_else(|| "?".into()),
                     pid: gp.pid,
                     gpu_index: gp.gpu_index,
                     kind: gp.kind,

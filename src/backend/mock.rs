@@ -85,6 +85,7 @@ impl GpuBackend for MockBackend {
                 },
                 gpu_util_pct: Some((util * (0.9 - 0.1 * i as f64)).max(0.0)),
                 gpu_mem_bytes: (3000 >> i.min(8)) as u64 * 1024 * 1024 + 64 * 1024 * 1024,
+                ..Default::default()
             })
             .collect()
     }
