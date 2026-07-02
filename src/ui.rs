@@ -1,10 +1,11 @@
 use crate::app::App;
 use crate::backend::GpuSnapshot;
+use crate::theme::UiTheme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Gauge, Paragraph, Row, Sparkline, Table};
+use ratatui::widgets::{Block, BorderType, Cell, Gauge, Paragraph, Row, Table};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -82,6 +83,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         ));
     }
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title(Line::from(title))
         .border_style(if selected {
             t.border_selected
@@ -124,28 +126,10 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         vram_row,
     );
 
-    if spark_row.height > 0
+    if spark_row.height >= 2
         && let Some(hist) = app.history.get(idx)
     {
-        let [util_spark, vram_spark] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(spark_row);
-        frame.render_widget(
-            Sparkline::default()
-                .data(tail(&hist.util, util_spark.width as usize))
-                .max(100)
-                .style(t.spark_util)
-                .block(Block::new().title(Span::styled("gpu%", t.dim))),
-            util_spark,
-        );
-        frame.render_widget(
-            Sparkline::default()
-                .data(tail(&hist.vram, vram_spark.width as usize))
-                .max(100)
-                .style(t.gauge_vram)
-                .block(Block::new().title(Span::styled("vram%", t.dim))),
-            vram_spark,
-        );
+        draw_waveform(frame, spark_row, &hist.util, &hist.vram, t);
     }
 
     let mut info: Vec<Span> = Vec::new();
@@ -174,12 +158,115 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
     frame.render_widget(Paragraph::new(Line::from(info)), info_row);
 }
 
+const BRAILLE_BASE: u32 = 0x2800;
+/// Braille dot bit for (sub-column, dot-row counted from cell top).
+const DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+
+/// btop-style mirrored waveform: `up_data` (gpu%) grows upward from the
+/// vertical midline, `down_data` (vram%) grows downward, both in braille
+/// (2 samples per cell column, 4 dot rows per cell) with a color gradient
+/// from the midline toward the edges. Zero values keep one dot row, so an
+/// idle GPU still draws a thin center line.
+fn draw_waveform(frame: &mut Frame, area: Rect, up_data: &[u64], down_data: &[u64], t: &UiTheme) {
+    if area.height < 2 || area.width == 0 {
+        return;
+    }
+    let top_rows = (area.height / 2) as usize;
+    let bot_rows = area.height as usize - top_rows;
+    let cols = area.width as usize;
+    let n = cols * 2; // braille doubles horizontal resolution
+
+    let up_stops = [
+        rgb_of(t.spark_util.fg, (0xa6, 0xe3, 0xa1)),
+        rgb_of(t.temp_warn.fg, (0xf9, 0xe2, 0xaf)),
+        rgb_of(t.temp_crit.fg, (0xf3, 0x8b, 0xa8)),
+    ];
+    let down_stops = [
+        rgb_of(t.gauge_vram.fg, (0x89, 0xb4, 0xfa)),
+        rgb_of(Some(t.accent), (0xcb, 0xa6, 0xf7)),
+    ];
+
+    // Newest sample at the right edge; missing history reads as 0.
+    let sample = |data: &[u64], i: usize| -> u64 {
+        if data.len() >= n {
+            data[data.len() - n + i]
+        } else {
+            let pad = n - data.len();
+            if i < pad { 0 } else { data[i - pad] }
+        }
+    };
+    // Value -> dot rows in this half; min 1 keeps the midline alive at 0.
+    let dots_for =
+        |v: u64, rows: usize| -> usize { ((v.min(100) as usize * rows * 4) / 100).max(1) };
+
+    let buf = frame.buffer_mut();
+    for half in 0..2 {
+        let (rows, data, stops) = if half == 0 {
+            (top_rows, up_data, &up_stops[..])
+        } else {
+            (bot_rows, down_data, &down_stops[..])
+        };
+        for cy in 0..rows {
+            // cy counts away from the midline in both halves.
+            let y = if half == 0 {
+                area.y + (top_rows - 1 - cy) as u16
+            } else {
+                area.y + (top_rows + cy) as u16
+            };
+            let frac = if rows > 1 {
+                cy as f64 / (rows - 1) as f64
+            } else {
+                0.0
+            };
+            let color = gradient(stops, frac);
+            for cx in 0..cols {
+                let mut bits = 0u8;
+                for (s, bit_col) in DOT_BITS.iter().enumerate() {
+                    let dots = dots_for(sample(data, cx * 2 + s), rows);
+                    let in_cell = dots.saturating_sub(cy * 4).min(4);
+                    for d in 0..in_cell {
+                        // Up half fills cells bottom-up, down half top-down.
+                        let row_in_cell = if half == 0 { 3 - d } else { d };
+                        bits |= bit_col[row_in_cell];
+                    }
+                }
+                if bits != 0
+                    && let Some(cell) = buf.cell_mut((area.x + cx as u16, y))
+                {
+                    cell.set_char(char::from_u32(BRAILLE_BASE + bits as u32).unwrap_or('⠀'));
+                    cell.set_fg(color);
+                }
+            }
+        }
+    }
+
+    buf.set_string(area.x, area.y, "gpu%", t.dim);
+    buf.set_string(area.x, area.y + area.height - 1, "vram%", t.dim);
+}
+
+fn rgb_of(c: Option<ratatui::style::Color>, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
+    match c {
+        Some(ratatui::style::Color::Rgb(r, g, b)) => (r, g, b),
+        _ => fallback,
+    }
+}
+
+fn gradient(stops: &[(u8, u8, u8)], frac: f64) -> ratatui::style::Color {
+    let seg = frac.clamp(0.0, 1.0) * (stops.len() - 1) as f64;
+    let i = (seg.floor() as usize).min(stops.len().saturating_sub(2));
+    let f = seg - i as f64;
+    let (a, b) = (stops[i], stops[i + 1]);
+    let lerp = |x: u8, y: u8| -> u8 { (x as f64 + (y as f64 - x as f64) * f).round() as u8 };
+    ratatui::style::Color::Rgb(lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
+}
+
 fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     if area.height < 3 {
         return;
     }
     let block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .title(Span::styled(" processes ", t.title))
         .border_style(t.border);
 
@@ -253,8 +340,4 @@ fn kbs(v: u64) -> String {
 
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-}
-
-fn tail(data: &[u64], width: usize) -> &[u64] {
-    &data[data.len().saturating_sub(width)..]
 }

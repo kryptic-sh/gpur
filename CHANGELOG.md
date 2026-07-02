@@ -10,6 +10,9 @@ and this project adheres to
 
 ### Added
 
+- btop-style mirrored braille waveform per GPU: gpu% grows up from the midline,
+  vram% mirrors down, vertical color gradient toward the edges (green→yellow→red
+  / blue→accent), idle keeps a thin center line; rounded borders on all panes.
 - nvtop-style process table: PID/USER/DEV/TYPE/GPU%/GPU MEM/CPU%/HOST
   MEM/COMMAND, sorted by GPU memory. Sources: AMD Linux via `/proc` fdinfo
   (drm-client-id dedupe, engine-busy-ns deltas for per-process GPU%,
