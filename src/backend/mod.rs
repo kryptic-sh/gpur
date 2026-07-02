@@ -46,12 +46,44 @@ impl GpuSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcKind {
+    Graphics,
+    Compute,
+}
+
+impl ProcKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ProcKind::Graphics => "Graphic",
+            ProcKind::Compute => "Compute",
+        }
+    }
+}
+
+/// One process currently using one GPU.
+#[derive(Debug, Clone)]
+pub struct GpuProcess {
+    pub pid: u32,
+    /// Index into the snapshot vec returned by `poll`.
+    pub gpu_index: usize,
+    pub kind: ProcKind,
+    /// GPU utilization attributable to this process, when the backend knows.
+    pub gpu_util_pct: Option<f64>,
+    pub gpu_mem_bytes: u64,
+}
+
 /// A source of GPU telemetry. Implementations poll all devices they can see.
 pub trait GpuBackend {
     /// Human-readable backend name ("nvml", "amdgpu", "metal", "mock").
     fn name(&self) -> &'static str;
     /// Sample every visible GPU. Index order must be stable across calls.
     fn poll(&mut self) -> Result<Vec<GpuSnapshot>>;
+    /// Processes using the GPUs, sampled after `poll`. Backends without
+    /// per-process visibility return nothing.
+    fn processes(&mut self) -> Vec<GpuProcess> {
+        Vec::new()
+    }
 }
 
 /// Pick the first backend that reports usable devices on this machine.

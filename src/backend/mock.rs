@@ -1,6 +1,6 @@
 //! Deterministic fake GPUs for UI development and demos (`--mock`).
 
-use super::{GpuBackend, GpuSnapshot};
+use super::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind};
 use anyhow::Result;
 
 pub struct MockBackend {
@@ -51,5 +51,25 @@ impl GpuBackend for MockBackend {
             })
             .collect();
         Ok(gpus)
+    }
+
+    fn processes(&mut self) -> Vec<GpuProcess> {
+        let util = self.wave(0.4, 53.0);
+        vec![
+            GpuProcess {
+                pid: std::process::id(),
+                gpu_index: 0,
+                kind: ProcKind::Graphics,
+                gpu_util_pct: Some(util * 0.7),
+                gpu_mem_bytes: 512 * 1024 * 1024 + (util * 1e7) as u64,
+            },
+            GpuProcess {
+                pid: 1,
+                gpu_index: 1,
+                kind: ProcKind::Compute,
+                gpu_util_pct: Some(util * 0.3),
+                gpu_mem_bytes: 2048 * 1024 * 1024,
+            },
+        ]
     }
 }

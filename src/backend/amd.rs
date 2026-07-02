@@ -13,30 +13,42 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use crate::backend::{GpuBackend, GpuSnapshot};
+    use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind};
     use anyhow::Result;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     use std::path::{Path, PathBuf};
+    use std::time::Instant;
 
     const AMD_VENDOR: &str = "0x1002";
     const PCI_IDS_PATHS: &[&str] = &["/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"];
+    /// DRM character-device major.
+    const DRM_MAJOR: u64 = 226;
 
     pub fn probe() -> Option<Box<dyn GpuBackend>> {
         let devices = scan("/sys/class/drm");
         if devices.is_empty() {
             return None;
         }
-        Some(Box::new(AmdBackend { devices }))
+        Some(Box::new(AmdBackend {
+            devices,
+            engine_state: HashMap::new(),
+        }))
     }
 
     struct AmdDevice {
         name: String,
         dev: PathBuf,
         hwmon: Option<PathBuf>,
+        /// PCI address ("0000:75:00.0"), matched against fdinfo drm-pdev.
+        pdev: Option<String>,
     }
 
     struct AmdBackend {
         devices: Vec<AmdDevice>,
+        /// (pid, drm-client-id) -> cumulative engine ns at last scan.
+        engine_state: HashMap<(u32, u64), (u64, Instant)>,
     }
 
     impl GpuBackend for AmdBackend {
@@ -47,6 +59,169 @@ mod linux {
         fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
             Ok(self.devices.iter().map(sample).collect())
         }
+
+        fn processes(&mut self) -> Vec<GpuProcess> {
+            let pdev_to_gpu: HashMap<&str, usize> = self
+                .devices
+                .iter()
+                .enumerate()
+                .filter_map(|(i, d)| d.pdev.as_deref().map(|p| (p, i)))
+                .collect();
+
+            // (pid, gpu) -> aggregated stats across that process's DRM clients.
+            let mut agg: HashMap<(u32, usize), (f64, u64, bool)> = HashMap::new();
+            let mut seen_clients: HashSet<(u32, u64)> = HashSet::new();
+            let now = Instant::now();
+
+            for pid in proc_pids() {
+                for client in drm_clients(pid) {
+                    let Some(&gpu) = client.pdev.as_deref().and_then(|p| pdev_to_gpu.get(p)) else {
+                        continue;
+                    };
+                    // The same client shows once per duplicated fd — count once.
+                    if !seen_clients.insert((pid, client.id)) {
+                        continue;
+                    }
+                    let util = match self.engine_state.get(&(pid, client.id)) {
+                        Some((prev_ns, prev_at)) => {
+                            let wall = now.duration_since(*prev_at).as_nanos() as f64;
+                            if wall > 0.0 {
+                                (client.engine_ns.saturating_sub(*prev_ns) as f64 / wall * 100.0)
+                                    .clamp(0.0, 100.0)
+                            } else {
+                                0.0
+                            }
+                        }
+                        None => 0.0,
+                    };
+                    self.engine_state
+                        .insert((pid, client.id), (client.engine_ns, now));
+
+                    let e = agg.entry((pid, gpu)).or_insert((0.0, 0, false));
+                    e.0 += util;
+                    e.1 += client.vram_bytes;
+                    e.2 |= client.graphics;
+                }
+            }
+
+            // Forget clients that vanished so the map doesn't grow forever.
+            self.engine_state.retain(|k, _| seen_clients.contains(k));
+
+            agg.into_iter()
+                .map(|((pid, gpu_index), (util, vram, graphics))| GpuProcess {
+                    pid,
+                    gpu_index,
+                    kind: if graphics {
+                        ProcKind::Graphics
+                    } else {
+                        ProcKind::Compute
+                    },
+                    gpu_util_pct: Some(util.min(100.0)),
+                    gpu_mem_bytes: vram,
+                })
+                .collect()
+        }
+    }
+
+    struct DrmClient {
+        id: u64,
+        pdev: Option<String>,
+        /// Sum of gfx/compute/enc/dec engine busy time.
+        engine_ns: u64,
+        vram_bytes: u64,
+        graphics: bool,
+    }
+
+    fn proc_pids() -> Vec<u32> {
+        fs::read_dir("/proc")
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().to_string_lossy().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Parse every amdgpu DRM client a process has open. Restricted to fds
+    /// that stat as DRM character devices to avoid reading every fdinfo.
+    fn drm_clients(pid: u32) -> Vec<DrmClient> {
+        let fd_dir = format!("/proc/{pid}/fd");
+        let Ok(entries) = fs::read_dir(&fd_dir) else {
+            return Vec::new(); // other users' processes without privileges
+        };
+        entries
+            .flatten()
+            .filter_map(|e| {
+                let meta = fs::metadata(e.path()).ok()?;
+                if !meta.file_type().is_char_device() || linux_major(meta.rdev()) != DRM_MAJOR {
+                    return None;
+                }
+                let fd = e.file_name();
+                let info =
+                    fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", fd.to_string_lossy()))
+                        .ok()?;
+                parse_fdinfo(&info)
+            })
+            .collect()
+    }
+
+    fn linux_major(rdev: u64) -> u64 {
+        ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff)
+    }
+
+    fn parse_fdinfo(info: &str) -> Option<DrmClient> {
+        if !info.contains("drm-driver:\tamdgpu") {
+            return None;
+        }
+        let mut client = DrmClient {
+            id: 0,
+            pdev: None,
+            engine_ns: 0,
+            vram_bytes: 0,
+            graphics: false,
+        };
+        let mut have_id = false;
+        for line in info.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            match key {
+                "drm-client-id" => {
+                    client.id = value.parse().ok()?;
+                    have_id = true;
+                }
+                "drm-pdev" => client.pdev = Some(value.to_string()),
+                "drm-engine-gfx" => {
+                    let ns = parse_ns(value);
+                    client.graphics |= ns > 0;
+                    client.engine_ns += ns;
+                }
+                "drm-engine-compute" | "drm-engine-enc" | "drm-engine-dec" => {
+                    client.engine_ns += parse_ns(value);
+                }
+                "drm-memory-vram" => client.vram_bytes = parse_kib(value),
+                _ => {}
+            }
+        }
+        have_id.then_some(client)
+    }
+
+    /// "123456 ns" -> 123456
+    fn parse_ns(v: &str) -> u64 {
+        v.split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// "12 KiB" -> 12288
+    fn parse_kib(v: &str) -> u64 {
+        v.split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1024
     }
 
     fn scan(drm: &str) -> Vec<AmdDevice> {
@@ -78,7 +253,17 @@ mod linux {
                     })
                     .unwrap_or_else(|| format!("AMD GPU {device_id} (card{idx})"));
                 let hwmon = first_dir(&dev.join("hwmon"));
-                AmdDevice { name, dev, hwmon }
+                // /sys/class/drm/cardN/device resolves to the PCI device dir;
+                // its basename is the address fdinfo reports as drm-pdev.
+                let pdev = fs::canonicalize(&dev)
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+                AmdDevice {
+                    name,
+                    dev,
+                    hwmon,
+                    pdev,
+                }
             })
             .collect()
     }
@@ -291,6 +476,22 @@ mod linux {
                 );
                 assert!(g.vram_total_bytes > 0, "vram total should be nonzero");
             }
+            // Two samples so engine-ns deltas can produce utilization.
+            let _ = backend.processes();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            backend.poll().unwrap();
+            let procs = backend.processes();
+            for p in &procs {
+                println!(
+                    "pid={} gpu={} kind={:?} util={:?}% vram={}MiB",
+                    p.pid,
+                    p.gpu_index,
+                    p.kind,
+                    p.gpu_util_pct,
+                    p.gpu_mem_bytes / 1024 / 1024,
+                );
+            }
+            println!("{} gpu processes", procs.len());
         }
 
         #[test]

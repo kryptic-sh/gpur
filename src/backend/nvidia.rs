@@ -1,15 +1,22 @@
 //! NVIDIA backend via NVML (Linux + Windows). Loads libnvidia-ml dynamically;
 //! probe fails soft on machines without the driver.
 
-use super::{GpuBackend, GpuSnapshot};
+use super::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind};
 use anyhow::Result;
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::{Clock, PcieUtilCounter, TemperatureSensor};
+use nvml_wrapper::enums::device::UsedGpuMemory;
+use nvml_wrapper::struct_wrappers::device::ProcessInfo;
+use std::collections::HashMap;
 
 pub fn probe() -> Option<Box<dyn GpuBackend>> {
     let nvml = Nvml::init().ok()?;
     match nvml.device_count() {
-        Ok(n) if n > 0 => Some(Box::new(NvmlBackend { nvml, count: n })),
+        Ok(n) if n > 0 => Some(Box::new(NvmlBackend {
+            nvml,
+            count: n,
+            last_util_ts: 0,
+        })),
         _ => None,
     }
 }
@@ -17,6 +24,8 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
 struct NvmlBackend {
     nvml: Nvml,
     count: u32,
+    /// Microsecond timestamp of the newest process-utilization sample seen.
+    last_util_ts: u64,
 }
 
 impl GpuBackend for NvmlBackend {
@@ -63,5 +72,44 @@ impl GpuBackend for NvmlBackend {
             });
         }
         Ok(gpus)
+    }
+
+    fn processes(&mut self) -> Vec<GpuProcess> {
+        let mut out = Vec::new();
+        for i in 0..self.count {
+            let Ok(dev) = self.nvml.device_by_index(i) else {
+                continue;
+            };
+            // pid -> (mem, kind); graphics wins when a pid appears in both.
+            let mut procs: HashMap<u32, (u64, ProcKind)> = HashMap::new();
+            for p in dev.running_compute_processes().unwrap_or_default() {
+                procs.insert(p.pid, (used_bytes(&p), ProcKind::Compute));
+            }
+            for p in dev.running_graphics_processes().unwrap_or_default() {
+                procs.insert(p.pid, (used_bytes(&p), ProcKind::Graphics));
+            }
+            let mut util: HashMap<u32, u32> = HashMap::new();
+            if let Ok(samples) = dev.process_utilization_stats(self.last_util_ts) {
+                for s in samples {
+                    self.last_util_ts = self.last_util_ts.max(s.timestamp);
+                    util.insert(s.pid, s.sm_util.min(100));
+                }
+            }
+            out.extend(procs.into_iter().map(|(pid, (mem, kind))| GpuProcess {
+                pid,
+                gpu_index: i as usize,
+                kind,
+                gpu_util_pct: util.get(&pid).map(|u| *u as f64),
+                gpu_mem_bytes: mem,
+            }));
+        }
+        out
+    }
+}
+
+fn used_bytes(p: &ProcessInfo) -> u64 {
+    match p.used_gpu_memory {
+        UsedGpuMemory::Used(b) => b,
+        UsedGpuMemory::Unavailable => 0,
     }
 }

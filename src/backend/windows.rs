@@ -16,7 +16,7 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
 
 #[cfg(windows)]
 mod win {
-    use crate::backend::{GpuBackend, GpuSnapshot};
+    use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind};
     use anyhow::Result;
     use std::collections::HashMap;
     use windows::Win32::Graphics::Dxgi::{
@@ -49,6 +49,8 @@ mod win {
         let util = add(w!(r"\GPU Engine(*)\Utilization Percentage"));
         let dedicated = add(w!(r"\GPU Adapter Memory(*)\Dedicated Usage"));
         let shared = add(w!(r"\GPU Adapter Memory(*)\Shared Usage"));
+        let proc_dedicated = add(w!(r"\GPU Process Memory(*)\Dedicated Usage"));
+        let proc_shared = add(w!(r"\GPU Process Memory(*)\Shared Usage"));
         if util.is_none() && dedicated.is_none() {
             unsafe { PdhCloseQuery(query) };
             return None;
@@ -60,7 +62,10 @@ mod win {
             util,
             dedicated,
             shared,
+            proc_dedicated,
+            proc_shared,
             adapters,
+            last_procs: Vec::new(),
         }))
     }
 
@@ -78,7 +83,11 @@ mod win {
         util: Option<PDH_HCOUNTER>,
         dedicated: Option<PDH_HCOUNTER>,
         shared: Option<PDH_HCOUNTER>,
+        proc_dedicated: Option<PDH_HCOUNTER>,
+        proc_shared: Option<PDH_HCOUNTER>,
         adapters: Vec<Adapter>,
+        /// Built during poll (same PDH collection), served by processes().
+        last_procs: Vec<GpuProcess>,
     }
 
     // PDH handles are plain opaque values owned by this struct.
@@ -98,20 +107,36 @@ mod win {
         fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
             unsafe { PdhCollectQueryData(self.query) };
 
-            // (luid, engtype) -> summed % across processes.
+            // (luid, engtype) -> summed % across processes, and
+            // (pid, luid, engtype) -> % for the process table.
             let mut engine: HashMap<(String, String), f64> = HashMap::new();
+            let mut proc_engine: HashMap<(u32, String, String), f64> = HashMap::new();
+            let mut proc_graphics: HashMap<(u32, String), bool> = HashMap::new();
             if let Some(c) = self.util {
                 for (inst, v) in read_array(c) {
                     let Some((luid, eng)) = luid_and_engtype(&inst) else {
                         continue;
                     };
-                    *engine.entry((luid, eng)).or_default() += v;
+                    *engine.entry((luid.clone(), eng.clone())).or_default() += v;
+                    if let Some(pid) = pid_prefix(&inst) {
+                        *proc_engine
+                            .entry((pid, luid.clone(), eng.clone()))
+                            .or_default() += v;
+                        let g = proc_graphics.entry((pid, luid)).or_default();
+                        *g |= eng.contains("3d") || eng.contains("graphics");
+                    }
                 }
             }
             // Busiest engine type per adapter = Task Manager's GPU %.
             let mut util_by_luid: HashMap<String, f64> = HashMap::new();
             for ((luid, _), v) in engine {
                 let e = util_by_luid.entry(luid).or_default();
+                *e = e.max(v);
+            }
+            // Same convention per process.
+            let mut util_by_proc: HashMap<(u32, String), f64> = HashMap::new();
+            for ((pid, luid, _), v) in proc_engine {
+                let e = util_by_proc.entry((pid, luid)).or_default();
                 *e = e.max(v);
             }
 
@@ -128,6 +153,65 @@ mod win {
             };
             let dedicated = mem_by_luid(self.dedicated);
             let shared = mem_by_luid(self.shared);
+
+            // Per-process memory: (pid, luid) -> bytes.
+            let proc_mem = |c: Option<PDH_HCOUNTER>| -> HashMap<(u32, String), u64> {
+                let mut m = HashMap::new();
+                if let Some(c) = c {
+                    for (inst, v) in read_array(c) {
+                        if let (Some(pid), Some(luid)) = (pid_prefix(&inst), luid_prefix(&inst)) {
+                            *m.entry((pid, luid)).or_default() += v as u64;
+                        }
+                    }
+                }
+                m
+            };
+            let proc_ded = proc_mem(self.proc_dedicated);
+            let proc_shr = proc_mem(self.proc_shared);
+
+            let luid_to_gpu: HashMap<&str, (usize, bool)> = self
+                .adapters
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (a.luid_key.as_str(), (i, a.integrated)))
+                .collect();
+            let mut procs: HashMap<(u32, String), GpuProcess> = HashMap::new();
+            let keys: Vec<(u32, String)> = util_by_proc
+                .keys()
+                .chain(proc_ded.keys())
+                .chain(proc_shr.keys())
+                .cloned()
+                .collect();
+            for key in keys {
+                if procs.contains_key(&key) {
+                    continue;
+                }
+                let Some(&(gpu_index, integrated)) = luid_to_gpu.get(key.1.as_str()) else {
+                    continue;
+                };
+                let mem = if integrated {
+                    proc_shr.get(&key).copied().unwrap_or(0)
+                } else {
+                    proc_ded.get(&key).copied().unwrap_or(0)
+                };
+                let kind = if proc_graphics.get(&key).copied().unwrap_or(false) {
+                    ProcKind::Graphics
+                } else {
+                    ProcKind::Compute
+                };
+                let p = GpuProcess {
+                    pid: key.0,
+                    gpu_index,
+                    kind,
+                    gpu_util_pct: util_by_proc.get(&key).copied(),
+                    gpu_mem_bytes: mem,
+                };
+                procs.insert(key, p);
+            }
+            self.last_procs = procs
+                .into_values()
+                .filter(|p| p.gpu_mem_bytes > 0 || p.gpu_util_pct.unwrap_or(0.0) > 0.0)
+                .collect();
 
             Ok(self
                 .adapters
@@ -152,6 +236,10 @@ mod win {
                     }
                 })
                 .collect())
+        }
+
+        fn processes(&mut self) -> Vec<GpuProcess> {
+            self.last_procs.clone()
         }
     }
 
@@ -232,6 +320,16 @@ mod win {
         let luid = luid_prefix(instance)?;
         let eng = instance.split("engtype_").nth(1)?.to_string();
         Some((luid, eng))
+    }
+
+    /// "pid_1234_luid_..." -> 1234
+    fn pid_prefix(instance: &str) -> Option<u32> {
+        instance
+            .strip_prefix("pid_")?
+            .split('_')
+            .next()?
+            .parse()
+            .ok()
     }
 
     /// Extract "luid_0x????????_0x????????" from anywhere in the instance name.

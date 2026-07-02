@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Gauge, Paragraph, Sparkline};
+use ratatui::widgets::{Block, Cell, Gauge, Paragraph, Row, Sparkline, Table};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -33,10 +33,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     frame.render_widget(Paragraph::new(Line::from(head)), header);
 
+    // Process pane: sized to content, capped at ~40% of the body.
+    let proc_height = (app.procs.len() as u16 + 3).clamp(4, (body.height * 2) / 5);
+    let [gpus_area, proc_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(proc_height)]).areas(body);
+
     if app.gpus.is_empty() {
         frame.render_widget(
             Paragraph::new("no GPUs reported by backend").style(t.dim),
-            body,
+            gpus_area,
         );
     } else {
         let rows = Layout::vertical(
@@ -44,11 +49,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 .iter()
                 .map(|_| Constraint::Ratio(1, app.gpus.len() as u32)),
         )
-        .split(body);
+        .split(gpus_area);
         for (i, gpu) in app.gpus.iter().enumerate() {
             draw_gpu(frame, rows[i], app, gpu, i);
         }
     }
+
+    draw_processes(frame, proc_area, app);
 
     frame.render_widget(
         Paragraph::new(" q quit  p pause  j/k select  +/- poll rate").style(t.dim),
@@ -162,6 +169,72 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         info.push(Span::styled(format!("membus {mb:.0}% "), t.dim));
     }
     frame.render_widget(Paragraph::new(Line::from(info)), info_row);
+}
+
+fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
+    if area.height < 3 {
+        return;
+    }
+    let block = Block::bordered()
+        .title(Span::styled(" processes ", t.title))
+        .border_style(t.border);
+
+    if app.procs.is_empty() {
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new("no GPU processes visible (need same-user or root for fdinfo)")
+                .style(t.dim),
+            inner,
+        );
+        return;
+    }
+
+    let header = Row::new(
+        [
+            "PID", "USER", "DEV", "TYPE", "GPU%", "GPU MEM", "CPU%", "HOST MEM", "COMMAND",
+        ]
+        .into_iter()
+        .map(Cell::from),
+    )
+    .style(t.title);
+
+    let rows = app.procs.iter().map(|p| {
+        Row::new(vec![
+            Cell::from(p.pid.to_string()),
+            Cell::from(p.user.clone()),
+            Cell::from(p.gpu_index.to_string()),
+            Cell::from(p.kind.label()),
+            Cell::from(
+                p.gpu_util_pct
+                    .map(|u| format!("{u:>3.0}%"))
+                    .unwrap_or_else(|| "N/A".into()),
+            ),
+            Cell::from(format!("{}MiB", p.gpu_mem_bytes / 1024 / 1024)),
+            Cell::from(format!("{:>3.0}%", p.cpu_pct)),
+            Cell::from(format!("{}MiB", p.host_mem_bytes / 1024 / 1024)),
+            Cell::from(p.command.clone()),
+        ])
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(3),
+            Constraint::Length(8),
+            Constraint::Length(5),
+            Constraint::Length(9),
+            Constraint::Length(5),
+            Constraint::Length(9),
+            Constraint::Fill(1),
+        ],
+    )
+    .header(header)
+    .block(block);
+    frame.render_widget(table, area);
 }
 
 /// KiB/s -> human rate, matching nvtop's per-direction PCIe readout.

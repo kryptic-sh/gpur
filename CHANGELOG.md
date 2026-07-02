@@ -8,6 +8,16 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- nvtop-style process table: PID/USER/DEV/TYPE/GPU%/GPU MEM/CPU%/HOST
+  MEM/COMMAND, sorted by GPU memory. Sources: AMD Linux via `/proc` fdinfo
+  (drm-client-id dedupe, engine-busy-ns deltas for per-process GPU%,
+  `drm-memory-vram`); NVML `running_graphics/compute_processes` +
+  `process_utilization_stats`; Windows PDH per-pid GPU Engine instances +
+  `GPU Process Memory` counters. Host user/CPU%/RSS/command via `sysinfo`. Apple
+  has no public per-process GPU API — table is empty there.
+
 ## [0.1.0] - 2026-07-02
 
 ### Added
