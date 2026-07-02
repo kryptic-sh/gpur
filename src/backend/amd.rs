@@ -45,6 +45,9 @@ mod linux_impl {
         pdev: Option<String>,
         /// Critical edge temperature (°C), for the throttle heuristic.
         temp_crit_c: Option<f64>,
+        /// hwmon channel numbers for the junction / memory temp sensors.
+        temp_junction_ch: Option<u8>,
+        temp_mem_ch: Option<u8>,
     }
 
     struct AmdBackend {
@@ -83,6 +86,10 @@ mod linux_impl {
 
         fn processes(&mut self) -> Vec<GpuProcess> {
             self.last_procs.clone()
+        }
+
+        fn driver_info(&self) -> Option<String> {
+            kernel_release().map(|k| format!("amdgpu · kernel {k}"))
         }
     }
 
@@ -178,12 +185,26 @@ mod linux_impl {
                     .as_deref()
                     .and_then(|h| read_u64(&h.join("temp1_crit")))
                     .map(|v| v as f64 / 1000.0);
+                // Map labelled temp channels (edge is temp1 by convention).
+                let mut temp_junction_ch = None;
+                let mut temp_mem_ch = None;
+                if let Some(h) = hwmon.as_deref() {
+                    for ch in 2u8..=4 {
+                        match read_trim(&h.join(format!("temp{ch}_label"))).as_deref() {
+                            Some("junction") => temp_junction_ch = Some(ch),
+                            Some("mem") => temp_mem_ch = Some(ch),
+                            _ => {}
+                        }
+                    }
+                }
                 AmdDevice {
                     name,
                     dev,
                     hwmon,
                     pdev,
                     temp_crit_c,
+                    temp_junction_ch,
+                    temp_mem_ch,
                 }
             })
             .collect()
@@ -234,9 +255,18 @@ mod linux_impl {
             // temp1 = edge sensor (millidegrees); power in microwatts with
             // the APU fallback and cap-of-0 handling done above.
             temperature_c,
+            temp_junction_c: d
+                .temp_junction_ch
+                .and_then(|ch| hwmon_u64(h, &format!("temp{ch}_input")))
+                .map(|v| v as f64 / 1000.0),
+            temp_mem_c: d
+                .temp_mem_ch
+                .and_then(|ch| hwmon_u64(h, &format!("temp{ch}_input")))
+                .map(|v| v as f64 / 1000.0),
             power_w,
             power_limit_w,
             fan_pct: fan_pct(h),
+            fan_rpm: hwmon_u64(h, "fan1_input"),
             // Hz. Reads 0 when the clock domain is power-gated at idle.
             clock_mhz: hwmon_u64(h, "freq1_input")
                 .map(|v| v / 1_000_000)
@@ -256,6 +286,11 @@ mod linux_impl {
             // amdgpu does not expose PCIe throughput counters.
             pcie_rx_kbs: None,
             pcie_tx_kbs: None,
+            gtt_used_bytes: read_u64(&d.dev.join("mem_info_gtt_used")),
+            gtt_total_bytes: read_u64(&d.dev.join("mem_info_gtt_total")),
+            volt_mv: hwmon_u64(h, "in0_input"),
+            perf_level: read_trim(&d.dev.join("power_dpm_force_performance_level"))
+                .filter(|l| l != "auto"),
         }
     }
 
@@ -301,6 +336,10 @@ mod linux_impl {
         let pwm = hwmon_u64(h, "pwm1")?;
         let max = hwmon_u64(h, "pwm1_max").filter(|v| *v > 0).unwrap_or(255);
         Some(pwm as f64 / max as f64 * 100.0)
+    }
+
+    fn kernel_release() -> Option<String> {
+        sysinfo::System::kernel_version()
     }
 
     fn hwmon_u64(hwmon: Option<&Path>, file: &str) -> Option<u64> {

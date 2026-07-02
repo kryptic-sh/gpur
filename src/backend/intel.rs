@@ -113,12 +113,7 @@ mod linux_impl {
                         fan_pct: None,
                         clock_mhz: gt_cur_freq_mhz(d),
                         mem_clock_mhz: None,
-                        pcie_gen: None,
-                        pcie_width: None,
-                        pcie_max_gen: None,
-                        pcie_max_width: None,
-                        pcie_rx_kbs: None,
-                        pcie_tx_kbs: None,
+                        ..Default::default()
                     }
                 })
                 .collect();
@@ -127,6 +122,13 @@ mod linux_impl {
 
         fn processes(&mut self) -> Vec<GpuProcess> {
             self.last_procs.clone()
+        }
+
+        fn driver_info(&self) -> Option<String> {
+            let drivers: std::collections::BTreeSet<&str> =
+                self.devices.iter().map(|d| d.driver.as_str()).collect();
+            let names = drivers.into_iter().collect::<Vec<_>>().join("+");
+            sysinfo::System::kernel_version().map(|k| format!("{names} · kernel {k}"))
         }
     }
 

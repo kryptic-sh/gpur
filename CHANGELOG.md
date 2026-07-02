@@ -8,6 +8,19 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Replay mode: `--replay session.jsonl` re-drives the full TUI (or `--json`
+  snapshot) from a `--log` recording — recorded user/command enrichment is
+  preserved instead of resolving foreign pids; last frame holds at EOF. Makes
+  bug reports replayable.
+- AMD sensor depth: junction + memory temperatures (labelled hwmon channels),
+  GTT usage, VDDGFX voltage, and a warning badge when the DPM performance level
+  is forced off auto.
+- Fan RPM alongside fan %, on AMD (fan1_input) and NVIDIA (NVML RPM API).
+- Driver/kernel version in the header (NVML driver version; kernel release for
+  the Linux sysfs backends; mock included).
+
 ## [0.6.0] - 2026-07-03
 
 ## [0.5.0] - 2026-07-02

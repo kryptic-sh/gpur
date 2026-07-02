@@ -38,6 +38,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled(format!("[{}] ", app.backend.name()), t.dim),
             Span::styled(format!("{}ms ", app.tick_ms), t.dim),
         ];
+        if let Some(drv) = app.backend.driver_info() {
+            head.push(Span::styled(format!("{drv} "), t.dim));
+        }
         if app.paused {
             head.push(Span::styled("PAUSED ", t.temp_warn));
         }
@@ -420,7 +423,14 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
                 t.dim,
             ));
         }
-        info.push(Span::styled(format!(" {c:.0}°C  "), t.temp_style(c)));
+        info.push(Span::styled(format!(" {c:.0}°C "), t.temp_style(c)));
+        if let Some(j) = gpu.temp_junction_c {
+            info.push(Span::styled(format!("junc {j:.0}° "), t.dim));
+        }
+        if let Some(m) = gpu.temp_mem_c {
+            info.push(Span::styled(format!("mem {m:.0}° "), t.dim));
+        }
+        info.push(Span::raw(" "));
     }
     if let Some(w) = gpu.power_w {
         let max_w = gpu.power_limit_w.unwrap_or(0.0).max(w).max(1.0) as u64;
@@ -440,7 +450,10 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         info.push(Span::styled(format!("▼{} ▲{}  ", kbs(rx), kbs(tx)), t.dim));
     }
     if let Some(f) = gpu.fan_pct {
-        info.push(Span::styled(format!("fan {f:.0}%  "), t.dim));
+        let rpm = gpu.fan_rpm.map(|r| format!(" {r}rpm")).unwrap_or_default();
+        info.push(Span::styled(format!("fan {f:.0}%{rpm}  "), t.dim));
+    } else if let Some(r) = gpu.fan_rpm {
+        info.push(Span::styled(format!("fan {r}rpm  "), t.dim));
     }
     if let Some(c) = gpu.clock_mhz {
         info.push(Span::styled(format!("core {c}MHz  "), t.dim));
@@ -459,6 +472,18 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
     }
     if let Some(d) = gpu.dec_util_pct {
         info.push(Span::styled(format!("dec {d:.0}%  "), t.dim));
+    }
+    if let Some(mv) = gpu.volt_mv {
+        info.push(Span::styled(format!("{:.2}V  ", mv as f64 / 1000.0), t.dim));
+    }
+    if let (Some(u_), Some(t_)) = (gpu.gtt_used_bytes, gpu.gtt_total_bytes) {
+        info.push(Span::styled(
+            format!("gtt {}/{}  ", human_bytes(u_), human_bytes(t_)),
+            t.dim,
+        ));
+    }
+    if let Some(p) = &gpu.perf_level {
+        info.push(Span::styled(format!("perf {p}  "), t.temp_warn));
     }
     frame.render_widget(Paragraph::new(Line::from(info)), info_row);
 }

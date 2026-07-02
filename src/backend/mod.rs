@@ -36,9 +36,13 @@ pub struct GpuSnapshot {
     pub vram_used_bytes: u64,
     pub vram_total_bytes: u64,
     pub temperature_c: Option<f64>,
+    /// Hotspot / memory-junction temperatures where exposed (AMD temp2/3).
+    pub temp_junction_c: Option<f64>,
+    pub temp_mem_c: Option<f64>,
     pub power_w: Option<f64>,
     pub power_limit_w: Option<f64>,
     pub fan_pct: Option<f64>,
+    pub fan_rpm: Option<u64>,
     pub clock_mhz: Option<u64>,
     pub mem_clock_mhz: Option<u64>,
     /// Current PCIe generation (1..=7).
@@ -51,6 +55,13 @@ pub struct GpuSnapshot {
     /// PCIe throughput, KiB/s.
     pub pcie_rx_kbs: Option<u64>,
     pub pcie_tx_kbs: Option<u64>,
+    /// GTT (system memory graphics pool) usage — matters for APUs.
+    pub gtt_used_bytes: Option<u64>,
+    pub gtt_total_bytes: Option<u64>,
+    /// Core voltage, millivolts (AMD vddgfx).
+    pub volt_mv: Option<u64>,
+    /// DPM performance level when forced off "auto".
+    pub perf_level: Option<String>,
 }
 
 impl GpuSnapshot {
@@ -108,6 +119,10 @@ pub trait GpuBackend {
     /// per-process visibility return nothing.
     fn processes(&mut self) -> Vec<GpuProcess> {
         Vec::new()
+    }
+    /// Driver / kernel version line for the header, when known.
+    fn driver_info(&self) -> Option<String> {
+        None
     }
 }
 

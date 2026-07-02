@@ -65,10 +65,20 @@ impl GpuBackend for MockBackend {
                     pcie_max_width: Some(16),
                     pcie_rx_kbs: Some((util * 8000.0) as u64),
                     pcie_tx_kbs: Some((util * 3000.0) as u64),
+                    fan_rpm: Some(800 + (util * 14.0) as u64),
+                    temp_junction_c: Some(50.0 + util * 0.45),
+                    gtt_used_bytes: Some((util * 2e7) as u64),
+                    gtt_total_bytes: Some(8 * 1024 * 1024 * 1024),
+                    volt_mv: Some(700 + (util * 4.0) as u64),
+                    ..Default::default()
                 }
             })
             .collect();
         Ok(gpus)
+    }
+
+    fn driver_info(&self) -> Option<String> {
+        Some("mock driver 1.0".into())
     }
 
     fn processes(&mut self) -> Vec<GpuProcess> {

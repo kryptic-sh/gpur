@@ -13,11 +13,15 @@ use std::collections::HashMap;
 pub fn probe() -> Option<Box<dyn GpuBackend>> {
     let nvml = Nvml::init().ok()?;
     match nvml.device_count() {
-        Ok(n) if n > 0 => Some(Box::new(NvmlBackend {
-            nvml,
-            count: n,
-            last_util_ts: 0,
-        })),
+        Ok(n) if n > 0 => {
+            let driver = nvml.sys_driver_version().ok();
+            Some(Box::new(NvmlBackend {
+                nvml,
+                count: n,
+                driver,
+                last_util_ts: 0,
+            }))
+        }
         _ => None,
     }
 }
@@ -25,6 +29,7 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
 struct NvmlBackend {
     nvml: Nvml,
     count: u32,
+    driver: Option<String>,
     /// Microsecond timestamp of the newest process-utilization sample seen.
     last_util_ts: u64,
 }
@@ -62,6 +67,7 @@ impl GpuBackend for NvmlBackend {
                 power_w: dev.power_usage().ok().map(|p| p as f64 / 1000.0),
                 power_limit_w: dev.enforced_power_limit().ok().map(|p| p as f64 / 1000.0),
                 fan_pct: dev.fan_speed(0).ok().map(|f| f as f64),
+                fan_rpm: dev.fan_speed_rpm(0).ok().map(u64::from),
                 clock_mhz: dev.clock_info(Clock::Graphics).ok().map(u64::from),
                 mem_clock_mhz: dev.clock_info(Clock::Memory).ok().map(u64::from),
                 pcie_gen: dev.current_pcie_link_gen().ok().map(|g| g as u8),
@@ -76,9 +82,14 @@ impl GpuBackend for NvmlBackend {
                     .pcie_throughput(PcieUtilCounter::Send)
                     .ok()
                     .map(u64::from),
+                ..Default::default()
             });
         }
         Ok(gpus)
+    }
+
+    fn driver_info(&self) -> Option<String> {
+        self.driver.as_ref().map(|d| format!("driver {d}"))
     }
 
     fn processes(&mut self) -> Vec<GpuProcess> {
