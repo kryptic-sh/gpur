@@ -14,6 +14,7 @@ and this project adheres to
   (NVML), AMD shows unified VCN `video %` (fdinfo engine deltas), Intel shows
   media-engine `video %` (i915 video/video-enhance ns, xe vcs/vecs cycles),
   Windows shows `enc`/`dec` from the PDH videoencode/videodecode engine types.
+- Throttle badge shows on folded card summaries too.
 - Throttle badge: red `⚠thermal`/`⚠power-limit` in the card info line. NVIDIA
   uses the real NVML throttle-reason mask; AMD uses an at-limit heuristic (power
   ≥99% of cap, or temp within 3°C of the hwmon critical trip).

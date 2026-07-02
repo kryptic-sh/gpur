@@ -250,6 +250,9 @@ fn draw_gpu_folded(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, 
     if let Some(w) = gpu.power_w {
         line.push(Span::styled(format!("{w:.0}W  "), t.spark_power));
     }
+    if let Some(reason) = &gpu.throttle {
+        line.push(Span::styled(format!("⚠{reason}  "), t.temp_crit));
+    }
     frame.render_widget(Paragraph::new(Line::from(line)), area);
 }
 
