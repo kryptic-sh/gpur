@@ -12,7 +12,11 @@ use app::App;
 use clap::Parser;
 use cli::Cli;
 use config::GpurConfig;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
+};
+use keys::Action;
+use ratatui::layout::Position;
 use std::io::stdout;
 use std::time::{Duration, Instant};
 
@@ -34,7 +38,9 @@ fn main() -> Result<()> {
 
     let mut terminal = ratatui::init();
     hjkl_kitty::enable(&mut stdout())?;
+    crossterm::execute!(stdout(), EnableMouseCapture)?;
     let result = run(&mut terminal, &mut app);
+    let _ = crossterm::execute!(stdout(), DisableMouseCapture);
     let _ = hjkl_kitty::disable(&mut stdout());
     ratatui::restore();
     result
@@ -65,6 +71,31 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                         && app.apply(action)
                     {
                         return Ok(());
+                    }
+                }
+                Event::Mouse(m) => {
+                    if app.splash_active() {
+                        app.splash_skipped = true;
+                        continue;
+                    }
+                    let pos = Position::new(m.column, m.row);
+                    let action = match m.kind {
+                        MouseEventKind::ScrollDown if app.proc_rect.contains(pos) => {
+                            Some(Action::ProcScrollDown)
+                        }
+                        MouseEventKind::ScrollUp if app.proc_rect.contains(pos) => {
+                            Some(Action::ProcScrollUp)
+                        }
+                        MouseEventKind::ScrollDown if app.gpus_rect.contains(pos) => {
+                            Some(Action::NextGpu)
+                        }
+                        MouseEventKind::ScrollUp if app.gpus_rect.contains(pos) => {
+                            Some(Action::PrevGpu)
+                        }
+                        _ => None,
+                    };
+                    if let Some(action) = action {
+                        app.apply(action);
                     }
                 }
                 _ => {}

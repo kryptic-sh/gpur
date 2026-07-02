@@ -10,6 +10,8 @@ and this project adheres to
 
 ### Added
 
+- Mouse wheel support: scrolling over the process pane scrolls the table, over
+  the GPU area moves the selection (mouse capture on, released at exit).
 - Dynamic layout: process pane sizes to content capped at 30% of the body with
   J/K + PgUp/PgDn scrolling and a scrollbar; GPU card list scrolls whole cards
   with a scrollbar when they overflow (selection stays visible, visible cards

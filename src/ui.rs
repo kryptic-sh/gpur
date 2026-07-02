@@ -53,6 +53,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let [gpus_area, proc_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(proc_height)]).areas(body);
 
+    app.gpus_rect = gpus_area;
+    app.proc_rect = proc_area;
     draw_gpus(frame, gpus_area, app);
     draw_processes(frame, proc_area, app);
 

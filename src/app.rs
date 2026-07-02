@@ -63,6 +63,9 @@ pub struct App {
     pub gpu_scroll: usize,
     /// First visible process row when the table overflows (clamped in draw).
     pub proc_scroll: usize,
+    /// Pane rectangles from the last draw, for routing mouse wheel events.
+    pub gpus_rect: ratatui::layout::Rect,
+    pub proc_rect: ratatui::layout::Rect,
     sys: System,
     users: Users,
 }
@@ -91,6 +94,8 @@ impl App {
             folded: std::collections::HashSet::new(),
             gpu_scroll: 0,
             proc_scroll: 0,
+            gpus_rect: ratatui::layout::Rect::default(),
+            proc_rect: ratatui::layout::Rect::default(),
             sys: System::new(),
             users: Users::new_with_refreshed_list(),
         }
