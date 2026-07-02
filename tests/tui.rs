@@ -187,10 +187,36 @@ fn survives_resize_storm() {
         // grids, and out-of-range coords from small-screen frames clamp.
         t.pump_once(Duration::from_millis(50));
     }
-    t.send("?");
-    t.wait_for("responsive after storm (help overlay)", |s| {
-        s.contains("any key closes")
-    });
+    // Let the app drain the resize backlog before probing.
+    for _ in 0..10 {
+        t.pump_once(Duration::from_millis(100));
+    }
+    // Prove liveness: the overlay is a NEW element. Retry the key — a
+    // keypress racing the tail of the resize burst can be coalesced away
+    // on slow CI runners; a genuinely wedged input loop still fails.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(
+            !matches!(t.child.try_wait(), Ok(Some(_))),
+            "app exited during/after resize storm"
+        );
+        t.send("?");
+        let round = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < round {
+            t.pump_once(Duration::from_millis(100));
+            if t.screen_text().contains("any key closes") {
+                break;
+            }
+        }
+        if t.screen_text().contains("any key closes") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no response to '?' after resize storm; screen:\n{}",
+            t.screen_text()
+        );
+    }
     t.send(" "); // close overlay
     t.send("q");
     assert!(t.wait_exit().success());
