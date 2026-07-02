@@ -9,9 +9,10 @@ the hjkl stack.
 
 ![gpur running with three mock GPUs](assets/screenshot.svg)
 
-> **Status: beta.** The AMD Linux path is battle-tested on real hardware; the
-> Intel/macOS/Windows backends are implemented and CI-built but still collecting
-> real-hardware mileage. Reports welcome.
+> **Status: beta.** The AMD Linux path is battle-tested on real hardware, and
+> the macOS IOKit backend returns live data (validated against macOS CI runners'
+> paravirt GPU — Apple Silicon numbers still welcome). Intel and Windows
+> backends are implemented, CI-exercised, and awaiting real-GPU reports.
 
 ## Install
 
