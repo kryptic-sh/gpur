@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-02
+
 ### Added
 
 - Process actions: `s` cycles the sort column (gpu-mem → gpu% → cpu% → host-mem
@@ -109,6 +111,7 @@ and this project adheres to
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.1.0
