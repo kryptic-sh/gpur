@@ -456,7 +456,7 @@ fn draw_meter(
         if i < filled {
             spans.push(Span::styled(
                 fill,
-                Style::new().fg(crate::theme::gradient(stops, pos)),
+                Style::new().fg(crate::theme::gradient(stops, pos, t.mode)),
             ));
         } else {
             spans.push(Span::styled(empty, t.dim));
@@ -592,7 +592,7 @@ fn draw_waveform(
             } else {
                 0.0
             };
-            let color = crate::theme::gradient(stops, frac);
+            let color = crate::theme::gradient(stops, frac, t.mode);
             for cx in 0..cols {
                 let mut bits = 0u8;
                 for (s, bit_col) in DOT_BITS.iter().enumerate() {
@@ -666,7 +666,7 @@ fn draw_waveform_cells(
             } else {
                 0.0
             };
-            let color = crate::theme::gradient(stops, frac);
+            let color = crate::theme::gradient(stops, frac, t.mode);
             for cx in 0..cols {
                 let v = sample(data, cx).min(100) as usize;
                 let units = ((v * rows * unit) / 100).max(1);

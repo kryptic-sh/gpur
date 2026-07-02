@@ -31,7 +31,7 @@ fn main() -> Result<()> {
     let tick_ms = cli.tick_ms.unwrap_or(cfg.tick_ms).max(50);
     let theme_path = cli.theme.clone().or(cfg.theme.clone());
 
-    let theme = theme::load(theme_path.as_deref())?;
+    let theme = theme::load(theme_path.as_deref(), theme::detect_color_mode())?;
     let backend = backend::detect(cli.mock)?;
     let graph_style = match cli.graphs {
         Some(s) => s,
@@ -55,11 +55,14 @@ fn main() -> Result<()> {
     let mut app = App::new(
         backend,
         theme,
-        tick_ms,
-        cfg.history_len,
-        cli.no_splash,
-        graph_style,
-        log,
+        app::AppOptions {
+            tick_ms,
+            history_len: cfg.history_len,
+            no_splash: cli.no_splash,
+            graph_style,
+            mock: cli.mock,
+            log,
+        },
     );
     app.poll();
 

@@ -145,6 +145,16 @@ pub struct ProcRow {
     pub command: String,
 }
 
+/// Startup knobs for [`App::new`], resolved from CLI + config.
+pub struct AppOptions {
+    pub tick_ms: u64,
+    pub history_len: usize,
+    pub no_splash: bool,
+    pub graph_style: GraphStyle,
+    pub mock: Option<usize>,
+    pub log: Option<std::io::BufWriter<std::fs::File>>,
+}
+
 pub struct App {
     pub backend: Box<dyn GpuBackend>,
     pub gpus: Vec<GpuSnapshot>,
@@ -190,6 +200,10 @@ pub struct App {
     /// (rect, gpu index) of each card drawn last frame, for click hit-tests.
     pub card_rects: Vec<(ratatui::layout::Rect, usize)>,
     pub graph_style: GraphStyle,
+    /// The --mock argument, kept for backend re-detection.
+    mock: Option<usize>,
+    /// Consecutive poll failures; triggers a re-detect (driver reload).
+    poll_failures: u32,
     /// JSONL sink: one line per successful poll when --log is given.
     log: Option<std::io::BufWriter<std::fs::File>>,
     /// Unfiltered process rows; `procs` is the filtered+sorted view.
@@ -199,17 +213,19 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        backend: Box<dyn GpuBackend>,
-        theme: UiTheme,
-        tick_ms: u64,
-        history_len: usize,
-        no_splash: bool,
-        graph_style: GraphStyle,
-        log: Option<std::io::BufWriter<std::fs::File>>,
-    ) -> Self {
+    pub fn new(backend: Box<dyn GpuBackend>, theme: UiTheme, opts: AppOptions) -> Self {
+        let AppOptions {
+            tick_ms,
+            history_len,
+            no_splash,
+            graph_style,
+            mock,
+            log,
+        } = opts;
         Self {
             graph_style,
+            mock,
+            poll_failures: 0,
             log,
             backend,
             gpus: Vec::new(),
@@ -274,9 +290,24 @@ impl App {
             Ok(gpus) => {
                 self.gpus = gpus;
                 self.poll_error = None;
+                self.poll_failures = 0;
             }
             Err(e) => {
                 self.poll_error = Some(format!("poll failed: {e:#}"));
+                self.poll_failures += 1;
+                // A driver reload can permanently kill the old backend
+                // handle (NVML especially). Try a fresh detect every 5th
+                // consecutive failure.
+                if self.poll_failures.is_multiple_of(5)
+                    && let Ok(fresh) = crate::backend::detect(self.mock)
+                {
+                    self.backend = fresh;
+                    self.set_status(format!(
+                        "backend re-detected ({}) after {} failed polls",
+                        self.backend.name(),
+                        self.poll_failures
+                    ));
+                }
                 return; // keep previous snapshot and history
             }
         }
