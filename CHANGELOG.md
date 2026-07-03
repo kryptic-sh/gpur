@@ -8,6 +8,12 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- `--completions nushell` via `clap_complete_nushell` (a `CompletionShell`
+  bridge enum — clap's core Shell has no nushell variant); the release
+  completions tarball now carries all six shells.
+
 ## [0.7.0] - 2026-07-03
 
 ### Added
