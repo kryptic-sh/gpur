@@ -27,7 +27,7 @@ fn main() -> Result<()> {
     // Packaging helpers (hidden): emit completions / man page and exit.
     if let Some(shell) = cli.completions {
         use clap::CommandFactory;
-        clap_complete::generate(shell, &mut Cli::command(), "gpur", &mut stdout());
+        shell.generate(&mut Cli::command());
         return Ok(());
     }
     if cli.man {

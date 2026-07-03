@@ -330,7 +330,7 @@ jobs:
           # Archive entries are prefixed ./ (tar -C dist .)
           tar -xzf dist/gpur-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz ./gpur
           mkdir -p pkgext/completions
-          for shell in bash zsh fish powershell elvish; do
+          for shell in bash zsh fish powershell elvish nushell; do
             ./gpur --completions "$shell" > "pkgext/completions/gpur.$shell"
           done
           ./gpur --man > pkgext/gpur.1

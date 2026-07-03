@@ -54,9 +54,40 @@ pub struct Cli {
 
     /// Print shell completions to stdout and exit
     #[arg(long, value_enum, value_name = "SHELL", hide = true)]
-    pub completions: Option<clap_complete::Shell>,
+    pub completions: Option<CompletionShell>,
 
     /// Print the man page (troff) to stdout and exit
     #[arg(long, hide = true)]
     pub man: bool,
+}
+
+/// Shells `--completions` can generate for: clap_complete's five core
+/// shells plus nushell (separate generator crate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    Powershell,
+    Elvish,
+    Nushell,
+}
+
+impl CompletionShell {
+    pub fn generate(self, cmd: &mut clap::Command) {
+        use clap_complete::Shell;
+        let out = &mut std::io::stdout();
+        match self {
+            CompletionShell::Bash => clap_complete::generate(Shell::Bash, cmd, "gpur", out),
+            CompletionShell::Zsh => clap_complete::generate(Shell::Zsh, cmd, "gpur", out),
+            CompletionShell::Fish => clap_complete::generate(Shell::Fish, cmd, "gpur", out),
+            CompletionShell::Powershell => {
+                clap_complete::generate(Shell::PowerShell, cmd, "gpur", out)
+            }
+            CompletionShell::Elvish => clap_complete::generate(Shell::Elvish, cmd, "gpur", out),
+            CompletionShell::Nushell => {
+                clap_complete::generate(clap_complete_nushell::Nushell, cmd, "gpur", out)
+            }
+        }
+    }
 }

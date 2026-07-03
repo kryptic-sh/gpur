@@ -94,3 +94,18 @@ fn json_snapshot_emits_valid_shape() {
         "own process missing from attribution"
     );
 }
+
+#[test]
+fn completions_flag_covers_all_shells() {
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish", "nushell"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_gpur"))
+            .args(["--completions", shell])
+            .output()
+            .expect("spawn gpur");
+        assert!(out.status.success(), "--completions {shell} failed");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("gpur"),
+            "{shell} completions empty"
+        );
+    }
+}
