@@ -73,6 +73,18 @@ impl GpuSnapshot {
     }
 }
 
+/// Collapse throttle-reason fragments into a `+`-joined label, or None when
+/// nothing throttled. Shared by the nvidia and amdgpu backends.
+pub fn join_throttle(parts: &[&str]) -> Option<String> {
+    (!parts.is_empty()).then(|| parts.join("+"))
+}
+
+/// Clamp a raw percentage into 0..=100. Backends derive these from counter
+/// ratios that can under/overshoot; this is the single guard.
+pub fn clamp_pct(v: f64) -> f64 {
+    v.clamp(0.0, 100.0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ProcKind {
     Graphics,

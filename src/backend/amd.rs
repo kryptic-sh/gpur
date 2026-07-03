@@ -14,9 +14,9 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use crate::backend::linux::{
-        self, card_name, cards_with_vendor, first_dir, pdev_of, read_trim, read_u64,
+        self, card_name, cards_with_vendor, first_dir, hwmon_u64, pdev_of, read_trim, read_u64,
     };
-    use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind};
+    use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, clamp_pct};
     use anyhow::Result;
     use std::collections::{HashMap, HashSet};
     use std::fs;
@@ -119,28 +119,13 @@ mod linux_impl {
                         continue;
                     }
                     let engine_ns = client.total_engine_ns();
-                    let video_ns: u64 = client
-                        .engine_ns
-                        .iter()
-                        .filter(|(k, _)| is_video_engine(k))
-                        .map(|(_, v)| *v)
-                        .sum();
-                    let (util, vutil) = match self.engine_state.get(&(pid, client.id)) {
-                        Some((prev_ns, prev_video, prev_at)) => {
-                            let wall = now.duration_since(*prev_at).as_nanos() as f64;
-                            if wall > 0.0 {
-                                (
-                                    (engine_ns.saturating_sub(*prev_ns) as f64 / wall * 100.0)
-                                        .clamp(0.0, 100.0),
-                                    (video_ns.saturating_sub(*prev_video) as f64 / wall * 100.0)
-                                        .clamp(0.0, 100.0),
-                                )
-                            } else {
-                                (0.0, 0.0)
-                            }
-                        }
-                        None => (0.0, 0.0),
-                    };
+                    let video_ns = client.engine_ns_where(is_video_engine);
+                    let (util, vutil) = linux::ns_delta_util(
+                        self.engine_state.get(&(pid, client.id)),
+                        engine_ns,
+                        video_ns,
+                        now,
+                    );
                     self.engine_state
                         .insert((pid, client.id), (engine_ns, video_ns, now));
 
@@ -157,17 +142,8 @@ mod linux_impl {
 
             self.last_procs = agg
                 .into_iter()
-                .map(|((pid, gpu_index), (util, vram, graphics))| GpuProcess {
-                    pid,
-                    gpu_index,
-                    kind: if graphics {
-                        ProcKind::Graphics
-                    } else {
-                        ProcKind::Compute
-                    },
-                    gpu_util_pct: Some(util.min(100.0)),
-                    gpu_mem_bytes: vram,
-                    ..Default::default()
+                .map(|((pid, gpu_index), (util, vram, graphics))| {
+                    linux::build_proc(pid, gpu_index, util, vram, graphics)
                 })
                 .collect();
             video_util
@@ -235,18 +211,14 @@ mod linux_impl {
         {
             throttle_parts.push("power-limit");
         }
-        let throttle = if throttle_parts.is_empty() {
-            None
-        } else {
-            Some(throttle_parts.join("+"))
-        };
+        let throttle = crate::backend::join_throttle(&throttle_parts);
 
         GpuSnapshot {
             name: d.name.clone(),
             integrated: is_apu(&d.dev),
             utilization_pct: read_u64(&d.dev.join("gpu_busy_percent")).unwrap_or(0) as f64,
             mem_util_pct: read_u64(&d.dev.join("mem_busy_percent")).map(|v| v as f64),
-            video_util_pct: video_util.map(|v| v.min(100.0)),
+            video_util_pct: video_util.map(clamp_pct),
             enc_util_pct: None,
             dec_util_pct: None,
             throttle,
@@ -340,10 +312,6 @@ mod linux_impl {
 
     fn kernel_release() -> Option<String> {
         sysinfo::System::kernel_version()
-    }
-
-    fn hwmon_u64(hwmon: Option<&Path>, file: &str) -> Option<u64> {
-        read_u64(&hwmon?.join(file))
     }
 
     #[cfg(test)]

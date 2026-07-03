@@ -3,10 +3,12 @@
 //! amdgpu and Intel (i915/xe) backends.
 #![cfg(target_os = "linux")]
 
+use super::{GpuProcess, ProcKind, clamp_pct};
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 pub const PCI_IDS_PATHS: &[&str] = &["/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"];
 /// DRM character-device major.
@@ -32,6 +34,16 @@ impl FdClient {
         self.engine_ns.values().sum()
     }
 
+    /// Busy ns summed over engines whose name matches `pred` (e.g. the media
+    /// engines, for video-utilization attribution).
+    pub fn engine_ns_where(&self, pred: impl Fn(&str) -> bool) -> u64 {
+        self.engine_ns
+            .iter()
+            .filter(|(k, _)| pred(k))
+            .map(|(_, v)| *v)
+            .sum()
+    }
+
     /// Busiest matching xe engine's cycles/total-cycles ratio since `prev`,
     /// as a fraction 0..=1. `pred` filters by engine name.
     pub fn xe_ratio(&self, prev: &FdClient, pred: impl Fn(&str) -> bool) -> f64 {
@@ -48,6 +60,47 @@ impl FdClient {
             best = best.max(cyc.saturating_sub(pcyc) as f64 / dt as f64);
         }
         best
+    }
+}
+
+/// Utilization% and video-util% from an engine-ns counter delta against the
+/// prior scan. Both amdgpu and i915 accumulate busy time in ns; percent =
+/// busy delta / wall-clock delta. Returns (0, 0) on the first sample or a
+/// zero interval. The caller stores `(engine_ns, video_ns, now)` as the next
+/// `prev`.
+pub fn ns_delta_util(
+    prev: Option<&(u64, u64, Instant)>,
+    engine_ns: u64,
+    video_ns: u64,
+    now: Instant,
+) -> (f64, f64) {
+    let Some((prev_ns, prev_video, prev_at)) = prev else {
+        return (0.0, 0.0);
+    };
+    let wall = now.duration_since(*prev_at).as_nanos() as f64;
+    if wall <= 0.0 {
+        return (0.0, 0.0);
+    }
+    (
+        (engine_ns.saturating_sub(*prev_ns) as f64 / wall * 100.0).clamp(0.0, 100.0),
+        (video_ns.saturating_sub(*prev_video) as f64 / wall * 100.0).clamp(0.0, 100.0),
+    )
+}
+
+/// Assemble one process-table row from aggregated sweep stats. Shared by the
+/// amdgpu and Intel sweeps, which build identical rows.
+pub fn build_proc(pid: u32, gpu_index: usize, util: f64, mem: u64, graphics: bool) -> GpuProcess {
+    GpuProcess {
+        pid,
+        gpu_index,
+        kind: if graphics {
+            ProcKind::Graphics
+        } else {
+            ProcKind::Compute
+        },
+        gpu_util_pct: Some(clamp_pct(util)),
+        gpu_mem_bytes: mem,
+        ..Default::default()
     }
 }
 
@@ -147,6 +200,13 @@ fn parse_kib(v: &str) -> u64 {
 
 pub fn read_u64(path: &Path) -> Option<u64> {
     read_trim(path)?.parse().ok()
+}
+
+/// Read a numeric hwmon attribute (`temp1_input`, `power1_average`, ...) from
+/// an optional hwmon directory. None when there's no hwmon or the file is
+/// missing/unparseable.
+pub fn hwmon_u64(hwmon: Option<&Path>, file: &str) -> Option<u64> {
+    read_u64(&hwmon?.join(file))
 }
 
 pub fn read_trim(path: &Path) -> Option<String> {

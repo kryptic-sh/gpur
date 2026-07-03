@@ -16,7 +16,7 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
 
 #[cfg(windows)]
 mod win {
-    use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind};
+    use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind, clamp_pct};
     use anyhow::Result;
     use std::collections::HashMap;
     use windows::Win32::Graphics::Dxgi::{
@@ -234,13 +234,11 @@ mod win {
                     GpuSnapshot {
                         name: a.name.clone(),
                         integrated: a.integrated,
-                        utilization_pct: util_by_luid
-                            .get(&a.luid_key)
-                            .copied()
-                            .unwrap_or(0.0)
-                            .clamp(0.0, 100.0),
-                        enc_util_pct: enc_by_luid.get(&a.luid_key).map(|v| v.clamp(0.0, 100.0)),
-                        dec_util_pct: dec_by_luid.get(&a.luid_key).map(|v| v.clamp(0.0, 100.0)),
+                        utilization_pct: clamp_pct(
+                            util_by_luid.get(&a.luid_key).copied().unwrap_or(0.0),
+                        ),
+                        enc_util_pct: enc_by_luid.get(&a.luid_key).copied().map(clamp_pct),
+                        dec_util_pct: dec_by_luid.get(&a.luid_key).copied().map(clamp_pct),
                         vram_used_bytes: used,
                         vram_total_bytes: a.vram_total,
                         ..Default::default()

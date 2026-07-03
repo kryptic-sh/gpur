@@ -51,11 +51,19 @@ impl GpuBackend for NvmlBackend {
             gpus.push(GpuSnapshot {
                 name: dev.name().unwrap_or_else(|_| format!("NVIDIA GPU {i}")),
                 integrated: false,
-                utilization_pct: util.as_ref().map(|u| u.gpu as f64).unwrap_or(0.0),
-                mem_util_pct: util.as_ref().map(|u| u.memory as f64),
+                utilization_pct: super::clamp_pct(
+                    util.as_ref().map(|u| u.gpu as f64).unwrap_or(0.0),
+                ),
+                mem_util_pct: util.as_ref().map(|u| super::clamp_pct(u.memory as f64)),
                 video_util_pct: None,
-                enc_util_pct: dev.encoder_utilization().ok().map(|u| u.utilization as f64),
-                dec_util_pct: dev.decoder_utilization().ok().map(|u| u.utilization as f64),
+                enc_util_pct: dev
+                    .encoder_utilization()
+                    .ok()
+                    .map(|u| super::clamp_pct(u.utilization as f64)),
+                dec_util_pct: dev
+                    .decoder_utilization()
+                    .ok()
+                    .map(|u| super::clamp_pct(u.utilization as f64)),
                 throttle: dev.current_throttle_reasons().ok().and_then(throttle_label),
                 vram_used_bytes: memory.as_ref().map(|m| m.used).unwrap_or(0),
                 vram_total_bytes: memory.as_ref().map(|m| m.total).unwrap_or(0),
@@ -139,11 +147,7 @@ fn throttle_label(r: ThrottleReasons) -> Option<String> {
     if r.contains(ThrottleReasons::HW_SLOWDOWN) {
         parts.push("hw-slowdown");
     }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("+"))
-    }
+    super::join_throttle(&parts)
 }
 
 fn used_bytes(p: &ProcessInfo) -> u64 {

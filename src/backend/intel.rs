@@ -19,9 +19,9 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use crate::backend::linux::{
-        self, FdClient, card_name, cards_with_vendor, first_dir, pdev_of, read_u64,
+        self, FdClient, card_name, cards_with_vendor, first_dir, hwmon_u64, pdev_of, read_u64,
     };
-    use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind};
+    use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, clamp_pct};
     use anyhow::Result;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
@@ -92,9 +92,9 @@ mod linux_impl {
                     GpuSnapshot {
                         name: d.name.clone(),
                         integrated: d.integrated,
-                        utilization_pct: device_util.remove(&i).unwrap_or(0.0).clamp(0.0, 100.0),
+                        utilization_pct: clamp_pct(device_util.remove(&i).unwrap_or(0.0)),
                         mem_util_pct: None,
-                        video_util_pct: device_video.remove(&i).map(|v| v.clamp(0.0, 100.0)),
+                        video_util_pct: device_video.remove(&i).map(clamp_pct),
                         enc_util_pct: None,
                         dec_util_pct: None,
                         throttle: None,
@@ -102,12 +102,9 @@ mod linux_impl {
                         // client-resident local memory as "used".
                         vram_used_bytes: device_mem.remove(&i).unwrap_or(0),
                         vram_total_bytes: read_u64(&d.dev.join("lmem_total_bytes")).unwrap_or(0),
-                        temperature_c: h
-                            .and_then(|h| read_u64(&h.join("temp1_input")))
-                            .map(|v| v as f64 / 1000.0),
+                        temperature_c: hwmon_u64(h, "temp1_input").map(|v| v as f64 / 1000.0),
                         power_w,
-                        power_limit_w: h
-                            .and_then(|h| read_u64(&h.join("power1_max")))
+                        power_limit_w: hwmon_u64(h, "power1_max")
                             .filter(|v| *v > 0)
                             .map(|v| v as f64 / 1e6),
                         fan_pct: None,
@@ -195,34 +192,21 @@ mod linux_impl {
                             (u, v)
                         } else {
                             let engine_ns = client.total_engine_ns();
-                            let video_ns: u64 = client
-                                .engine_ns
-                                .iter()
-                                .filter(|(k, _)| is_video(k))
-                                .map(|(_, v)| *v)
-                                .sum();
-                            let (u, v) = match self.i915_state.get(&(pid, client.id)) {
-                                Some((prev_ns, prev_video, prev_at)) => {
-                                    let wall = now.duration_since(*prev_at).as_nanos() as f64;
-                                    if wall > 0.0 {
-                                        (
-                                            engine_ns.saturating_sub(*prev_ns) as f64 / wall
-                                                * 100.0,
-                                            video_ns.saturating_sub(*prev_video) as f64 / wall
-                                                * 100.0,
-                                        )
-                                    } else {
-                                        (0.0, 0.0)
-                                    }
-                                }
-                                None => (0.0, 0.0),
-                            };
+                            let video_ns = client.engine_ns_where(is_video);
+                            let r = linux::ns_delta_util(
+                                self.i915_state.get(&(pid, client.id)),
+                                engine_ns,
+                                video_ns,
+                                now,
+                            );
                             self.i915_state
                                 .insert((pid, client.id), (engine_ns, video_ns, now));
-                            (u, v)
+                            r
                         };
-                        let util = util.clamp(0.0, 100.0);
-                        let vutil = vutil.clamp(0.0, 100.0);
+                        // xe_ratio can exceed 1.0 on odd counters; clamp both
+                        // paths (ns_delta_util already clamps the i915 branch).
+                        let util = clamp_pct(util);
+                        let vutil = clamp_pct(vutil);
 
                         // "local*"/"vram*" = device memory (dGPU); ignore
                         // system/gtt so iGPU numbers don't count plain RAM.
@@ -251,17 +235,8 @@ mod linux_impl {
 
             let procs = agg
                 .into_iter()
-                .map(|((pid, gpu_index), (util, mem, graphics))| GpuProcess {
-                    pid,
-                    gpu_index,
-                    kind: if graphics {
-                        ProcKind::Graphics
-                    } else {
-                        ProcKind::Compute
-                    },
-                    gpu_util_pct: Some(util.min(100.0)),
-                    gpu_mem_bytes: mem,
-                    ..Default::default()
+                .map(|((pid, gpu_index), (util, mem, graphics))| {
+                    linux::build_proc(pid, gpu_index, util, mem, graphics)
                 })
                 .collect();
             (device_util, device_mem, device_video, procs)
