@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-03
+
 ### Fixed
 
 - Wide-terminal graphs no longer freeze at the left edge: history retention was
@@ -196,7 +198,8 @@ and this project adheres to
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.7.0
 [0.6.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.6.0
 [0.5.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.5.0
