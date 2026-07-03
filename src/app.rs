@@ -275,6 +275,10 @@ pub struct App {
     pub show_help: bool,
     /// (rect, gpu index) of each card drawn last frame, for click hit-tests.
     pub card_rects: Vec<(ratatui::layout::Rect, usize)>,
+    /// Samples the widest graph needs (2 per braille cell) — retention must
+    /// cover this or wide terminals get a permanently empty left region and
+    /// a "stuck" pad boundary. Set by the renderer each frame.
+    pub history_need: usize,
     pub graph_style: GraphStyle,
     /// The --mock argument, kept for backend re-detection.
     mock: Option<usize>,
@@ -333,6 +337,7 @@ impl App {
             status: None,
             show_help: false,
             card_rects: Vec::new(),
+            history_need: 0,
             all_procs: Vec::new(),
             sys: System::new(),
             users: Users::new_with_refreshed_list(),
@@ -427,7 +432,10 @@ impl App {
             hist.power.push(gpu.power_w.unwrap_or(0.0).round() as u64);
             hist.temp
                 .push(gpu.temperature_c.unwrap_or(0.0).round() as u64);
-            let overflow = hist.util.len().saturating_sub(self.history_len);
+            // Config history_len is a MINIMUM; keep at least what the
+            // widest graph can display (+slack for resize wiggle).
+            let cap = self.history_len.max(self.history_need + 8);
+            let overflow = hist.util.len().saturating_sub(cap);
             if overflow > 0 {
                 hist.util.drain(..overflow);
                 hist.vram.drain(..overflow);

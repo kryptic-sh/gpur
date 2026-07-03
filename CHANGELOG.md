@@ -8,6 +8,14 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- Wide-terminal graphs no longer freeze at the left edge: history retention was
+  a fixed 300 samples while braille graphs need 2×width — on terminals wider
+  than 150 columns the left region could never fill and long activity bursts
+  pinned at the pad boundary looking stuck. Retention now adapts to the widest
+  graph seen (config `history_len` acts as a minimum).
+
 ### Added
 
 - `--completions nushell` via `clap_complete_nushell` (a `CompletionShell`

@@ -64,6 +64,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     app.gpus_rect = gpus_area;
     app.proc_rect = proc_area;
+    // Braille packs 2 samples per column; retain enough history for the
+    // full frame width so wide terminals can fill their graphs.
+    app.history_need = app.history_need.max(area.width as usize * 2);
     draw_gpus(frame, gpus_area, app);
     draw_processes(frame, proc_area, app);
 
