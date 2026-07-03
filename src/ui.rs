@@ -101,14 +101,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(k, _)| k.chars().count())
         .max()
         .unwrap_or(8) as u16;
-    let w = (key_w + 50).min(area.width);
-    let h = (rows.len() as u16 + 2).min(area.height);
-    let popup = Rect::new(
-        area.x + (area.width.saturating_sub(w)) / 2,
-        area.y + (area.height.saturating_sub(h)) / 2,
-        w,
-        h,
-    );
+    let popup = centered(area, key_w + 50, rows.len() as u16 + 2);
     frame.render_widget(ratatui::widgets::Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -137,14 +130,7 @@ fn draw_confirm_popup(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     let sig = if *force { "SIGKILL" } else { "SIGTERM" };
     let text = format!("send {sig} to {pid}?");
-    let w = (text.len().max(cmd.len()) as u16 + 6).min(area.width);
-    let h = 5u16.min(area.height);
-    let popup = Rect::new(
-        area.x + (area.width.saturating_sub(w)) / 2,
-        area.y + (area.height.saturating_sub(h)) / 2,
-        w,
-        h,
-    );
+    let popup = centered(area, text.len().max(cmd.len()) as u16 + 6, 5);
     frame.render_widget(ratatui::widgets::Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -196,12 +182,8 @@ fn draw_gpus(frame: &mut Frame, area: Rect, app: &mut App) {
         }))
         .split(area);
         app.card_rects = rows.iter().copied().zip(0..n).collect();
-        for (i, gpu) in app.gpus.iter().enumerate() {
-            if app.folded.contains(&i) {
-                draw_gpu_folded(frame, rows[i], app, gpu, i);
-            } else {
-                draw_gpu(frame, rows[i], app, gpu, i);
-            }
+        for i in 0..n {
+            draw_card(frame, rows[i], app, i);
         }
         return;
     }
@@ -247,29 +229,17 @@ fn draw_gpus(frame: &mut Frame, area: Rect, app: &mut App) {
     .split(cards);
     app.card_rects = rows.iter().copied().zip(window.iter().copied()).collect();
     for (slot, &i) in rows.iter().zip(&window) {
-        let gpu = &app.gpus[i];
-        if app.folded.contains(&i) {
-            draw_gpu_folded(frame, *slot, app, gpu, i);
-        } else {
-            draw_gpu(frame, *slot, app, gpu, i);
-        }
+        draw_card(frame, *slot, app, i);
     }
 
-    // ratatui quirk: the thumb only reaches the track end when
-    // position == content_length - 1, so content_length must be the number
-    // of SCROLL POSITIONS (max_scroll + 1), not the item count. With
-    // viewport = shown this also keeps thumb size = shown/total of track.
     let max_scroll = n.saturating_sub(shown);
-    let mut sb = ScrollbarState::new(max_scroll + 1)
-        .position(app.gpu_scroll)
-        .viewport_content_length(shown);
-    frame.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .style(app.theme.dim),
+    draw_scrollbar(
+        frame,
         area,
-        &mut sb,
+        app.gpu_scroll,
+        max_scroll + 1,
+        shown,
+        app.theme.dim,
     );
 }
 
@@ -298,7 +268,7 @@ fn draw_gpu_folded(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, 
         line.push(Span::styled(format!("{w:.0}W  "), t.spark_power));
     }
     if let Some(reason) = &gpu.throttle {
-        line.push(Span::styled(format!("⚠{reason}  "), t.temp_crit));
+        line.push(Span::styled(format!("⚠ {reason}  "), t.temp_crit));
     }
     frame.render_widget(Paragraph::new(Line::from(line)), area);
 }
@@ -310,6 +280,63 @@ fn caption<'a>(text: String, text_style: Style, border: Style) -> Line<'a> {
         Span::styled(text, text_style),
         Span::styled("┌", border),
     ])
+}
+
+/// Sample index `i` of a right-aligned window of `window` values over `data`:
+/// newest sample at the right edge, missing history reads as 0.
+fn windowed(data: &[u64], i: usize, window: usize) -> u64 {
+    if data.len() >= window {
+        data[data.len() - window + i]
+    } else {
+        let pad = window - data.len();
+        if i < pad { 0 } else { data[i - pad] }
+    }
+}
+
+/// A `w`×`h` rect centered in `area`, clamped to it.
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(w) / 2,
+        area.y + area.height.saturating_sub(h) / 2,
+        w,
+        h,
+    )
+}
+
+/// Vertical scrollbar for a windowed list. `positions` is max_scroll+1 (the
+/// ratatui thumb only reaches the track end at content_length-1); `viewport`
+/// is the item count shown.
+fn draw_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    pos: usize,
+    positions: usize,
+    viewport: usize,
+    style: Style,
+) {
+    let mut sb = ScrollbarState::new(positions)
+        .position(pos)
+        .viewport_content_length(viewport);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .style(style),
+        area,
+        &mut sb,
+    );
+}
+
+/// Draw GPU card `idx` into `area`, folded or full per app state.
+fn draw_card(frame: &mut Frame, area: Rect, app: &App, idx: usize) {
+    let gpu = &app.gpus[idx];
+    if app.folded.contains(&idx) {
+        draw_gpu_folded(frame, area, app, gpu, idx);
+    } else {
+        draw_gpu(frame, area, app, gpu, idx);
+    }
 }
 
 fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: usize) {
@@ -417,7 +444,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
 
     let mut info: Vec<Span> = vec![Span::raw(" ")];
     if let Some(reason) = &gpu.throttle {
-        info.push(Span::styled(format!("⚠{reason}  "), t.temp_crit));
+        info.push(Span::styled(format!("⚠ {reason}  "), t.temp_crit));
     }
     if let Some(c) = gpu.temperature_c {
         if let Some(h) = hist {
@@ -450,7 +477,10 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         info.push(Span::styled(format!(" {w:.0}{limit}W  "), t.spark_power));
     }
     if let (Some(rx), Some(tx)) = (gpu.pcie_rx_kbs, gpu.pcie_tx_kbs) {
-        info.push(Span::styled(format!("▼{} ▲{}  ", kbs(rx), kbs(tx)), t.dim));
+        info.push(Span::styled(
+            format!("▼ {} ▲ {}  ", kbs(rx), kbs(tx)),
+            t.dim,
+        ));
     }
     if let Some(f) = gpu.fan_pct {
         let rpm = gpu.fan_rpm.map(|r| format!(" {r}rpm")).unwrap_or_default();
@@ -545,13 +575,7 @@ fn mini_spark(data: &[u64], max: u64, style: GraphStyle) -> String {
         const ASCII_RAMP: [char; 5] = ['_', '.', '-', '+', '#'];
         return (0..CELLS)
             .map(|c| {
-                let v = if data.len() >= CELLS {
-                    data[data.len() - CELLS + c]
-                } else {
-                    let pad = CELLS - data.len();
-                    if c < pad { 0 } else { data[c - pad] }
-                }
-                .min(max);
+                let v = windowed(data, c, CELLS).min(max);
                 if style == GraphStyle::Block {
                     let lvl = ((v as usize * 8).div_ceil(max as usize)).clamp(1, 8);
                     EIGHTHS[lvl]
@@ -567,13 +591,7 @@ fn mini_spark(data: &[u64], max: u64, style: GraphStyle) -> String {
     for c in 0..CELLS {
         let mut bits = 0u8;
         for (s, bit_col) in DOT_BITS.iter().enumerate() {
-            let i = c * 2 + s;
-            let v = if data.len() >= n {
-                data[data.len() - n + i]
-            } else {
-                let pad = n - data.len();
-                if i < pad { 0 } else { data[i - pad] }
-            };
+            let v = windowed(data, c * 2 + s, n);
             let dots = ((v.min(max) as usize * 4).div_ceil(max as usize)).clamp(1, 4);
             for d in 0..dots {
                 bits |= bit_col[3 - d];
@@ -601,47 +619,32 @@ const BRAILLE_BASE: u32 = 0x2800;
 /// Braille dot bit for (sub-column, dot-row counted from cell top).
 const DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
 
-/// btop-style mirrored waveform: `up_data` (gpu%) grows upward from the
-/// vertical midline, `down_data` (vram%) grows downward, with a color
-/// gradient from the midline toward the edges. Zero values keep a minimum
-/// sliver, so an idle GPU still draws a thin center line. The glyph set is
-/// selectable: braille (2 samples/cell, 4 rows/cell), block eighths, or
-/// pure ascii.
-fn draw_waveform(
+/// Walk the mirrored-waveform grid and call `cell` once per terminal row:
+/// top half from `up_data` growing up from the midline, bottom half from
+/// `down_data` growing down. Owns the shared geometry (row `y`, gradient
+/// `color`, the gpu%/vram% edge labels); the glyph-specific per-column fill
+/// lives in the closure. `cell` receives (buf, row data, half-height rows,
+/// distance-from-midline cy, row y, color, half).
+fn waveform_halves(
     frame: &mut Frame,
     area: Rect,
     up_data: &[u64],
     down_data: &[u64],
     t: &UiTheme,
-    style: GraphStyle,
+    mut cell: impl FnMut(
+        &mut ratatui::buffer::Buffer,
+        &[u64],
+        usize,
+        usize,
+        u16,
+        ratatui::style::Color,
+        usize,
+    ),
 ) {
-    if area.height < 2 || area.width == 0 {
-        return;
-    }
-    if style != GraphStyle::Braille {
-        return draw_waveform_cells(frame, area, up_data, down_data, t, style);
-    }
     let top_rows = (area.height / 2) as usize;
     let bot_rows = area.height as usize - top_rows;
-    let cols = area.width as usize;
-    let n = cols * 2; // braille doubles horizontal resolution
-
     let up_stops = t.util_stops();
     let down_stops = t.vram_stops();
-
-    // Newest sample at the right edge; missing history reads as 0.
-    let sample = |data: &[u64], i: usize| -> u64 {
-        if data.len() >= n {
-            data[data.len() - n + i]
-        } else {
-            let pad = n - data.len();
-            if i < pad { 0 } else { data[i - pad] }
-        }
-    };
-    // Value -> dot rows in this half; min 1 keeps the midline alive at 0.
-    let dots_for =
-        |v: u64, rows: usize| -> usize { ((v.min(100) as usize * rows * 4) / 100).max(1) };
-
     let buf = frame.buffer_mut();
     for half in 0..2 {
         let (rows, data, stops) = if half == 0 {
@@ -662,10 +665,50 @@ fn draw_waveform(
                 0.0
             };
             let color = crate::theme::gradient(stops, frac, t.mode);
+            cell(buf, data, rows, cy, y, color, half);
+        }
+    }
+    buf.set_string(area.x, area.y, "gpu%", t.dim);
+    buf.set_string(area.x, area.y + area.height - 1, "vram%", t.dim);
+}
+
+/// btop-style mirrored waveform: `up_data` (gpu%) grows upward from the
+/// vertical midline, `down_data` (vram%) grows downward, with a color
+/// gradient from the midline toward the edges. Zero values keep a minimum
+/// sliver, so an idle GPU still draws a thin center line. The glyph set is
+/// selectable: braille (2 samples/cell, 4 rows/cell), block eighths, or
+/// pure ascii.
+fn draw_waveform(
+    frame: &mut Frame,
+    area: Rect,
+    up_data: &[u64],
+    down_data: &[u64],
+    t: &UiTheme,
+    style: GraphStyle,
+) {
+    if area.height < 2 || area.width == 0 {
+        return;
+    }
+    if style != GraphStyle::Braille {
+        return draw_waveform_cells(frame, area, up_data, down_data, t, style);
+    }
+    let cols = area.width as usize;
+    let n = cols * 2; // braille doubles horizontal resolution
+    // Value -> dot rows in this half; min 1 keeps the midline alive at 0.
+    let dots_for =
+        |v: u64, rows: usize| -> usize { ((v.min(100) as usize * rows * 4) / 100).max(1) };
+
+    waveform_halves(
+        frame,
+        area,
+        up_data,
+        down_data,
+        t,
+        |buf, data, rows, cy, y, color, half| {
             for cx in 0..cols {
                 let mut bits = 0u8;
                 for (s, bit_col) in DOT_BITS.iter().enumerate() {
-                    let dots = dots_for(sample(data, cx * 2 + s), rows);
+                    let dots = dots_for(windowed(data, cx * 2 + s, n), rows);
                     let in_cell = dots.saturating_sub(cy * 4).min(4);
                     for d in 0..in_cell {
                         // Up half fills cells bottom-up, down half top-down.
@@ -680,11 +723,8 @@ fn draw_waveform(
                     cell.set_fg(color);
                 }
             }
-        }
-    }
-
-    buf.set_string(area.x, area.y, "gpu%", t.dim);
-    buf.set_string(area.x, area.y + area.height - 1, "vram%", t.dim);
+        },
+    );
 }
 
 /// Block/ascii waveform: one sample per column. Block mode uses eighth
@@ -698,46 +738,21 @@ fn draw_waveform_cells(
     t: &UiTheme,
     style: GraphStyle,
 ) {
-    let top_rows = (area.height / 2) as usize;
-    let bot_rows = area.height as usize - top_rows;
     let cols = area.width as usize;
-    let up_stops = t.util_stops();
-    let down_stops = t.vram_stops();
     // Sub-units per cell: 8 block eighths or 4 ascii coverage steps.
     let unit = if style == GraphStyle::Block { 8 } else { 4 };
     const ASCII_RAMP: [char; 5] = [' ', '.', '-', '+', '#'];
-
-    let sample = |data: &[u64], i: usize| -> u64 {
-        if data.len() >= cols {
-            data[data.len() - cols + i]
-        } else {
-            let pad = cols - data.len();
-            if i < pad { 0 } else { data[i - pad] }
-        }
-    };
-
     let bg = crate::theme::rgb_of(Some(t.bg), (0x1e, 0x1e, 0x2e));
-    let buf = frame.buffer_mut();
-    for half in 0..2 {
-        let (rows, data, stops) = if half == 0 {
-            (top_rows, up_data, &up_stops[..])
-        } else {
-            (bot_rows, down_data, &down_stops[..])
-        };
-        for cy in 0..rows {
-            let y = if half == 0 {
-                area.y + (top_rows - 1 - cy) as u16
-            } else {
-                area.y + (top_rows + cy) as u16
-            };
-            let frac = if rows > 1 {
-                cy as f64 / (rows - 1) as f64
-            } else {
-                0.0
-            };
-            let color = crate::theme::gradient(stops, frac, t.mode);
+
+    waveform_halves(
+        frame,
+        area,
+        up_data,
+        down_data,
+        t,
+        |buf, data, rows, cy, y, color, half| {
             for cx in 0..cols {
-                let v = sample(data, cx).min(100) as usize;
+                let v = windowed(data, cx, cols).min(100) as usize;
                 let units = ((v * rows * unit) / 100).max(1);
                 let in_cell = units.saturating_sub(cy * unit).min(unit);
                 if in_cell == 0 {
@@ -766,10 +781,8 @@ fn draw_waveform_cells(
                     cell.set_style(cell_style);
                 }
             }
-        }
-    }
-    buf.set_string(area.x, area.y, "gpu%", t.dim);
-    buf.set_string(area.x, area.y + area.height - 1, "vram%", t.dim);
+        },
+    );
 }
 
 fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -824,7 +837,6 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let arrow = if app.sort_desc { "↓" } else { "↑" };
     let mark = |label: &str, is: bool| -> String {
         if is {
             format!("{label}{arrow}")
@@ -910,17 +922,13 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
             area.width,
             area.height.saturating_sub(3),
         );
-        // Same scroll-positions semantics as the GPU list scrollbar.
-        let mut sb = ScrollbarState::new(max_scroll + 1)
-            .position(app.proc_scroll)
-            .viewport_content_length(visible);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None)
-                .style(app.theme.dim),
+        draw_scrollbar(
+            frame,
             track,
-            &mut sb,
+            app.proc_scroll,
+            max_scroll + 1,
+            visible,
+            app.theme.dim,
         );
     }
 }
