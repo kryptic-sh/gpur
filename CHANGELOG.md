@@ -8,6 +8,24 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-03
+
+### Fixed
+
+- Status icons now sit apart from their text: the throttle warning (`⚠`) and the
+  PCIe throughput arrows (`▼`/`▲`) gained a space before the value, so they read
+  as `⚠ power-limit` and `▼ 1.2GiB/s` instead of hugging the glyph.
+
+### Changed
+
+- Internal DRY/YAGNI refactor, no behavior change: hoisted the shared
+  amdgpu/i915 fdinfo delta math and process-row assembly into the Linux DRM
+  layer (`ns_delta_util`, `build_proc`, `engine_ns_where`, a shared `hwmon_u64`)
+  and added `clamp_pct` / `join_throttle` to the backend module (used by the
+  nvidia, amd, intel and windows backends); deduplicated the UI scrollbars,
+  popup centering, waveform mirror geometry and history sampling into
+  `draw_scrollbar`, `centered`, `waveform_halves`, `windowed` and `draw_card`.
+
 ## [0.8.0] - 2026-07-03
 
 ### Fixed
