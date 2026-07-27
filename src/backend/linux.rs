@@ -168,13 +168,15 @@ pub fn parse_fdinfo(info: &str) -> Option<FdClient> {
         } else if let Some(name) = key.strip_prefix("drm-cycles-") {
             c.cycles.entry(name.to_string()).or_default().0 = parse_ns(value);
         } else if let Some(region) = key.strip_prefix("drm-memory-") {
-            c.memory.insert(region.to_string(), parse_kib(value));
+            c.memory.insert(region.to_string(), parse_size(value));
         } else if let Some(region) = key.strip_prefix("drm-resident-") {
-            resident.insert(region.to_string(), parse_kib(value));
+            resident.insert(region.to_string(), parse_size(value));
         }
     }
     // Newer kernels emit drm-resident-*; older only drm-memory-*. Prefer the
-    // explicit memory lines, fall back to resident.
+    // explicit memory lines, fall back to resident. drm-total-* is deliberately
+    // ignored: it counts allocated-but-possibly-evicted pages, not what the
+    // region actually holds.
     for (region, bytes) in resident {
         c.memory.entry(region).or_insert(bytes);
     }
@@ -189,13 +191,19 @@ fn parse_ns(v: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// "12 KiB" -> 12288
-fn parse_kib(v: &str) -> u64 {
-    v.split_whitespace()
-        .next()
-        .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(0)
-        * 1024
+/// Bytes from a DRM size value. `drm_fdinfo_print_size` scales the number down
+/// while it stays 1 KiB-aligned, so the same key yields bare bytes, "KiB" or
+/// "MiB" depending on the allocation — the suffix must be honoured, not assumed.
+/// Saturating so a bogus suffix on a huge number can't overflow.
+fn parse_size(v: &str) -> u64 {
+    let mut it = v.split_whitespace();
+    let n: u64 = it.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    match it.next() {
+        Some("KiB") => n.saturating_mul(1 << 10),
+        Some("MiB") => n.saturating_mul(1 << 20),
+        Some("GiB") => n.saturating_mul(1 << 30),
+        _ => n,
+    }
 }
 
 pub fn read_u64(path: &Path) -> Option<u64> {
@@ -311,8 +319,10 @@ drm-pdev:\t0000:00:02.0
 drm-engine-render:\t9876543 ns
 drm-engine-video:\t100 ns
 drm-engine-capacity-video:\t2
-drm-total-local0:\t256 MiB
-drm-resident-local0:\t131072 KiB
+drm-total-local0:\t512 MiB
+drm-resident-local0:\t256 MiB
+drm-resident-stolen-local0:\t131072 KiB
+drm-resident-system0:\t1234567
 ";
 
     const XE_FDINFO: &str = "\
@@ -334,7 +344,9 @@ drm-resident-vram0:\t4096 KiB
         assert_eq!(c.pdev.as_deref(), Some("0000:75:00.0"));
         assert_eq!(c.engine_ns["gfx"], 123_456_789);
         assert_eq!(c.total_engine_ns(), 123_456_789 + 1000);
-        assert_eq!(c.memory["vram"], 12 * 1024);
+        // amdgpu's legacy printer always tags KiB, on both lines.
+        assert_eq!(c.memory["vram"], 12 << 10);
+        assert_eq!(c.memory["gtt"], 2048 << 10);
     }
 
     #[test]
@@ -343,8 +355,27 @@ drm-resident-vram0:\t4096 KiB
         assert_eq!(c.driver, "i915");
         assert_eq!(c.engine_ns["render"], 9_876_543);
         assert!(!c.engine_ns.contains_key("capacity-video"));
-        // resident fallback populates the region
-        assert_eq!(c.memory["local0"], 131_072 * 1024);
+        // resident fallback populates the region, honouring each unit the DRM
+        // printer may pick: MiB, KiB, and bare bytes when not 1 KiB-aligned.
+        assert_eq!(c.memory["local0"], 256 << 20);
+        assert_eq!(c.memory["stolen-local0"], 131_072 << 10);
+        assert_eq!(c.memory["system0"], 1_234_567);
+        // drm-total-* is allocated, not resident: never counted.
+        assert!(!c.memory.contains_key("total-local0"));
+    }
+
+    #[test]
+    fn parse_size_honours_unit_suffix() {
+        assert_eq!(parse_size("1234567"), 1_234_567); // bare bytes
+        assert_eq!(parse_size("12 KiB"), 12 << 10);
+        assert_eq!(parse_size("512 MiB"), 512 << 20);
+        assert_eq!(parse_size("2 GiB"), 2 << 30);
+        assert_eq!(parse_size("0"), 0);
+        assert_eq!(parse_size("0 KiB"), 0);
+        assert_eq!(parse_size(""), 0);
+        // unknown suffix falls back to bytes; absurd input saturates
+        assert_eq!(parse_size("42 TiB"), 42);
+        assert_eq!(parse_size(&format!("{} GiB", u64::MAX)), u64::MAX);
     }
 
     #[test]
