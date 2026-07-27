@@ -10,7 +10,9 @@ pub struct GpurConfig {
     pub tick_ms: u64,
     /// Path to a theme TOML. None means the built-in theme.
     pub theme: Option<PathBuf>,
-    /// History window kept per GPU (sparkline samples).
+    /// Minimum history samples kept per GPU. Not a fixed window: retention
+    /// grows with the widest graph drawn (braille packs two samples per
+    /// column), so a wide terminal keeps more than this — see `App::poll`.
     pub history_len: usize,
     /// Graph glyph set: "braille" (default), "block", or "ascii".
     pub graphs: String,

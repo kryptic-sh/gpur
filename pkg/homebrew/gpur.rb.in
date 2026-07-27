@@ -3,7 +3,7 @@
 # next tag — change `pkg/homebrew/gpur.rb.in` in the upstream repo and
 # let `.github/workflows/ci.yml` rebuild on the next release.
 class Gpur < Formula
-  desc "btop-style GPU monitor TUI — NVIDIA, AMD, Apple Silicon"
+  desc "btop-style GPU monitor TUI — NVIDIA, AMD, Intel, Apple Silicon"
   homepage "https://github.com/kryptic-sh/gpur"
   version "{VERSION}"
   license "MIT"

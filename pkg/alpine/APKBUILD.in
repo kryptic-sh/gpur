@@ -7,7 +7,7 @@
 pkgname=gpur
 pkgver={VERSION}
 pkgrel=0
-pkgdesc="btop-style GPU monitor TUI — NVIDIA, AMD, Apple Silicon"
+pkgdesc="btop-style GPU monitor TUI — NVIDIA, AMD, Intel, Apple Silicon"
 url="https://github.com/kryptic-sh/gpur"
 arch="x86_64"
 license="MIT"

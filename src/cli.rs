@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(
     name = "gpur",
     version,
-    about = "btop-style GPU monitor — NVIDIA, AMD, Apple Silicon",
+    about = "btop-style GPU monitor — NVIDIA, AMD, Intel, Apple Silicon",
     before_help = include_str!("art.txt")
 )]
 pub struct Cli {

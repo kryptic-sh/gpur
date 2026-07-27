@@ -2,7 +2,7 @@
 name = "gpur"
 version = "0.8.1"
 edition = "2024"
-description = "btop-style GPU monitor TUI — NVIDIA, AMD, Apple Silicon; Linux, macOS, Windows"
+description = "btop-style GPU monitor TUI — NVIDIA, AMD, Intel, Apple Silicon; Linux, macOS, Windows"
 license = "MIT"
 repository = "https://github.com/kryptic-sh/gpur"
 keywords = ["gpu", "monitor", "tui", "nvtop", "btop"]
@@ -11,7 +11,7 @@ categories = ["command-line-utilities"]
 [package.metadata.deb]
 maintainer = "mxaddict <mxaddict@kryptic.sh>"
 copyright = "2026, mxaddict <mxaddict@kryptic.sh>"
-extended-description = "btop-style GPU monitor for the terminal. NVIDIA, AMD, and Apple GPUs on Linux, macOS, and Windows."
+extended-description = "btop-style GPU monitor for the terminal. NVIDIA, AMD, Intel, and Apple GPUs on Linux, macOS, and Windows."
 section = "utils"
 priority = "optional"
 assets = [

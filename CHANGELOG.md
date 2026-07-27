@@ -8,6 +8,128 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **The process-kill path is now guarded.** `x`/`X` refuse to open the dialog
+  unless the process pane has focus, and a new `GpuBackend::can_signal()` (false
+  for `--mock` and `--replay`) blocks signalling pids that name fabricated or
+  foreign processes — a shared recording was otherwise a one-keystroke kill
+  primitive against whoever opened it. `confirm_kill` also refuses pid 1, gpur's
+  own pid, and processes with no readable executable (kernel threads), and pins
+  the target's `start_time` when the dialog opens so a recycled pid is rejected
+  instead of signalled; the old "pid no longer exists" guard could never fire,
+  because `sysinfo` never evicts a pid outside the refresh set. Mock pids now
+  start at `1_000_000` with fabricated host columns instead of emitting the
+  literal integers `1..3n`, which the demo UI had been enriching from the real
+  host table (init and kernel threads shown as killable rows).
+- Windows PDH resolved no adapters at all: `luid_prefix` sliced a fixed 22
+  characters out of the counter instance name while the LUID token is 26, so no
+  lookup against `luid_key` could ever match and utilization, dedicated/shared
+  memory, encode/decode rates and the entire process table read zero on every
+  Windows machine with an AMD or Intel GPU. Matching is now structural over the
+  `_`-separated tokens, and the pure parsers moved out of the `cfg(windows)`
+  module so they compile and are unit-tested on any host.
+- i915/xe memory figures were off by up to 1024×: `parse_kib` multiplied every
+  fdinfo value by 1024 regardless of the unit the kernel printed, so a client
+  holding 512 MiB reported 0 MiB and an unaligned 1234567 bytes reported 1.15
+  GiB. The suffix is now parsed, saturating so a bogus unit cannot overflow.
+- Intel GPUs no longer show a permanent `0M/0M`. VRAM total is chained by driver
+  (xe `device/tileN/physical_vram_size_bytes` summed over tiles, i915
+  `lmem_total_bytes` on the card kobject rather than the PCI directory) and left
+  absent instead of zero when no source answers; discrete-vs-integrated is
+  derived from local-memory evidence and made sticky, so an Arc dGPU is no
+  longer filed as an iGPU with its whole PCIe caption suppressed; and the fdinfo
+  memory filter now classifies the region names i915/xe actually emit on
+  integrated parts, routing system memory into the GTT fields the UI already
+  renders.
+- NVIDIA per-process GPU% worked only on device 0: the
+  `process_utilization_stats` watermark was one backend-wide field advanced
+  inside the per-device loop, so device 0 raised it to "now" and every later
+  device saw nothing. It is now per device, and the many samples NVML returns
+  per pid per call are folded to the newest instead of "whichever arrived last".
+- A NVIDIA device that errors mid-poll is replaced by a placeholder instead of
+  skipped, so a transient driver reset no longer shifts every later snapshot
+  down a slot — which destroyed the last card's waveform history and session
+  peaks while rendering its values over another card's graph.
+- The splash screen busy-looped: the event timeout was computed against
+  `last_poll`, which only advances on a poll, so during the splash it went to
+  zero for the rest of every tick (~15,840 frames in 1.4 s, a pegged core, a
+  flood of repaints on every launch). Frames now pace off `last_draw`, polls off
+  `last_poll`, timeout is the minimum of the two.
+- Running with stdout redirected produced a raw ratatui panic and exit 101; it
+  now bails with
+  `stdout is not a terminal — use --once or --json for non-interactive output`,
+  like every other startup failure.
+- `Ctrl-C` in the filter input inserted a literal `c` and, with no SIGINT under
+  raw mode, left `Esc` as the only way out. `Ctrl-C` (quit), `Ctrl-U` (clear)
+  and `Ctrl-W` (delete word) are handled; other chords are ignored.
+- `+` (poll faster) raised the interval below 100 ms — the keybinding floored at
+  100 while the CLI floored at 50, and no key sequence returned to 50. Both now
+  share `MIN_TICK_MS = 50`.
+- AMD clock readings never fell back: the comment noted `freq1_input` reads 0
+  when the domain is power-gated, but `.map()` on `Some(0)` is `Some(0)`, so
+  `or_else` only ran when the file was absent. The zero is filtered first.
+- AMD per-process memory counted only the `vram` region, so on an APU — where
+  almost everything lands in GTT — the process rows contradicted the card's own
+  `gtt` line. Measured against a live VA-API encode on a Phoenix2 APU: the same
+  pid goes from 58 MiB to 79 MiB once GTT is counted.
+- Clicking the process pane's bottom border selected a row that was never
+  visible; hit-testing is now bounded by the rows the last draw actually showed.
+  Mouse events also no longer move the selection underneath an open modal.
+- `--mock` silently rewrote out-of-range counts (0 → 1, 100 → 16); the count is
+  now range-checked by clap and rejected with an error.
+- The test suite read and overwrote the developer's real
+  `~/.cache/gpur/state.json`, so `sort_cycle` and the smoke sort assertion
+  failed on any machine whose cached sort differed from the default. Each test
+  now runs against a sandboxed XDG tree under the system temp dir.
+
+### Changed
+
+- **`--json` and `--log` now emit the same record shape**:
+  `{ts_ms, backend, driver, gpus, processes}`. `--json` gained `ts_ms` and
+  `driver`; `--log` records gained `backend` and `driver` (the two facts a
+  maintainer needs first in a bug report, previously recorded by neither).
+- **`processes[].container` round-trips**: `GpuProcess` gained a `container`
+  field, so a recording's container attribution is read back instead of being
+  dropped by serde and re-resolved from the recorded, foreign pid against the
+  replaying host's `/proc`.
+- **Headless output is deterministic**: `--once` and `--json` skip `state.json`
+  entirely, and the `processes` array is the unfiltered table in a fixed order
+  (GPU memory descending, then pid, then GPU index) instead of following
+  whatever sort a human last chose in the TUI. `--once --log` writes one record
+  rather than two.
+- **`state.json` gained `tick_ms_explicit`**: the poll rate is persisted as
+  sticky only when it was chosen interactively with `+`/`-`. A rate that came
+  from `config.toml` or `--tick-ms` no longer shadows a later config edit
+  forever after the first clean quit; a state file written before the flag
+  existed is honoured once, then rewritten with real provenance.
+- Windows no longer hides idle GPU processes — no other backend does — and its
+  integrated-GPU heuristic no longer files small discrete cards as iGPUs and
+  hands them the shared memory pool as their VRAM total. The PDH counter array
+  is allocated as `Vec<PDH_FMT_COUNTERVALUE_ITEM_W>` so the buffer carries the
+  item's alignment instead of relying on the allocator.
+- AMD device utilization is routed through `clamp_pct` like every other backend.
+
+### Added
+
+- AMD PCIe throughput: `pcie_bw` is read as a counter delta against the max
+  packet size where the ASIC implements `get_pcie_usage`, degrading to none on
+  APUs and RDNA3 where the kernel marks it unsupported. The code comment
+  asserting amdgpu exposes no throughput counters was wrong.
+- AMD encoder/decoder split alongside the unified `video` figure — the predicate
+  already existed and the split was being discarded. Both stay absent unless a
+  client actually used that engine class, so no card grows a permanent `enc 0%`.
+- NVIDIA memory temperature (via `field_values_for`), the real fan count instead
+  of assuming fan 0, and the performance state. Each degrades to none on
+  unsupported hardware, including NVML's zero "no reading" answer.
+- Intel now reads the four generic PCI link attributes, so the PCIe downgrade
+  warning finally fires for Arc; `gts_to_gen`, `pcie_link` and the fdinfo sweep
+  moved into `backend/linux.rs` for amdgpu to share.
+- Test coverage for sort actually reordering rows, pause, the tick keys, GPU
+  card overflow scrolling, and the `GPUR_MOCK_FAIL` degradation and re-detect
+  paths; four assertions that passed vacuously (dashboard, filter, row content,
+  completions) are now pinned to behavior.
+
 ## [0.8.1] - 2026-07-03
 
 ### Fixed
@@ -61,6 +183,17 @@ and this project adheres to
   the Linux sysfs backends; mock included).
 
 ## [0.6.0] - 2026-07-03
+
+### Added
+
+- `?` help overlay, driven by the same binding table as the keymap, and UI state
+  persistence across runs (folded cards, sort column/direction, poll rate) in
+  `state.json` under the cache dir.
+- Hidden `--completions <SHELL>` and `--man` generators for packaging, plus
+  Windows console teardown on exit.
+- Backend re-detect after repeated poll failures, and color degradation for
+  `NO_COLOR` and 256/16-color terminals.
+- PTY resize-storm test coverage.
 
 ## [0.5.0] - 2026-07-02
 
@@ -216,7 +349,8 @@ and this project adheres to
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/kryptic-sh/gpur/releases/tag/v0.8.1
 [0.8.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.7.0
 [0.6.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.6.0

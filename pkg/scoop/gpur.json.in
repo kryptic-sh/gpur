@@ -1,6 +1,6 @@
 {
   "version": "{VERSION}",
-  "description": "btop-style GPU monitor TUI — NVIDIA, AMD, Apple Silicon",
+  "description": "btop-style GPU monitor TUI — NVIDIA, AMD, Intel, Apple Silicon",
   "homepage": "https://github.com/kryptic-sh/gpur",
   "license": "MIT",
   "architecture": {
