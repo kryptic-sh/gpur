@@ -14,7 +14,8 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use crate::backend::linux::{
-        self, card_name, cards_with_vendor, first_dir, hwmon_u64, pdev_of, read_trim, read_u64,
+        self, FdClient, card_name, cards_with_vendor, first_dir, hwmon_u64, pdev_of, read_trim,
+        read_u64,
     };
     use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, clamp_pct};
     use anyhow::Result;
@@ -31,6 +32,7 @@ mod linux_impl {
             return None;
         }
         Some(Box::new(AmdBackend {
+            pcie_state: vec![None; devices.len()],
             devices,
             engine_state: HashMap::new(),
             last_procs: Vec::new(),
@@ -43,6 +45,9 @@ mod linux_impl {
         hwmon: Option<PathBuf>,
         /// PCI address ("0000:75:00.0"), matched against fdinfo drm-pdev.
         pdev: Option<String>,
+        /// APU rather than discrete card. Fixed per device, so resolved once:
+        /// the per-process memory rule depends on it every sweep.
+        integrated: bool,
         /// Critical edge temperature (°C), for the throttle heuristic.
         temp_crit_c: Option<f64>,
         /// hwmon channel numbers for the junction / memory temp sensors.
@@ -52,19 +57,51 @@ mod linux_impl {
 
     struct AmdBackend {
         devices: Vec<AmdDevice>,
-        /// (pid, drm-client-id) -> (total engine ns, video engine ns) at last scan.
-        engine_state: HashMap<(u32, u64), (u64, u64, Instant)>,
+        /// (pid, drm-client-id) -> that client's engine counters at last scan.
+        engine_state: HashMap<(u32, u64), EngineSample>,
+        /// Per device: (rx count, tx count, sampled at) from `pcie_bw`.
+        pcie_state: Vec<Option<(u64, u64, Instant)>>,
         /// Built during poll's fdinfo sweep, served by processes().
         last_procs: Vec<GpuProcess>,
     }
 
-    /// VCN/media engines in amdgpu fdinfo naming.
+    /// Cumulative fdinfo engine counters of one DRM client at the last sweep.
+    #[derive(Clone, Copy)]
+    struct EngineSample {
+        total_ns: u64,
+        video_ns: u64,
+        enc_ns: u64,
+        dec_ns: u64,
+        at: Instant,
+    }
+
+    /// Media-engine utilization accumulated over one device's clients. `enc` /
+    /// `dec` stay None unless some client actually reported that engine class —
+    /// amdgpu only prints the engines a client used, so absence means "this
+    /// device has no separate encoder/decoder activity", not "0%".
+    #[derive(Clone, Copy, Default)]
+    struct MediaUtil {
+        video: f64,
+        enc: Option<f64>,
+        dec: Option<f64>,
+    }
+
+    /// VCN/media engines in amdgpu fdinfo naming (`amdgpu_ip_name[]`).
     fn is_video_engine(name: &str) -> bool {
-        name.starts_with("dec")
-            || name.starts_with("enc")
-            || name.starts_with("jpeg")
+        is_dec_engine(name)
+            || is_enc_engine(name)
             || name.starts_with("vcn")
             || name.starts_with("vpe")
+    }
+
+    /// Encoder rings: VCE, UVD-ENC and VCN-ENC all report as "enc".
+    fn is_enc_engine(name: &str) -> bool {
+        name.starts_with("enc")
+    }
+
+    /// Decoder rings: UVD/VCN-DEC report as "dec", the JPEG block as "jpeg".
+    fn is_dec_engine(name: &str) -> bool {
+        name.starts_with("dec") || name.starts_with("jpeg")
     }
 
     impl GpuBackend for AmdBackend {
@@ -75,12 +112,19 @@ mod linux_impl {
         fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
             // One fdinfo sweep per poll: per-process rows + device video util
             // (sysfs has gpu_busy_percent but nothing for the VCN engines).
-            let video_util = self.sweep_clients();
+            let media = self.sweep_clients();
+            let now = Instant::now();
+            let pcie_state = &mut self.pcie_state;
             Ok(self
                 .devices
                 .iter()
                 .enumerate()
-                .map(|(i, d)| sample(d, video_util.get(&i).copied()))
+                .map(|(i, d)| {
+                    let bw = pcie_state
+                        .get_mut(i)
+                        .and_then(|prev| pcie_bw_kbs(&d.dev, prev, now));
+                    sample(d, media.get(&i).copied(), bw)
+                })
                 .collect())
         }
 
@@ -94,8 +138,8 @@ mod linux_impl {
     }
 
     impl AmdBackend {
-        /// Returns per-device video-engine utilization; refreshes last_procs.
-        fn sweep_clients(&mut self) -> HashMap<usize, f64> {
+        /// Returns per-device media-engine utilization; refreshes last_procs.
+        fn sweep_clients(&mut self) -> HashMap<usize, MediaUtil> {
             let pdev_to_gpu: HashMap<&str, usize> = self
                 .devices
                 .iter()
@@ -105,7 +149,7 @@ mod linux_impl {
 
             // (pid, gpu) -> aggregated stats across that process's DRM clients.
             let mut agg: HashMap<(u32, usize), (f64, u64, bool)> = HashMap::new();
-            let mut video_util: HashMap<usize, f64> = HashMap::new();
+            let mut media: HashMap<usize, MediaUtil> = HashMap::new();
             let mut seen_clients: HashSet<(u32, u64)> = HashSet::new();
             let now = Instant::now();
 
@@ -120,19 +164,46 @@ mod linux_impl {
                     }
                     let engine_ns = client.total_engine_ns();
                     let video_ns = client.engine_ns_where(is_video_engine);
+                    let enc_ns = client.engine_ns_where(is_enc_engine);
+                    let dec_ns = client.engine_ns_where(is_dec_engine);
+                    // ns_delta_util turns one (counter, counter) pair into two
+                    // percentages; run it twice over the same interval to also
+                    // get the enc/dec split amdgpu names separately.
+                    let prev = self.engine_state.get(&(pid, client.id)).copied();
                     let (util, vutil) = linux::ns_delta_util(
-                        self.engine_state.get(&(pid, client.id)),
+                        prev.map(|p| (p.total_ns, p.video_ns, p.at)).as_ref(),
                         engine_ns,
                         video_ns,
                         now,
                     );
-                    self.engine_state
-                        .insert((pid, client.id), (engine_ns, video_ns, now));
+                    let (enc_util, dec_util) = linux::ns_delta_util(
+                        prev.map(|p| (p.enc_ns, p.dec_ns, p.at)).as_ref(),
+                        enc_ns,
+                        dec_ns,
+                        now,
+                    );
+                    self.engine_state.insert(
+                        (pid, client.id),
+                        EngineSample {
+                            total_ns: engine_ns,
+                            video_ns,
+                            enc_ns,
+                            dec_ns,
+                            at: now,
+                        },
+                    );
 
-                    *video_util.entry(gpu).or_default() += vutil;
+                    let m = media.entry(gpu).or_default();
+                    m.video += vutil;
+                    if client.engine_ns.keys().any(|k| is_enc_engine(k)) {
+                        *m.enc.get_or_insert(0.0) += enc_util;
+                    }
+                    if client.engine_ns.keys().any(|k| is_dec_engine(k)) {
+                        *m.dec.get_or_insert(0.0) += dec_util;
+                    }
                     let e = agg.entry((pid, gpu)).or_insert((0.0, 0, false));
                     e.0 += util;
-                    e.1 += client.memory.get("vram").copied().unwrap_or(0);
+                    e.1 += client_mem_bytes(&client, self.devices[gpu].integrated);
                     e.2 |= client.engine_ns.get("gfx").copied().unwrap_or(0) > 0;
                 }
             }
@@ -146,7 +217,20 @@ mod linux_impl {
                     linux::build_proc(pid, gpu_index, util, vram, graphics)
                 })
                 .collect();
-            video_util
+            media
+        }
+    }
+
+    /// Graphics memory to attribute to one client. Discrete cards keep client
+    /// allocations in `vram`; an APU has only a small stolen VRAM carve-out and
+    /// puts the rest in `gtt`, so both must be summed there or the process rows
+    /// contradict the gtt gauge on the device card above them.
+    fn client_mem_bytes(c: &FdClient, integrated: bool) -> u64 {
+        let vram = c.memory.get("vram").copied().unwrap_or(0);
+        if integrated {
+            vram.saturating_add(c.memory.get("gtt").copied().unwrap_or(0))
+        } else {
+            vram
         }
     }
 
@@ -174,6 +258,7 @@ mod linux_impl {
                     }
                 }
                 AmdDevice {
+                    integrated: is_apu(&dev),
                     name,
                     dev,
                     hwmon,
@@ -186,7 +271,7 @@ mod linux_impl {
             .collect()
     }
 
-    fn sample(d: &AmdDevice, video_util: Option<f64>) -> GpuSnapshot {
+    fn sample(d: &AmdDevice, media: Option<MediaUtil>, pcie_bw: Option<(u64, u64)>) -> GpuSnapshot {
         let h = d.hwmon.as_deref();
         let temperature_c = hwmon_u64(h, "temp1_input").map(|v| v as f64 / 1000.0);
         let power_w = hwmon_u64(h, "power1_average")
@@ -215,12 +300,17 @@ mod linux_impl {
 
         GpuSnapshot {
             name: d.name.clone(),
-            integrated: is_apu(&d.dev),
-            utilization_pct: read_u64(&d.dev.join("gpu_busy_percent")).unwrap_or(0) as f64,
-            mem_util_pct: read_u64(&d.dev.join("mem_busy_percent")).map(|v| v as f64),
-            video_util_pct: video_util.map(clamp_pct),
-            enc_util_pct: None,
-            dec_util_pct: None,
+            integrated: d.integrated,
+            utilization_pct: clamp_pct(
+                read_u64(&d.dev.join("gpu_busy_percent")).unwrap_or(0) as f64
+            ),
+            mem_util_pct: read_u64(&d.dev.join("mem_busy_percent")).map(|v| clamp_pct(v as f64)),
+            // amdgpu names enc/dec rings separately, so report the split as
+            // well as the total (which also carries the genuinely unified
+            // engines: vcn and vpe).
+            video_util_pct: media.map(|m| clamp_pct(m.video)),
+            enc_util_pct: media.and_then(|m| m.enc).map(clamp_pct),
+            dec_util_pct: media.and_then(|m| m.dec).map(clamp_pct),
             throttle,
             vram_used_bytes: read_u64(&d.dev.join("mem_info_vram_used")).unwrap_or(0),
             vram_total_bytes: read_u64(&d.dev.join("mem_info_vram_total")).unwrap_or(0),
@@ -239,14 +329,9 @@ mod linux_impl {
             power_limit_w,
             fan_pct: fan_pct(h),
             fan_rpm: hwmon_u64(h, "fan1_input"),
-            // Hz. Reads 0 when the clock domain is power-gated at idle.
-            clock_mhz: hwmon_u64(h, "freq1_input")
-                .map(|v| v / 1_000_000)
-                .or_else(|| dpm_active_mhz(&d.dev.join("pp_dpm_sclk"))),
-            mem_clock_mhz: hwmon_u64(h, "freq2_input")
-                .map(|v| v / 1_000_000)
-                // APUs have no freq2_input; the active DPM level has it.
-                .or_else(|| dpm_active_mhz(&d.dev.join("pp_dpm_mclk"))),
+            clock_mhz: clock_mhz(h, "freq1_input", &d.dev.join("pp_dpm_sclk")),
+            // APUs have no freq2_input; the active DPM level has it.
+            mem_clock_mhz: clock_mhz(h, "freq2_input", &d.dev.join("pp_dpm_mclk")),
             pcie_gen: read_trim(&d.dev.join("current_link_speed"))
                 .as_deref()
                 .and_then(gts_to_gen),
@@ -255,9 +340,12 @@ mod linux_impl {
                 .as_deref()
                 .and_then(gts_to_gen),
             pcie_max_width: read_trim(&d.dev.join("max_link_width")).and_then(|w| w.parse().ok()),
-            // amdgpu does not expose PCIe throughput counters.
-            pcie_rx_kbs: None,
-            pcie_tx_kbs: None,
+            // `pcie_bw` only exists where the ASIC implements
+            // asic_funcs->get_pcie_usage (Vega10/20, Navi 1x/2x); the kernel
+            // marks it unsupported on APUs and it is unimplemented on RDNA3.
+            // Absent file -> None, and the first sample has no delta yet.
+            pcie_rx_kbs: pcie_bw.map(|(rx, _)| rx),
+            pcie_tx_kbs: pcie_bw.map(|(_, tx)| tx),
             gtt_used_bytes: read_u64(&d.dev.join("mem_info_gtt_used")),
             gtt_total_bytes: read_u64(&d.dev.join("mem_info_gtt_total")),
             volt_mv: hwmon_u64(h, "in0_input"),
@@ -287,6 +375,65 @@ mod linux_impl {
             s if s >= 5.0 => 2,
             _ => 1,
         })
+    }
+
+    /// hwmon `freqN_input` (Hz) as MHz, falling back to the DPM table's active
+    /// level. The file reads 0 while the clock domain is power-gated, and
+    /// `Some(0).map(..)` would shadow the fallback, so the zero is filtered
+    /// first. Note the fallback is not guaranteed to be better: on RDNA3 an
+    /// idle `pp_dpm_sclk` carries a sleep row ("S: 0Mhz *") and also yields 0 —
+    /// gated really is 0 MHz there. It wins on parts that report a stale or
+    /// missing hwmon frequency while the DPM table has a live level.
+    fn clock_mhz(hwmon: Option<&Path>, file: &str, dpm: &Path) -> Option<u64> {
+        hwmon_u64(hwmon, file)
+            .filter(|hz| *hz > 0)
+            .map(|hz| hz / 1_000_000)
+            .or_else(|| dpm_active_mhz(dpm))
+    }
+
+    /// `pcie_bw` is "<received count> <transmitted count> <max packet size>"
+    /// (`amdgpu_get_pcie_bw`); the counts are packets, not bytes.
+    fn parse_pcie_bw(s: &str) -> Option<(u64, u64, u64)> {
+        let mut it = s.split_whitespace();
+        let rx = it.next()?.parse().ok()?;
+        let tx = it.next()?.parse().ok()?;
+        let mps = it.next()?.parse().ok()?;
+        Some((rx, tx, mps))
+    }
+
+    /// KiB/s from two `pcie_bw` samples: packet-count delta × max packet size ÷
+    /// elapsed. None for a non-positive interval; a counter reset saturates to
+    /// a 0 delta rather than wrapping.
+    fn pcie_kbs(prev: (u64, u64), cur: (u64, u64), mps: u64, secs: f64) -> Option<(u64, u64)> {
+        if secs <= 0.0 {
+            return None;
+        }
+        let rate = |delta: u64| (delta as f64 * mps as f64 / secs / 1024.0) as u64;
+        Some((
+            rate(cur.0.saturating_sub(prev.0)),
+            rate(cur.1.saturating_sub(prev.1)),
+        ))
+    }
+
+    /// Sample `pcie_bw` and fold it into (rx, tx) KiB/s against `prev`, which is
+    /// updated in place. None when the file is absent (see the note in
+    /// `sample`) or on the first sample of a device.
+    fn pcie_bw_kbs(
+        dev: &Path,
+        prev: &mut Option<(u64, u64, Instant)>,
+        now: Instant,
+    ) -> Option<(u64, u64)> {
+        let (rx, tx, mps) = parse_pcie_bw(&read_trim(&dev.join("pcie_bw"))?)?;
+        let kbs = prev.and_then(|(prx, ptx, at)| {
+            pcie_kbs(
+                (prx, ptx),
+                (rx, tx),
+                mps,
+                now.duration_since(at).as_secs_f64(),
+            )
+        });
+        *prev = Some((rx, tx, now));
+        kbs
     }
 
     /// Parse the '*'-marked active level of a pp_dpm_{s,m}clk table:
@@ -327,6 +474,113 @@ mod linux_impl {
             assert_eq!(gts_to_gen("garbage"), None);
         }
 
+        /// Fake sysfs root for one test, wiped so a rerun can't see stale files.
+        fn fake_sysfs(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(name);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn power_gated_clock_falls_through_to_the_dpm_table() {
+            let dir = fake_sysfs("gpur-clock-test");
+            let dpm = dir.join("pp_dpm_sclk");
+            std::fs::write(&dpm, "0: 500Mhz\n1: 1500Mhz *\n2: 2371Mhz\n").unwrap();
+
+            // Live clock: hwmon wins, Hz -> MHz.
+            std::fs::write(dir.join("freq1_input"), "3022000000\n").unwrap();
+            assert_eq!(clock_mhz(Some(&dir), "freq1_input", &dpm), Some(3022));
+            // Power-gated: hwmon reads 0, so the DPM level must be reachable.
+            std::fs::write(dir.join("freq1_input"), "0\n").unwrap();
+            assert_eq!(clock_mhz(Some(&dir), "freq1_input", &dpm), Some(1500));
+            // Absent hwmon file (APU freq2_input): same fallback.
+            assert_eq!(clock_mhz(Some(&dir), "freq2_input", &dpm), Some(1500));
+            // RDNA3 at idle: the DPM table's active row is a 0 MHz sleep level,
+            // so 0 is the honest answer, not a missing reading.
+            std::fs::write(&dpm, "S: 0Mhz *\n").unwrap();
+            assert_eq!(clock_mhz(Some(&dir), "freq1_input", &dpm), Some(0));
+            // Neither source present.
+            assert_eq!(clock_mhz(None, "freq1_input", &dir.join("absent")), None);
+        }
+
+        #[test]
+        fn pcie_bw_line_parses() {
+            assert_eq!(parse_pcie_bw("1234 5678 512\n"), Some((1234, 5678, 512)));
+            assert_eq!(parse_pcie_bw("0 0 256"), Some((0, 0, 256)));
+            assert_eq!(parse_pcie_bw("1234 5678"), None); // truncated
+            assert_eq!(parse_pcie_bw(""), None);
+            assert_eq!(parse_pcie_bw("a b c"), None);
+        }
+
+        #[test]
+        fn pcie_bw_delta_is_packets_times_packet_size() {
+            // 1024 packets × 512 B over 1 s = 512 KiB/s.
+            assert_eq!(pcie_kbs((0, 0), (1024, 2048), 512, 1.0), Some((512, 1024)));
+            // Half the interval, double the rate.
+            assert_eq!(pcie_kbs((0, 0), (1024, 0), 512, 0.5), Some((1024, 0)));
+            // Counter reset must saturate to 0, not wrap.
+            assert_eq!(pcie_kbs((5000, 5000), (10, 10), 512, 1.0), Some((0, 0)));
+            // Degenerate interval yields nothing rather than a divide-by-zero.
+            assert_eq!(pcie_kbs((0, 0), (10, 10), 512, 0.0), None);
+        }
+
+        #[test]
+        fn pcie_bw_absent_file_stays_none() {
+            let dir = fake_sysfs("gpur-pciebw-test");
+            let t0 = Instant::now();
+            let t1 = t0 + std::time::Duration::from_secs(1);
+            let mut prev = None;
+
+            // Absent on APUs and RDNA3: no reading, and no state to carry.
+            assert_eq!(pcie_bw_kbs(&dir, &mut prev, t0), None);
+            assert!(prev.is_none());
+
+            std::fs::write(dir.join("pcie_bw"), "100 200 512\n").unwrap();
+            assert_eq!(pcie_bw_kbs(&dir, &mut prev, t0), None); // first sample
+            assert!(prev.is_some());
+            std::fs::write(dir.join("pcie_bw"), "1124 2200 512\n").unwrap();
+            assert_eq!(pcie_bw_kbs(&dir, &mut prev, t1), Some((512, 1000)));
+        }
+
+        const APU_FDINFO: &str = "\
+drm-driver:\tamdgpu
+drm-client-id:\t56692
+drm-pdev:\t0000:75:00.0
+drm-memory-vram:\t60060 KiB
+drm-memory-gtt: \t21664 KiB
+drm-engine-compute:\t1701383665 ns
+drm-engine-enc:\t9770559248 ns
+";
+
+        #[test]
+        fn apu_client_memory_includes_gtt() {
+            let c = linux::parse_fdinfo(APU_FDINFO).unwrap();
+            // Discrete: the vram carve-out is the whole story.
+            assert_eq!(client_mem_bytes(&c, false), 60060 << 10);
+            // APU: most of the allocation lives in gtt and must be counted.
+            assert_eq!(client_mem_bytes(&c, true), (60060 + 21664) << 10);
+        }
+
+        #[test]
+        fn media_engines_split_into_enc_and_dec() {
+            assert!(is_enc_engine("enc") && !is_dec_engine("enc"));
+            assert!(is_dec_engine("dec") && !is_enc_engine("dec"));
+            assert!(is_dec_engine("jpeg")); // JPEG block is a decoder
+            // Genuinely unified engines belong to neither half but still count
+            // towards the video total.
+            for unified in ["vcn", "vpe"] {
+                assert!(is_video_engine(unified));
+                assert!(!is_enc_engine(unified) && !is_dec_engine(unified));
+            }
+            for name in ["enc", "dec", "jpeg"] {
+                assert!(is_video_engine(name));
+            }
+            for other in ["gfx", "compute", "dma"] {
+                assert!(!is_video_engine(other));
+            }
+        }
+
         #[test]
         fn dpm_table_active_level_parses() {
             let dir = std::env::temp_dir().join("gpur-dpm-test");
@@ -346,7 +600,7 @@ mod linux_impl {
             assert!(!gpus.is_empty());
             for g in &gpus {
                 println!(
-                    "{}: util={}% vram={}/{}MiB temp={:?}C power={:?}W fan={:?}% core={:?}MHz mem={:?}MHz",
+                    "{}: util={}% vram={}/{}MiB temp={:?}C power={:?}W fan={:?}% core={:?}MHz mem={:?}MHz video={:?} enc={:?} dec={:?} pcie_rx={:?} pcie_tx={:?}",
                     g.name,
                     g.utilization_pct,
                     g.vram_used_bytes / 1024 / 1024,
@@ -356,6 +610,11 @@ mod linux_impl {
                     g.fan_pct,
                     g.clock_mhz,
                     g.mem_clock_mhz,
+                    g.video_util_pct,
+                    g.enc_util_pct,
+                    g.dec_util_pct,
+                    g.pcie_rx_kbs,
+                    g.pcie_tx_kbs,
                 );
                 assert!(g.vram_total_bytes > 0, "vram total should be nonzero");
             }
