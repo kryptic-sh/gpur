@@ -107,6 +107,14 @@ On a clean quit gpur writes `state.json` into its cache directory
 It holds folded cards, the process sort column and direction, and the poll rate
 — it is not a config file and is safe to delete.
 
+Folds are recorded per device (`folded_devices`), keyed by the identity the
+backend reports — NVML UUID, PCI address, IOKit registry entry id, adapter LUID
+— so adding or removing a card between runs folds the same GPU you folded, not
+whatever now sits in its slot. A `state.json` written before that key existed
+holds bare positions instead; those cannot be mapped onto the current devices,
+so they are dropped (the rest of the file is still honoured) and folds are set
+again on the first run after the upgrade.
+
 The poll rate resolves as `--tick-ms` > persisted rate > `config.toml`, and the
 persisted rate counts only when you chose it interactively with `+`/`-` (tracked
 by `tick_ms_explicit` in the file). A rate that merely came from `config.toml`

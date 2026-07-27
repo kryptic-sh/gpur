@@ -180,8 +180,7 @@ fn draw_gpus(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let height_of =
-        |app: &App, i: usize| -> u16 { if app.folded.contains(&i) { 1 } else { CARD_MIN } };
+    let height_of = |app: &App, i: usize| -> u16 { if app.is_folded(i) { 1 } else { CARD_MIN } };
     let n = app.gpus.len();
     let needed: u16 = (0..n).map(|i| height_of(app, i)).sum();
 
@@ -189,7 +188,7 @@ fn draw_gpus(frame: &mut Frame, area: Rect, app: &mut App) {
         // Everything fits: unfolded cards stretch to share the space.
         app.gpu_scroll = 0;
         let rows = Layout::vertical((0..n).map(|i| {
-            if app.folded.contains(&i) {
+            if app.is_folded(i) {
                 Constraint::Length(1)
             } else {
                 Constraint::Fill(1)
@@ -234,8 +233,8 @@ fn draw_gpus(frame: &mut Frame, area: Rect, app: &mut App) {
         ..area
     };
     let window: Vec<usize> = (app.gpu_scroll..(app.gpu_scroll + shown).min(n)).collect();
-    let rows = Layout::vertical(window.iter().map(|i| {
-        if app.folded.contains(i) {
+    let rows = Layout::vertical(window.iter().map(|&i| {
+        if app.is_folded(i) {
             Constraint::Length(1)
         } else {
             Constraint::Fill(1)
@@ -395,7 +394,7 @@ fn draw_scrollbar(
 /// Draw GPU card `idx` into `area`, folded or full per app state.
 fn draw_card(frame: &mut Frame, area: Rect, app: &App, idx: usize) {
     let gpu = &app.gpus[idx];
-    if app.folded.contains(&idx) {
+    if app.is_folded(idx) {
         draw_gpu_folded(frame, area, app, gpu, idx);
     } else {
         draw_gpu(frame, area, app, gpu, idx);
@@ -443,7 +442,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
     // Session-stats line only when the card has breathing room AND at least
     // one of its terms was ever measured — an all-empty row is noise.
     let session_line = (inner.height >= 7)
-        .then(|| app.session.get(idx))
+        .then(|| app.session_at(idx))
         .flatten()
         .and_then(|s| session_line(s, t));
     let show_session = session_line.is_some();
@@ -460,7 +459,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         frame.render_widget(Paragraph::new(line), session_row);
     }
 
-    let hist = app.history.get(idx);
+    let hist = app.history_at(idx);
     draw_meter(
         frame,
         util_row,

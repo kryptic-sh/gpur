@@ -66,7 +66,17 @@ impl GpuBackend for ReplayBackend {
                 None => self.finished = true, // hold the final frame
             }
         }
-        Ok(self.last.gpus.clone())
+        let mut gpus = self.last.gpus.clone();
+        // Recordings made before device ids existed carry none. Position
+        // within one recording IS a stable identity — the log is a fixed
+        // sequence of frames, not live hardware — so filling the gap here is
+        // honest, and a recorded id always wins over it.
+        for (i, g) in gpus.iter_mut().enumerate() {
+            if g.device_id.is_none() {
+                g.device_id = Some(format!("replay:{i}"));
+            }
+        }
+        Ok(gpus)
     }
 
     fn processes(&mut self) -> Vec<GpuProcess> {

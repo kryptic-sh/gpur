@@ -19,10 +19,16 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
     match nvml.device_count() {
         Ok(n) if n > 0 => {
             let driver = nvml.sys_driver_version().ok();
+            // Read once: a UUID is fixed for the life of the device and a
+            // per-poll query is a driver round-trip per card.
+            let uuids = (0..n)
+                .map(|i| nvml.device_by_index(i).ok().and_then(|d| d.uuid().ok()))
+                .collect();
             Some(Box::new(NvmlBackend {
                 nvml,
                 count: n,
                 driver,
+                uuids,
                 last_util_ts: vec![0; n as usize],
             }))
         }
@@ -34,6 +40,10 @@ struct NvmlBackend {
     nvml: Nvml,
     count: u32,
     driver: Option<String>,
+    /// `GPU-<uuid>` per device index, cached at probe. This is the device
+    /// identity `App` keys its per-GPU state on; `None` for a device whose
+    /// UUID the driver refused, which degrades to a positional key.
+    uuids: Vec<Option<String>>,
     /// Microsecond timestamp of the newest process-utilization sample seen,
     /// **per device index**. `nvmlDeviceGetProcessUtilization` only returns
     /// samples strictly newer than the timestamp handed to it, and the
@@ -57,14 +67,17 @@ impl GpuBackend for NvmlBackend {
     fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
         let mut gpus = Vec::with_capacity(self.count as usize);
         for i in 0..self.count {
+            let device_id = self.uuids.get(i as usize).cloned().flatten();
             // A device can drop off the bus (e.g. driver reset). Push a degraded
-            // placeholder instead of skipping: `poll`'s contract is a stable index
-            // order and `App` zips history/session positionally, so dropping the
-            // slot would shift every later card down one and permanently rebind
-            // their waveform history and session peaks to the wrong GPU.
+            // placeholder instead of skipping, so the card keeps its place on
+            // screen rather than every later card jumping up a row and back
+            // again next tick. It carries the cached UUID, so its graphs and
+            // peaks continue as the same device — the placeholder is display
+            // continuity, not the thing that keeps state attached.
             let Ok(dev) = self.nvml.device_by_index(i) else {
                 gpus.push(GpuSnapshot {
                     name: format!("NVIDIA GPU {i} (unavailable)"),
+                    device_id,
                     ..Default::default()
                 });
                 continue;
@@ -74,6 +87,7 @@ impl GpuBackend for NvmlBackend {
             let (fan_pct, fan_rpm) = fan_speeds(&dev);
             gpus.push(GpuSnapshot {
                 name: dev.name().unwrap_or_else(|_| format!("NVIDIA GPU {i}")),
+                device_id,
                 // NVML has no "is integrated" query. FPCI is Tegra's on-SoC host
                 // interface and the only bus type no discrete card reports, so it
                 // is the one signal that can flag a Jetson iGPU; anything else,

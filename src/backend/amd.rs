@@ -298,6 +298,7 @@ mod linux_impl {
 
         GpuSnapshot {
             name: d.name.clone(),
+            device_id: linux::pci_device_id(d.pdev.as_deref()),
             integrated: d.integrated,
             // Absent on older ASICs and some APU configs; report the absence
             // rather than a 0% that reads as an idle GPU.

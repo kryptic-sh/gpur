@@ -26,6 +26,11 @@ mod parse {
     /// is deliberately distinct from zero.
     #[derive(Debug, Default, Clone, PartialEq, Eq)]
     pub struct RawAccel {
+        /// IOKit registry entry id — unique per registry entry and stable for
+        /// its lifetime, so it is this backend's device identity. `None` when
+        /// IOKit refused it, which stays "unidentifiable" rather than
+        /// becoming a made-up key.
+        pub entry_id: Option<u64>,
         pub io_class: Option<String>,
         /// "Device Utilization %" / "GPU Activity(%)".
         pub util_pct: Option<i64>,
@@ -64,6 +69,7 @@ mod parse {
 
         GpuSnapshot {
             name,
+            device_id: a.entry_id.map(|id| format!("ioreg:{id}")),
             integrated: agx,
             // An accelerator that publishes no PerformanceStatistics (the
             // paravirt one on CI, some Intel-Mac drivers) must read "unknown",
@@ -207,12 +213,11 @@ mod macos {
 
     /// Properties of every IOAccelerator service, ordered by registry entry id.
     ///
-    /// `IOServiceGetMatchingServices` documents no iteration order, but `poll`
-    /// must return a stable index order: `App` keys history, session peaks,
-    /// folding and selection by position alone, so a reshuffle would swap two
-    /// GPUs' entire graphs with no visual cue. The registry entry id is a
-    /// stable 64-bit key for the entry's lifetime, so sorting on it pins the
-    /// order without giving up hotplug pickup.
+    /// `IOServiceGetMatchingServices` documents no iteration order. Per-GPU
+    /// state follows the entry id now (it rides along in every snapshot), so
+    /// the sort is no longer what keeps graphs attached to the right card —
+    /// it keeps the cards from reshuffling on screen between polls, which is
+    /// worth having on its own.
     fn enumerate_accelerators() -> Vec<RawAccel> {
         let mut out: Vec<(u64, RawAccel)> = Vec::new();
         unsafe {
@@ -230,13 +235,9 @@ mod macos {
                 if entry == 0 {
                     break;
                 }
-                let mut id: u64 = 0;
-                // An entry with no id sorts last, still deterministically.
-                let id = if IORegistryEntryGetRegistryEntryID(entry, &mut id) == 0 {
-                    id
-                } else {
-                    u64::MAX
-                };
+                let mut raw_id: u64 = 0;
+                let entry_id =
+                    (IORegistryEntryGetRegistryEntryID(entry, &mut raw_id) == 0).then_some(raw_id);
                 let mut props: CFMutableDictionaryRef = std::ptr::null_mut();
                 let kr =
                     IORegistryEntryCreateCFProperties(entry, &mut props, kCFAllocatorDefault, 0);
@@ -244,7 +245,8 @@ mod macos {
                 if kr == 0 && !props.is_null() {
                     // Create rule: the wrapper owns the dictionary.
                     let props = CFDictionary::wrap_under_create_rule(props as CFDictionaryRef);
-                    out.push((id, read_accel(&props)));
+                    // An entry with no id sorts last, still deterministically.
+                    out.push((entry_id.unwrap_or(u64::MAX), read_accel(&props, entry_id)));
                 }
             }
             IOObjectRelease(iter);
@@ -255,7 +257,7 @@ mod macos {
 
     /// Lift the properties this backend cares about out of CoreFoundation, so
     /// nothing below the FFI boundary escapes into the shaping code.
-    fn read_accel(props: &CFDictionary) -> RawAccel {
+    fn read_accel(props: &CFDictionary, entry_id: Option<u64>) -> RawAccel {
         let root = props.as_concrete_TypeRef();
         let stats = dict_get_dict(root, "PerformanceStatistics");
         let stat = |key: &str| {
@@ -264,6 +266,7 @@ mod macos {
                 .and_then(|s| dict_get_i64(s.as_concrete_TypeRef(), key))
         };
         RawAccel {
+            entry_id,
             io_class: dict_get_string(root, "IOClass"),
             util_pct: stat("Device Utilization %").or_else(|| stat("GPU Activity(%)")),
             vram_used_bytes: stat("In use system memory").or_else(|| stat("vramUsedBytes")),
@@ -448,6 +451,23 @@ mod tests {
         );
         // A negative byte count must not become 18 exabytes.
         assert_eq!(snapshot(&with(0, -1), None, None).vram_used_bytes, Some(0));
+    }
+
+    /// The registry entry id is this backend's device identity: it survives
+    /// a reshuffled enumeration, which is the whole point of carrying it.
+    #[test]
+    fn device_id_comes_from_the_registry_entry_id() {
+        let a = RawAccel {
+            entry_id: Some(4_294_967_297),
+            ..Default::default()
+        };
+        assert_eq!(
+            snapshot(&a, None, None).device_id.as_deref(),
+            Some("ioreg:4294967297")
+        );
+        // An entry IOKit refused an id for stays unidentified rather than
+        // getting a fabricated key.
+        assert_eq!(snapshot(&RawAccel::default(), None, None).device_id, None);
     }
 
     /// An accelerator with no PerformanceStatistics reports nothing, and

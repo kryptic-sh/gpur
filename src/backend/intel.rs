@@ -105,6 +105,7 @@ mod linux_impl {
                         linux::pcie_link(&d.dev);
                     GpuSnapshot {
                         name: d.name.clone(),
+                        device_id: linux::pci_device_id(d.pdev.as_deref()),
                         integrated: !d.discrete,
                         // Summed over this device's DRM clients: no clients is
                         // a measured 0%, not an unreadable counter.

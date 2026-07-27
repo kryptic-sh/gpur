@@ -10,6 +10,19 @@ and this project adheres to
 
 ### Fixed
 
+- **Devices now carry a stable identity.** `GpuSnapshot` gained an opaque
+  `device_id` — NVML UUID, PCI address on Linux, IOKit registry entry id on
+  macOS, adapter LUID on Windows, namespaced per child in the composite backend
+  — and `App` keys waveform history, session peaks, folding and the selection
+  cursor on it instead of on position. A hotplug, a driver reset or a
+  differently-ordered enumeration previously reattached one GPU's graphs and
+  peaks to another with no visual cue. State for a departed device is kept (so a
+  card that vanishes and returns picks its own graphs back up) and bounded, so
+  hotplug churn cannot grow the maps without limit. Folds persist as
+  `folded_devices` (device ids) rather than the old `folded` array of positions,
+  which folded the wrong card whenever the device set changed between runs; a
+  pre-identity `state.json` still loads, its positions dropped rather than
+  misapplied.
 - **The process-kill path is now guarded.** `x`/`X` refuse to open the dialog
   unless the process pane has focus, and a new `GpuBackend::can_signal()` (false
   for `--mock` and `--replay`) blocks signalling pids that name fabricated or

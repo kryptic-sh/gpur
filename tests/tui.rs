@@ -611,7 +611,8 @@ fn ui_state_is_saved_into_the_sandboxed_cache() {
     let v: serde_json::Value = serde_json::from_str(&text).expect("valid state JSON");
     assert_eq!(v["sort_by"], "GpuUtil");
     assert_eq!(v["tick_ms"], 100);
-    assert_eq!(v["folded"], serde_json::json!([0]));
+    // Folds persist by device id, never by position.
+    assert_eq!(v["folded_devices"], serde_json::json!(["mock:0"]));
 }
 
 /// A cached state file must be honoured on startup — the same read path
@@ -623,7 +624,7 @@ fn saved_state_is_restored_on_startup() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("state.json"),
-        r#"{"folded":[1],"sort_by":"Pid","sort_desc":false,"tick_ms":300}"#,
+        r#"{"folded_devices":["mock:1"],"sort_by":"Pid","sort_desc":false,"tick_ms":300}"#,
     )
     .unwrap();
 
@@ -632,6 +633,33 @@ fn saved_state_is_restored_on_startup() {
     t.wait_for("restored sort", |s| s.contains("pid↑"));
     t.wait_for("restored fold", |s| s.contains("▸ 1·Mock GPU 1"));
     t.wait_for("restored tick", |s| s.contains("300ms"));
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+/// A state file written before devices had ids carries `folded` as bare
+/// positions. Those cannot be mapped onto this run's devices, so they are
+/// dropped — but the file must still load, and the rest of it must survive.
+#[test]
+fn legacy_positional_folds_load_without_folding_a_card() {
+    let home = Sandbox::new();
+    let dir = home.0.join("gpur");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("state.json"),
+        r#"{"folded":[1],"sort_by":"Pid","sort_desc":false,"tick_ms":300}"#,
+    )
+    .unwrap();
+
+    let mut t = Tui::spawn_in(&["--no-splash", "--mock"], &[], home);
+    t.wait_for("restored sort", |s| s.contains("pid↑"));
+    t.wait_for("restored tick", |s| s.contains("300ms"));
+    t.wait_for("cards", |s| s.contains("1·Mock GPU 1"));
+    let s = t.screen_text();
+    assert!(
+        !s.contains("▸ 0·Mock GPU 0") && !s.contains("▸ 1·Mock GPU 1"),
+        "a stale positional fold was applied:\n{s}"
+    );
     t.send("q");
     assert!(t.wait_exit().success());
 }

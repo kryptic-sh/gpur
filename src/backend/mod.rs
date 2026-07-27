@@ -17,6 +17,14 @@ use anyhow::Result;
 #[serde(default)]
 pub struct GpuSnapshot {
     pub name: String,
+    /// Opaque, stable identity for this device — NVML UUID, PCI BDF, IOKit
+    /// registry entry id, adapter LUID. `App` keys graph history, session
+    /// peaks and folding on it, so it must name the same physical GPU across
+    /// polls, across hotplug, and across runs. `None` when the backend
+    /// genuinely cannot identify a device: `App` then falls back to the
+    /// device's position, which is honest about being positional instead of
+    /// pretending an identity it doesn't have.
+    pub device_id: Option<String>,
     /// Integrated (APU/iGPU) as opposed to a discrete card.
     pub integrated: bool,
     /// Core utilization, 0..=100. `None` means the backend cannot read it —
@@ -159,15 +167,19 @@ const NO_BACKEND: &str = "no supported GPU backend found (run with --mock to dem
 struct Child {
     backend: Box<dyn GpuBackend>,
     /// Slots this child owns in the concatenated snapshot vec — a high-water
-    /// mark, never shrunk. `App` keys history, session peaks and folded state
-    /// positionally, so a child that fails or returns short for one tick must
-    /// not slide every later child's devices onto another card's graphs.
-    /// Growth (a hotplugged device) does shift the children after it, once —
-    /// nothing positional can avoid that without device identity.
+    /// mark, never shrunk. Purely for display continuity now that
+    /// [`GpuSnapshot::device_id`] carries identity: a child failing for one
+    /// tick would otherwise pull every later card up the screen and push it
+    /// back down on the next tick. Per-device state follows the id, so a
+    /// shifted index no longer misattributes anything.
     slots: usize,
     /// Device names from the last poll that saw each slot, to label the
     /// placeholders that hold the slots open.
     names: Vec<String>,
+    /// Namespaced device id last seen in each slot. A placeholder inherits
+    /// it: the card is the same GPU, briefly unreadable, so its graphs and
+    /// session peaks must carry on rather than restart.
+    ids: Vec<Option<String>>,
 }
 
 /// Every backend that reported devices, polled as one. Mixed-vendor rigs — an
@@ -187,6 +199,7 @@ impl CompositeBackend {
                     backend,
                     slots: 0,
                     names: Vec::new(),
+                    ids: Vec::new(),
                 })
                 .collect(),
         }
@@ -204,7 +217,7 @@ impl GpuBackend for CompositeBackend {
     fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
         let mut out = Vec::new();
         let mut errors = Vec::new();
-        for c in &mut self.children {
+        for (ci, c) in self.children.iter_mut().enumerate() {
             let mut snaps = match c.backend.poll() {
                 Ok(s) => s,
                 // One vendor's driver going away must not take the others'
@@ -215,10 +228,22 @@ impl GpuBackend for CompositeBackend {
                     Vec::new()
                 }
             };
+            // Namespace every child's ids. Nothing in the trait stops two
+            // children minting the same string, and two devices sharing one
+            // key would share one set of graphs. The child index is fixed for
+            // the session (and re-detect rebuilds the same probe order), so
+            // it also survives a re-detect.
+            for s in &mut snaps {
+                if let Some(id) = s.device_id.take() {
+                    s.device_id = Some(format!("{}#{ci}:{id}", c.backend.name()));
+                }
+            }
             c.slots = c.slots.max(snaps.len());
             c.names.resize(c.slots, String::new());
-            for (slot, snap) in c.names.iter_mut().zip(&snaps) {
-                snap.name.clone_into(slot);
+            c.ids.resize(c.slots, None);
+            for (i, snap) in snaps.iter().enumerate() {
+                snap.name.clone_into(&mut c.names[i]);
+                c.ids[i].clone_from(&snap.device_id);
             }
             for i in snaps.len()..c.slots {
                 let label = match c.names.get(i) {
@@ -227,6 +252,7 @@ impl GpuBackend for CompositeBackend {
                 };
                 snaps.push(GpuSnapshot {
                     name: format!("{label} (unavailable)"),
+                    device_id: c.ids.get(i).cloned().flatten(),
                     ..Default::default()
                 });
             }
@@ -345,6 +371,8 @@ mod tests {
         procs: Vec<(u32, usize)>,
         driver: Option<&'static str>,
         signal: bool,
+        /// Whether devices carry an id (the device name doubles as one).
+        ids: bool,
     }
 
     impl Stub {
@@ -356,7 +384,13 @@ mod tests {
                 procs: Vec::new(),
                 driver: None,
                 signal: true,
+                ids: true,
             }
+        }
+        /// A backend that cannot identify its devices.
+        fn no_ids(mut self) -> Self {
+            self.ids = false;
+            self
         }
         fn procs(mut self, procs: &[(u32, usize)]) -> Self {
             self.procs = procs.to_vec();
@@ -384,6 +418,7 @@ mod tests {
                     .iter()
                     .map(|n| GpuSnapshot {
                         name: (*n).to_string(),
+                        device_id: self.ids.then(|| (*n).to_string()),
                         ..Default::default()
                     })
                     .collect()),
@@ -410,6 +445,10 @@ mod tests {
 
     fn names(snaps: &[GpuSnapshot]) -> Vec<&str> {
         snaps.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    fn ids(snaps: &[GpuSnapshot]) -> Vec<Option<&str>> {
+        snaps.iter().map(|s| s.device_id.as_deref()).collect()
     }
 
     #[test]
@@ -470,6 +509,61 @@ mod tests {
         assert_eq!(
             names(&b.poll().unwrap()),
             ["4090", "4080 (unavailable)", "APU"]
+        );
+    }
+
+    /// Two children can mint the same id string — nothing in the trait stops
+    /// them — and two devices sharing a key would share one set of graphs.
+    #[test]
+    fn device_ids_are_namespaced_per_child() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new("nv", vec![Some(vec!["gpu0"])])),
+            Box::new(Stub::new("amd", vec![Some(vec!["gpu0"])])),
+        ]);
+        assert_eq!(
+            ids(&b.poll().unwrap()),
+            [Some("nv#0:gpu0"), Some("amd#1:gpu0")]
+        );
+
+        // Even two children reporting the same backend name stay apart: the
+        // child index is part of the namespace.
+        let mut same = CompositeBackend::new(vec![
+            Box::new(Stub::new("nv", vec![Some(vec!["gpu0"])])),
+            Box::new(Stub::new("nv", vec![Some(vec!["gpu0"])])),
+        ]);
+        assert_eq!(
+            ids(&same.poll().unwrap()),
+            [Some("nv#0:gpu0"), Some("nv#1:gpu0")]
+        );
+    }
+
+    /// A child that cannot identify its devices must not be handed a made-up
+    /// id here — `App` falls back to position, and it has to know that.
+    #[test]
+    fn a_child_without_ids_reports_none() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new("nv", vec![Some(vec!["4090"])])),
+            Box::new(Stub::new("pdh", vec![Some(vec!["iGPU"])]).no_ids()),
+        ]);
+        assert_eq!(ids(&b.poll().unwrap()), [Some("nv#0:4090"), None]);
+    }
+
+    /// The placeholder holding a vanished device's slot is that same device,
+    /// briefly unreadable — so its graphs and peaks must carry on, which
+    /// means it keeps the id.
+    #[test]
+    fn a_placeholder_keeps_the_id_of_the_slot_it_holds() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new(
+                "nv",
+                vec![Some(vec!["4090", "4080"]), Some(vec!["4090"])],
+            )),
+            Box::new(Stub::new("amd", vec![Some(vec!["APU"]), None])),
+        ]);
+        b.poll().unwrap();
+        assert_eq!(
+            ids(&b.poll().unwrap()),
+            [Some("nv#0:4090"), Some("nv#0:4080"), Some("amd#1:APU")]
         );
     }
 

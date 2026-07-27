@@ -399,6 +399,14 @@ pub fn pdev_of(dev: &Path) -> Option<String> {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
 }
 
+/// Stable device id from a PCI address. The BDF names the slot the card sits
+/// in, which survives re-enumeration, driver reload and card renumbering —
+/// unlike the `cardN` index. `None` keeps "unidentifiable" distinct from a
+/// fabricated id; see [`crate::backend::GpuSnapshot::device_id`].
+pub fn pci_device_id(pdev: Option<&str>) -> Option<String> {
+    pdev.map(|p| format!("pci:{p}"))
+}
+
 /// Look up a device's marketing name in pci.ids. Vendor/device ids are
 /// lowercase hex without the 0x prefix.
 pub fn pci_device_name(ids: &str, vendor: &str, device: &str) -> Option<String> {
@@ -441,6 +449,17 @@ pub fn card_name(dev: &Path, idx: u32, vendor_hex: &str, fallback_brand: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The BDF names the slot, so it is the same key across driver reloads
+    /// and card renumbering; no address means no identity, not a made-up one.
+    #[test]
+    fn pci_device_ids_are_namespaced_and_optional() {
+        assert_eq!(
+            pci_device_id(Some("0000:75:00.0")).as_deref(),
+            Some("pci:0000:75:00.0")
+        );
+        assert_eq!(pci_device_id(None), None);
+    }
 
     const AMD_FDINFO: &str = "\
 drm-driver:\tamdgpu

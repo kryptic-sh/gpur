@@ -267,6 +267,9 @@ mod win {
                     };
                     GpuSnapshot {
                         name: a.name.clone(),
+                        // The adapter LUID is the identity Windows itself
+                        // uses to name an adapter across processes.
+                        device_id: Some(a.luid_key.clone()),
                         integrated: a.integrated,
                         utilization_pct: util_by_luid.get(&a.luid_key).copied().map(clamp_pct),
                         enc_util_pct: enc_by_luid.get(&a.luid_key).copied().map(clamp_pct),

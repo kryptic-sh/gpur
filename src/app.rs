@@ -1,6 +1,7 @@
 use crate::backend::{GpuBackend, GpuSnapshot, ProcKind};
 use crate::keys::Action;
 use crate::theme::UiTheme;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
 
@@ -86,6 +87,43 @@ pub struct History {
     pub power: Vec<u64>,
     pub temp: Vec<u64>,
 }
+
+/// What per-device state hangs off. Position is not identity: a device count
+/// or order change reattaches one GPU's graphs and peaks to another, and no
+/// amount of index bookkeeping in the backends can fix that.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DeviceKey {
+    /// The backend's own opaque id — see [`GpuSnapshot::device_id`].
+    Id(String),
+    /// The backend cannot identify this device, so its slot is all there is.
+    /// Session-only, never persisted: a bare position that outlives the
+    /// process is exactly the bug this type replaced.
+    Pos(usize),
+}
+
+/// One key per snapshot, in poll order. Ids must be unique within a poll —
+/// two cards sharing a key would fold their samples into one history — so a
+/// repeated id degrades to its position rather than colliding.
+fn device_keys(gpus: &[GpuSnapshot]) -> Vec<DeviceKey> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    gpus.iter()
+        .enumerate()
+        .map(|(i, g)| match g.device_id.as_deref() {
+            Some(id) if seen.insert(id) => DeviceKey::Id(id.to_string()),
+            _ => DeviceKey::Pos(i),
+        })
+        .collect()
+}
+
+/// Departed devices whose state is kept in case they come back — a driver
+/// reset, an eGPU replugged, a card that missed one poll. Bounded so a long
+/// session churning through devices cannot grow the maps without limit; the
+/// least recently seen are dropped first.
+const MAX_ABSENT_DEVICES: usize = 16;
+
+/// Cap on folds written to `state.json`, for the same reason. Devices seen
+/// this session win the cap.
+const MAX_FOLDS_PERSISTED: usize = 32;
 
 /// Full command line like nvtop; falls back to the process name for
 /// kernel threads and stripped cmdlines.
@@ -247,7 +285,17 @@ pub struct PendingKill {
 /// never a config file.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 pub struct UiState {
-    pub folded: Vec<usize>,
+    /// Folded cards, by device id.
+    ///
+    /// Deliberately a different key from the pre-identity `folded:
+    /// [<index>]`: that field held bare positions, and a position recorded by
+    /// a previous run cannot be mapped onto this run's devices without
+    /// risking folding a different GPU than the user folded. An old file
+    /// therefore keeps its `folded` key, serde ignores it, and nothing else
+    /// in the file is lost — the one cost is that folds reset once, on the
+    /// upgrade run.
+    #[serde(default)]
+    pub folded_devices: Vec<String>,
     pub sort_by: SortBy,
     pub sort_desc: bool,
     pub tick_ms: u64,
@@ -300,9 +348,16 @@ pub struct AppOptions {
 pub struct App {
     pub backend: Box<dyn GpuBackend>,
     pub gpus: Vec<GpuSnapshot>,
-    pub history: Vec<History>,
+    /// Key of each entry in `gpus`, same order. Everything per-device hangs
+    /// off these rather than off the index — see [`DeviceKey`].
+    keys: Vec<DeviceKey>,
+    history: HashMap<DeviceKey, History>,
     /// Per-GPU peaks/averages since launch.
-    pub session: Vec<SessionStats>,
+    session: HashMap<DeviceKey, SessionStats>,
+    /// Poll number each key was last present in, for eviction.
+    last_seen: HashMap<DeviceKey, u64>,
+    /// Successful polls so far; the clock `last_seen` counts on.
+    polls: u64,
     pub history_len: usize,
     pub selected: usize,
     pub paused: bool,
@@ -313,8 +368,8 @@ pub struct App {
     pub splash_skipped: bool,
     /// Filtered + sorted view of the process rows.
     pub procs: Vec<ProcRow>,
-    /// GPU indices folded to a one-line summary (digit keys toggle).
-    pub folded: std::collections::HashSet<usize>,
+    /// GPUs folded to a one-line summary (digit keys toggle).
+    folded: HashSet<DeviceKey>,
     /// First visible GPU card when the card list overflows (clamped in draw).
     pub gpu_scroll: usize,
     /// First visible process row when the table overflows (clamped in draw).
@@ -386,8 +441,11 @@ impl App {
             log,
             backend,
             gpus: Vec::new(),
-            history: Vec::new(),
-            session: Vec::new(),
+            keys: Vec::new(),
+            history: HashMap::new(),
+            session: HashMap::new(),
+            last_seen: HashMap::new(),
+            polls: 0,
             history_len,
             selected: 0,
             paused: false,
@@ -397,7 +455,7 @@ impl App {
             splash_path: crate::splash::build_path(),
             splash_skipped: no_splash,
             procs: Vec::new(),
-            folded: std::collections::HashSet::new(),
+            folded: HashSet::new(),
             gpu_scroll: 0,
             proc_scroll: 0,
             proc_sel: 0,
@@ -423,7 +481,12 @@ impl App {
     }
 
     pub fn restore_state(&mut self, s: &UiState) {
-        self.folded = s.folded.iter().copied().collect();
+        self.folded = s
+            .folded_devices
+            .iter()
+            .cloned()
+            .map(DeviceKey::Id)
+            .collect();
         self.sort_by = s.sort_by;
         self.sort_desc = s.sort_desc;
     }
@@ -433,7 +496,7 @@ impl App {
     pub fn save_state(&self) {
         let Some(path) = state_path() else { return };
         let state = UiState {
-            folded: self.folded.iter().copied().collect(),
+            folded_devices: self.persisted_folds(),
             sort_by: self.sort_by,
             sort_desc: self.sort_desc,
             tick_ms: self.tick_ms,
@@ -444,6 +507,77 @@ impl App {
         }
         if let Ok(json) = serde_json::to_string_pretty(&state) {
             let _ = std::fs::write(path, json);
+        }
+    }
+
+    /// Folds worth writing to `state.json`: only real device ids (a
+    /// positional key is meaningless to the next run), sorted for a stable
+    /// file, capped, with devices seen this session keeping their fold first.
+    fn persisted_folds(&self) -> Vec<String> {
+        let (mut seen, mut gone): (Vec<String>, Vec<String>) = self
+            .folded
+            .iter()
+            .filter_map(|k| match k {
+                DeviceKey::Id(id) => Some(id.clone()),
+                DeviceKey::Pos(_) => None,
+            })
+            .partition(|id| self.last_seen.contains_key(&DeviceKey::Id(id.clone())));
+        seen.sort();
+        gone.sort();
+        seen.into_iter()
+            .chain(gone)
+            .take(MAX_FOLDS_PERSISTED)
+            .collect()
+    }
+
+    /// Forget the longest-absent departed devices once too many have piled
+    /// up. Keeping some is the point — a card that misses one poll, or an
+    /// eGPU replugged, comes back to its own graphs — but a machine that
+    /// churns through devices must not grow these maps forever.
+    fn evict_absent_devices(&mut self) {
+        let live = self.keys.len();
+        let Some(excess) = self.last_seen.len().checked_sub(live + MAX_ABSENT_DEVICES) else {
+            return;
+        };
+        let mut absent: Vec<(u64, DeviceKey)> = self
+            .last_seen
+            .iter()
+            .filter(|(k, _)| !self.keys.contains(k))
+            .map(|(k, seen)| (*seen, k.clone()))
+            .collect();
+        // Oldest first; the key breaks ties so eviction is deterministic.
+        absent.sort_unstable();
+        for (_, k) in absent.into_iter().take(excess) {
+            self.history.remove(&k);
+            self.session.remove(&k);
+            self.last_seen.remove(&k);
+            // The fold goes with it: nothing else remembers this device, so
+            // keeping the fold alone would silently fold it on return with no
+            // history behind it.
+            self.folded.remove(&k);
+        }
+    }
+
+    /// Graph history of the card at `idx`, empty until its first poll.
+    pub fn history_at(&self, idx: usize) -> Option<&History> {
+        self.history.get(self.keys.get(idx)?)
+    }
+
+    /// Session peaks/averages of the card at `idx`.
+    pub fn session_at(&self, idx: usize) -> Option<&SessionStats> {
+        self.session.get(self.keys.get(idx)?)
+    }
+
+    pub fn is_folded(&self, idx: usize) -> bool {
+        self.keys.get(idx).is_some_and(|k| self.folded.contains(k))
+    }
+
+    fn toggle_fold(&mut self, idx: usize) {
+        let Some(key) = self.keys.get(idx).cloned() else {
+            return;
+        };
+        if !self.folded.remove(&key) {
+            self.folded.insert(key);
         }
     }
 
@@ -507,16 +641,35 @@ impl App {
                 return; // keep previous snapshot and history
             }
         }
-        self.history.resize_with(self.gpus.len(), History::default);
-        self.session
-            .resize_with(self.gpus.len(), SessionStats::default);
-        if self.selected >= self.gpus.len() {
-            self.selected = self.gpus.len().saturating_sub(1);
-        }
-        for (gpu, sess) in self.gpus.iter().zip(&mut self.session) {
-            sess.add(gpu);
-        }
-        for (gpu, hist) in self.gpus.iter().zip(&mut self.history) {
+        // The cursor follows the device, not the slot: a hotplug that shifts
+        // every later card must not silently move the selection onto a
+        // different GPU.
+        let selected_key = self.keys.get(self.selected).cloned();
+        self.keys = device_keys(&self.gpus);
+        self.selected = selected_key
+            .and_then(|k| self.keys.iter().position(|x| *x == k))
+            .unwrap_or_else(|| self.selected.min(self.gpus.len().saturating_sub(1)));
+
+        self.polls += 1;
+        // Split borrow: the per-device maps are updated while `gpus` is read.
+        let Self {
+            gpus,
+            keys,
+            history,
+            session,
+            last_seen,
+            polls,
+            history_len,
+            history_need,
+            ..
+        } = self;
+        // Config history_len is a MINIMUM; keep at least what the widest
+        // graph can display (+slack for resize wiggle).
+        let cap = (*history_len).max(*history_need + 8);
+        for (gpu, key) in gpus.iter().zip(keys.iter()) {
+            last_seen.insert(key.clone(), *polls);
+            session.entry(key.clone()).or_default().add(gpu);
+            let hist = history.entry(key.clone()).or_default();
             // A waveform has no glyph for "unknown", so an unreadable metric
             // records as a flat 0 line. The meter above it says `n/a`, which
             // is where the distinction is actually made.
@@ -526,9 +679,6 @@ impl App {
             hist.power.push(gpu.power_w.unwrap_or(0.0).round() as u64);
             hist.temp
                 .push(gpu.temperature_c.unwrap_or(0.0).round() as u64);
-            // Config history_len is a MINIMUM; keep at least what the
-            // widest graph can display (+slack for resize wiggle).
-            let cap = self.history_len.max(self.history_need + 8);
             let overflow = hist.util.len().saturating_sub(cap);
             if overflow > 0 {
                 hist.util.drain(..overflow);
@@ -537,6 +687,7 @@ impl App {
                 hist.temp.drain(..overflow);
             }
         }
+        self.evict_absent_devices();
         self.refresh_processes();
         if log {
             self.write_log();
@@ -855,9 +1006,7 @@ impl App {
                 if i < self.gpus.len() {
                     if self.focus == Focus::Gpus && self.selected == i {
                         // Second press on the selected GPU folds it.
-                        if !self.folded.remove(&i) {
-                            self.folded.insert(i);
-                        }
+                        self.toggle_fold(i);
                     } else {
                         self.focus = Focus::Gpus;
                         self.selected = i;
@@ -956,6 +1105,43 @@ mod tests {
                 },
             ]
         }
+    }
+
+    /// Scripted device list: one entry per poll, each `(device id, util%)`.
+    /// The last entry repeats once the script runs out. `None` for the id is
+    /// a backend that cannot identify the device.
+    struct ScriptedBackend {
+        ticks: Vec<Vec<(Option<&'static str>, f64)>>,
+        tick: usize,
+    }
+
+    impl ScriptedBackend {
+        fn boxed(ticks: Vec<Vec<(Option<&'static str>, f64)>>) -> Box<dyn GpuBackend> {
+            Box::new(Self { ticks, tick: 0 })
+        }
+    }
+
+    impl GpuBackend for ScriptedBackend {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+        fn poll(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
+            let i = self.tick.min(self.ticks.len() - 1);
+            self.tick += 1;
+            Ok(self.ticks[i]
+                .iter()
+                .map(|(id, util)| GpuSnapshot {
+                    name: id.unwrap_or("anon").to_string(),
+                    device_id: id.map(str::to_string),
+                    utilization_pct: Some(*util),
+                    ..Default::default()
+                })
+                .collect())
+        }
+    }
+
+    fn util_history(app: &App, idx: usize) -> Vec<u64> {
+        app.history_at(idx).expect("history for card").util.clone()
     }
 
     fn app_with(backend: Box<dyn GpuBackend>) -> App {
@@ -1300,6 +1486,202 @@ mod tests {
             vec![1, 3, 2],
             "an unmeasured row sorted as if it were 0%"
         );
+    }
+
+    /// The heart of it: a GPU that changes position between polls keeps its
+    /// own waveform history and its own session peaks.
+    #[test]
+    fn per_device_state_follows_the_device_across_a_reorder() {
+        let mut app = app_with(ScriptedBackend::boxed(vec![
+            vec![(Some("a"), 10.0), (Some("b"), 90.0)],
+            // A hotplug (or a differently-ordered enumeration) swaps them.
+            vec![(Some("b"), 20.0), (Some("a"), 30.0)],
+        ]));
+        app.poll();
+        app.poll();
+
+        assert_eq!(app.gpus[0].name, "b");
+        assert_eq!(util_history(&app, 0), vec![90, 20]);
+        assert_eq!(app.session_at(0).unwrap().max_util_pct, Some(90.0));
+        assert_eq!(util_history(&app, 1), vec![10, 30]);
+        assert_eq!(app.session_at(1).unwrap().max_util_pct, Some(30.0));
+    }
+
+    /// A device that drops off the bus and comes back is the same device.
+    #[test]
+    fn a_returning_device_is_re_identified_not_treated_as_new() {
+        let mut app = app_with(ScriptedBackend::boxed(vec![
+            vec![(Some("a"), 10.0), (Some("b"), 90.0)],
+            vec![(Some("b"), 20.0)],
+            vec![(Some("b"), 30.0), (Some("a"), 40.0)],
+        ]));
+        app.poll();
+        app.poll();
+        app.poll();
+
+        assert_eq!(app.gpus[1].name, "a");
+        assert_eq!(util_history(&app, 1), vec![10, 40]);
+        assert_eq!(app.session_at(1).unwrap().max_util_pct, Some(40.0));
+        // And the device that stayed is untouched by the churn.
+        assert_eq!(util_history(&app, 0), vec![90, 20, 30]);
+    }
+
+    /// The cursor names a GPU, not a slot.
+    #[test]
+    fn the_selection_follows_the_selected_device() {
+        let mut app = app_with(ScriptedBackend::boxed(vec![
+            vec![(Some("a"), 1.0), (Some("b"), 2.0)],
+            vec![(Some("c"), 3.0), (Some("a"), 1.0), (Some("b"), 2.0)],
+        ]));
+        app.poll();
+        app.selected = 1; // "b"
+        app.poll();
+        assert_eq!(app.gpus[app.selected].name, "b");
+
+        // A selected device that leaves clamps into range rather than
+        // pointing past the end.
+        let mut app = app_with(ScriptedBackend::boxed(vec![
+            vec![(Some("a"), 1.0), (Some("b"), 2.0)],
+            vec![(Some("a"), 1.0)],
+        ]));
+        app.poll();
+        app.selected = 1;
+        app.poll();
+        assert_eq!(app.selected, 0);
+    }
+
+    /// Folding is a property of the GPU, so adding or removing a card must
+    /// not move the fold onto a different one.
+    #[test]
+    fn a_fold_survives_a_device_being_added_or_removed() {
+        let mut app = app_with(ScriptedBackend::boxed(vec![
+            vec![(Some("a"), 1.0), (Some("b"), 2.0)],
+            // "c" arrives ahead of both, pushing "b" from slot 1 to slot 2.
+            vec![(Some("c"), 3.0), (Some("a"), 1.0), (Some("b"), 2.0)],
+            // ...and then "a" leaves.
+            vec![(Some("c"), 3.0), (Some("b"), 2.0)],
+        ]));
+        app.poll();
+        app.selected = 1;
+        app.apply(Action::Digit(1)); // fold "b"
+        assert!(app.is_folded(1));
+
+        app.poll();
+        assert!(app.is_folded(2), "the fold did not follow the device");
+        assert!(!app.is_folded(0) && !app.is_folded(1));
+
+        app.poll();
+        assert!(app.is_folded(1));
+        assert!(!app.is_folded(0));
+    }
+
+    /// Folds are persisted by id; a positional key means nothing to the next
+    /// run, so it never reaches the file.
+    #[test]
+    fn only_identified_devices_persist_their_fold() {
+        let mut app = app_with(ScriptedBackend::boxed(vec![vec![
+            (Some("a"), 1.0),
+            (None, 2.0),
+        ]]));
+        app.poll();
+        app.selected = 0;
+        app.apply(Action::Digit(0));
+        app.selected = 1;
+        app.apply(Action::Digit(1));
+        assert!(app.is_folded(0) && app.is_folded(1));
+        assert_eq!(app.persisted_folds(), vec!["a".to_string()]);
+    }
+
+    /// A pre-identity state file carries `folded` as bare positions. It must
+    /// load — losing the sort and the poll rate too would be a second bug —
+    /// and those positions must not fold anything.
+    #[test]
+    fn legacy_positional_folds_are_dropped_not_applied() {
+        let legacy: UiState = serde_json::from_str(
+            r#"{"folded":[1],"sort_by":"Pid","sort_desc":false,"tick_ms":300}"#,
+        )
+        .expect("a pre-identity state file must still parse");
+        assert!(legacy.folded_devices.is_empty());
+        assert_eq!(legacy.sort_by, SortBy::Pid);
+        assert_eq!(legacy.sticky_tick_ms(), Some(300));
+
+        let mut app = app_with(ScriptedBackend::boxed(vec![vec![
+            (Some("a"), 1.0),
+            (Some("b"), 2.0),
+        ]]));
+        app.restore_state(&legacy);
+        app.poll();
+        assert!(!app.is_folded(0) && !app.is_folded(1));
+    }
+
+    #[test]
+    fn state_restored_by_id_folds_that_device_wherever_it_sits() {
+        let state: UiState = serde_json::from_str(
+            r#"{"folded_devices":["b"],"sort_by":"Pid","sort_desc":false,"tick_ms":0}"#,
+        )
+        .unwrap();
+        let mut app = app_with(ScriptedBackend::boxed(vec![vec![
+            (Some("c"), 3.0),
+            (Some("a"), 1.0),
+            (Some("b"), 2.0),
+        ]]));
+        app.restore_state(&state);
+        app.poll();
+        assert!(app.is_folded(2));
+        assert!(!app.is_folded(0) && !app.is_folded(1));
+    }
+
+    /// A backend that cannot identify its devices gets positional keys, and
+    /// so does the second of two devices claiming the same id — sharing one
+    /// key would fold two cards' samples into one history.
+    #[test]
+    fn unidentifiable_and_duplicate_ids_fall_back_to_position() {
+        let snap = |id: Option<&str>| GpuSnapshot {
+            device_id: id.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(
+            device_keys(&[snap(Some("a")), snap(None), snap(Some("a"))]),
+            vec![
+                DeviceKey::Id("a".into()),
+                DeviceKey::Pos(1),
+                DeviceKey::Pos(2)
+            ]
+        );
+    }
+
+    /// Keying by id means a departed GPU's state is no longer dropped by a
+    /// shorter vec, so it has to be evicted deliberately.
+    #[test]
+    fn state_for_departed_devices_is_bounded() {
+        /// Pathological hotplug: every poll shows one brand-new device and
+        /// the previous one is gone for good.
+        struct ChurnBackend(u64);
+        impl GpuBackend for ChurnBackend {
+            fn name(&self) -> &'static str {
+                "churn"
+            }
+            fn poll(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
+                self.0 += 1;
+                Ok(vec![GpuSnapshot {
+                    device_id: Some(format!("dev-{}", self.0)),
+                    ..Default::default()
+                }])
+            }
+        }
+
+        let churn = MAX_ABSENT_DEVICES * 3;
+        let mut app = app_with(Box::new(ChurnBackend(0)));
+        for _ in 0..churn {
+            app.poll();
+        }
+        // Exactly the cap: one live device plus the retained departed ones,
+        // proving eviction ran rather than the churn simply being short.
+        assert_eq!(app.history.len(), 1 + MAX_ABSENT_DEVICES);
+        assert_eq!(app.history.len(), app.session.len());
+        assert_eq!(app.history.len(), app.last_seen.len());
+        // A device seen recently is still there to come back to.
+        assert!(app.history.contains_key(app.keys.last().unwrap()));
     }
 
     #[test]

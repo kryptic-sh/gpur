@@ -59,6 +59,9 @@ impl GpuBackend for MockBackend {
                 let vram = self.wave(i as f64 * 2.1 + 0.7, 97.0);
                 GpuSnapshot {
                     name: format!("Mock GPU {i}"),
+                    // Synthetic, but stable across polls and across runs,
+                    // which is all the identity contract asks for.
+                    device_id: Some(format!("mock:{i}")),
                     integrated: i == 0,
                     utilization_pct: Some(util),
                     mem_util_pct: Some(util * 0.6),
