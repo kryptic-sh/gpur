@@ -7,18 +7,18 @@ mod splash;
 mod theme;
 mod ui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use app::{App, Focus, InputMode};
 use clap::Parser;
 use cli::Cli;
 use config::GpurConfig;
-use crossterm::event::KeyCode;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
 };
 use keys::Action;
 use ratatui::layout::Position;
-use std::io::stdout;
+use std::io::{IsTerminal, stdout};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
@@ -40,13 +40,19 @@ fn main() -> Result<()> {
         Some(path) => hjkl_config::load_from(path)?,
         None => hjkl_config::load()?.0,
     };
+    // Headless output must not depend on what a human once did in the TUI:
+    // sort/fold state is a UI preference, not part of the data.
+    let headless = cli.once || cli.json;
     // Precedence: CLI flag > last-used (persisted state) > config default.
-    let state = app::load_state();
+    // Only an *interactively* chosen rate is "last-used" — otherwise the
+    // state file shadows config.toml forever after the first run.
+    let state = app::load_state().filter(|_| !headless);
+    let saved_tick = state.as_ref().and_then(app::UiState::sticky_tick_ms);
     let tick_ms = cli
         .tick_ms
-        .or(state.as_ref().map(|s| s.tick_ms).filter(|t| *t > 0))
+        .or(saved_tick)
         .unwrap_or(cfg.tick_ms)
-        .max(50);
+        .max(app::MIN_TICK_MS);
     let theme_path = cli.theme.clone().or(cfg.theme.clone());
 
     let theme = theme::load(theme_path.as_deref(), theme::detect_color_mode())?;
@@ -75,6 +81,10 @@ fn main() -> Result<()> {
         theme,
         app::AppOptions {
             tick_ms,
+            // Sticky only if it was already an interactive choice; a config,
+            // a --tick-ms value, or a pre-flag state file stays non-sticky.
+            tick_explicit: cli.tick_ms.is_none()
+                && state.as_ref().is_some_and(app::UiState::tick_chosen_by_key),
             history_len: cfg.history_len,
             no_splash: cli.no_splash,
             graph_style,
@@ -82,20 +92,24 @@ fn main() -> Result<()> {
             log,
         },
     );
+    if headless {
+        return snapshot(&mut app, cli.json, tick_ms);
+    }
     if let Some(s) = &state {
         app.restore_state(s);
     }
     app.poll();
 
-    if cli.once || cli.json {
-        return snapshot(&mut app, cli.json, tick_ms);
+    // A pipe, a cron job or a CI runner has no terminal to put into raw
+    // mode; ratatui::init() would unwrap the error into a panic backtrace.
+    if !stdout().is_terminal() {
+        anyhow::bail!("stdout is not a terminal — use --once or --json for non-interactive output");
     }
-
     // ratatui::init installs a panic hook restoring raw mode + alt screen;
     // it knows nothing about mouse capture or the kitty protocol, so chain
     // our teardown in front of it — a panic must not leave the shell with
     // mouse reporting on.
-    let mut terminal = ratatui::init();
+    let mut terminal = ratatui::try_init().context("initializing the terminal")?;
     hjkl_kitty::enable(&mut stdout())?;
     crossterm::execute!(stdout(), EnableMouseCapture)?;
     {
@@ -162,18 +176,15 @@ fn install_signal_teardown() {
 fn install_signal_teardown() {}
 
 /// Headless one-shot: a second poll after a short gap makes the delta-based
-/// utilizations (Intel, per-process) real instead of zero.
+/// utilizations (Intel, per-process) real instead of zero. The priming poll
+/// is not logged — `--once --log` must write exactly one record.
 fn snapshot(app: &mut App, json: bool, tick_ms: u64) -> Result<()> {
+    app.poll_priming();
     std::thread::sleep(Duration::from_millis(tick_ms.clamp(100, 1000)));
     app.poll();
 
     if json {
-        let out = serde_json::json!({
-            "backend": app.backend.name(),
-            "gpus": app.gpus,
-            "processes": app.procs,
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        println!("{}", serde_json::to_string_pretty(&app.record())?);
         return Ok(());
     }
 
@@ -193,7 +204,8 @@ fn snapshot(app: &mut App, json: bool, tick_ms: u64) -> Result<()> {
         }
         println!("{line}");
     }
-    for p in &app.procs {
+    // Same rows the JSON record carries: unfiltered, deterministic order.
+    for p in &app.all_procs {
         println!(
             "  pid {:>7}  gpu {}  {:>4}  {:>5}MiB  {}",
             p.pid,
@@ -208,19 +220,44 @@ fn snapshot(app: &mut App, json: bool, tick_ms: u64) -> Result<()> {
     Ok(())
 }
 
+/// Splash animation frame budget (~16 fps).
+const SPLASH_FRAME_MS: u64 = 60;
+
+/// How long to wait for input before the next frame is due. Frames and
+/// polls run on separate clocks: the splash animates at ~16 fps while polls
+/// stay at `tick_ms`, and pacing frames off the poll clock spun the loop at
+/// full speed for the rest of every tick.
+fn event_timeout(
+    splash: bool,
+    tick_ms: u64,
+    since_draw: Duration,
+    since_poll: Duration,
+) -> Duration {
+    let frame_interval = if splash {
+        Duration::from_millis(SPLASH_FRAME_MS)
+    } else {
+        Duration::from_millis(tick_ms)
+    };
+    let tick = Duration::from_millis(tick_ms);
+    frame_interval
+        .saturating_sub(since_draw)
+        .min(tick.saturating_sub(since_poll))
+}
+
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     let mut keymap = keys::default_keymap();
     let mut last_poll = Instant::now();
 
     loop {
         terminal.draw(|frame| ui::draw(frame, app))?;
+        let last_draw = Instant::now();
 
-        let interval = if app.splash_active() {
-            Duration::from_millis(60)
-        } else {
-            Duration::from_millis(app.tick_ms)
-        };
-        let timeout = interval.saturating_sub(last_poll.elapsed()).min(interval);
+        let timeout = event_timeout(
+            app.splash_active(),
+            app.tick_ms,
+            last_draw.elapsed(),
+            last_poll.elapsed(),
+        );
 
         if event::poll(timeout)? {
             match event::read()? {
@@ -231,15 +268,26 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                     }
                     match app.input_mode {
                         // Filter editing: raw input, bypasses the keymap.
-                        InputMode::Filter => match key.code {
-                            KeyCode::Enter => app.commit_filter(),
-                            KeyCode::Esc => app.input_mode = InputMode::Normal,
-                            KeyCode::Backspace => {
-                                app.filter_input.pop();
+                        // Control chords must never reach the buffer — raw
+                        // mode gives no SIGINT, so a literal 'c' from Ctrl-C
+                        // left the app with no way out but Esc.
+                        InputMode::Filter => {
+                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                            match key.code {
+                                KeyCode::Char('c') if ctrl => return Ok(()),
+                                KeyCode::Char('u') if ctrl => app.filter_input.clear(),
+                                KeyCode::Char('w') if ctrl => app.filter_delete_word(),
+                                // Any other control chord is ignored, not typed.
+                                KeyCode::Char(_) if ctrl => {}
+                                KeyCode::Enter => app.commit_filter(),
+                                KeyCode::Esc => app.input_mode = InputMode::Normal,
+                                KeyCode::Backspace => {
+                                    app.filter_input.pop();
+                                }
+                                KeyCode::Char(c) => app.filter_input.push(c),
+                                _ => {}
                             }
-                            KeyCode::Char(c) => app.filter_input.push(c),
-                            _ => {}
-                        },
+                        }
                         // Kill confirmation: y confirms, anything else cancels.
                         InputMode::Confirm => {
                             if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
@@ -266,6 +314,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                 Event::Mouse(m) => {
                     if app.splash_active() {
                         app.splash_skipped = true;
+                        continue;
+                    }
+                    // Modals own the screen: a wheel or click must not move
+                    // the selection underneath the kill dialog, the filter
+                    // input, or the help overlay.
+                    if app.show_help || app.input_mode != InputMode::Normal {
                         continue;
                     }
                     let pos = Position::new(m.column, m.row);
@@ -329,5 +383,46 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
             app.poll();
             last_poll = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The splash busy-loop: with frames paced off the *poll* clock, the
+    /// timeout collapsed to zero for the rest of every tick and the loop
+    /// spun at ~1000 fps. Frames get their own clock now.
+    #[test]
+    fn splash_frames_wait_a_frame_not_zero() {
+        // 100 ms into a 1000 ms tick, 40 ms into a 60 ms frame.
+        let t = event_timeout(
+            true,
+            1000,
+            Duration::from_millis(40),
+            Duration::from_millis(100),
+        );
+        assert_eq!(t, Duration::from_millis(SPLASH_FRAME_MS - 40));
+    }
+
+    #[test]
+    fn a_due_poll_wins_over_a_later_frame() {
+        // 990 ms into the tick: the poll is 10 ms away, the frame 60 ms.
+        let t = event_timeout(true, 1000, Duration::ZERO, Duration::from_millis(990));
+        assert_eq!(t, Duration::from_millis(10));
+    }
+
+    /// Outside the splash both clocks are the tick, so a fresh draw waits a
+    /// whole tick and an overdue poll returns immediately.
+    #[test]
+    fn steady_state_paces_on_the_tick() {
+        assert_eq!(
+            event_timeout(false, 500, Duration::ZERO, Duration::ZERO),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            event_timeout(false, 500, Duration::ZERO, Duration::from_millis(700)),
+            Duration::ZERO
+        );
     }
 }

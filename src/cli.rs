@@ -10,8 +10,16 @@ use std::path::PathBuf;
 )]
 pub struct Cli {
     /// Use deterministic mock GPUs (demo the UI without hardware).
-    /// Optionally pass how many, e.g. `--mock 6`.
-    #[arg(long, num_args = 0..=1, default_missing_value = "2", value_name = "N")]
+    /// Optionally pass how many (1-16), e.g. `--mock 6`.
+    // Range-checked here so an out-of-range count is rejected with a clap
+    // error instead of being silently rewritten by a clamp.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "2",
+        value_name = "N",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=16),
+    )]
     pub mock: Option<usize>,
 
     /// Path to config.toml (default: $XDG_CONFIG_HOME/gpur/config.toml)
@@ -22,7 +30,7 @@ pub struct Cli {
     #[arg(long, short)]
     pub theme: Option<PathBuf>,
 
-    /// Poll interval in milliseconds (overrides the config file)
+    /// Poll interval in milliseconds, floor 50 (overrides the config file)
     #[arg(long)]
     pub tick_ms: Option<u64>,
 
@@ -89,5 +97,27 @@ impl CompletionShell {
                 clap_complete::generate(clap_complete_nushell::Nushell, cmd, "gpur", out)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Out-of-range counts used to be clamped silently (0 → 1, 100 → 16).
+    #[test]
+    fn mock_count_is_range_checked() {
+        assert_eq!(
+            Cli::try_parse_from(["gpur", "--mock", "6"]).unwrap().mock,
+            Some(6)
+        );
+        // No value keeps the two-GPU default.
+        assert_eq!(
+            Cli::try_parse_from(["gpur", "--mock"]).unwrap().mock,
+            Some(2)
+        );
+        assert!(Cli::try_parse_from(["gpur", "--mock", "0"]).is_err());
+        assert!(Cli::try_parse_from(["gpur", "--mock", "17"]).is_err());
+        assert!(Cli::try_parse_from(["gpur", "--mock", "-1"]).is_err());
     }
 }

@@ -124,6 +124,7 @@ impl GpuBackend for MockBackend {
                     command: (!own).then(|| command.to_string()),
                     cpu_pct: (!own).then(|| (util * (0.5 - 0.05 * i as f64)).max(0.0) as f32),
                     host_mem_bytes: (!own).then(|| (400 >> i.min(6)) as u64 * 1024 * 1024),
+                    container: None,
                 }
             })
             .collect()

@@ -119,6 +119,9 @@ pub struct GpuProcess {
     pub command: Option<String>,
     pub cpu_pct: Option<f32>,
     pub host_mem_bytes: Option<u64>,
+    /// Container runtime + short id, recorded rather than re-resolved: the
+    /// replaying host's `/proc` knows nothing about a foreign pid.
+    pub container: Option<String>,
 }
 
 /// A source of GPU telemetry. Implementations poll all devices they can see.
@@ -154,6 +157,8 @@ pub fn detect(
         return replay::load(path);
     }
     if let Some(n) = mock {
+        // The CLI range-validates `--mock`; this clamp only guards internal
+        // callers (re-detect) from a count the mock backend can't render.
         return Ok(Box::new(MockBackend::new(n.clamp(1, 16))));
     }
     if let Some(b) = nvidia::probe() {

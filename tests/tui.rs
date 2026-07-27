@@ -477,12 +477,15 @@ fn tick_keys_change_the_poll_interval() {
     t.send("+");
     t.wait_for("faster again", |s| s.contains("200ms"));
     t.send("+");
-    t.wait_for("at the floor", |s| s.contains("100ms"));
-    // The floor must hold rather than wrap around to a slower rate.
+    t.wait_for("faster still", |s| s.contains("100ms"));
+    t.send("+");
+    t.wait_for("at the floor", |s| s.contains("50ms"));
+    // The floor must hold rather than bounce back up to a slower rate, which
+    // is what the old key-only floor of 100 did to anyone starting below it.
     t.send("+");
     let s = t.drain(Duration::from_millis(400));
     let header = s.lines().next().unwrap_or_default();
-    assert!(s.contains("100ms"), "tick left the 100ms floor: {header:?}");
+    assert!(s.contains("50ms"), "tick left the 50ms floor: {header:?}");
     t.send("q");
     t.wait_exit();
 }

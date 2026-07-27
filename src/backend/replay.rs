@@ -10,6 +10,12 @@ use std::path::Path;
 
 #[derive(serde::Deserialize)]
 struct LogRecord {
+    /// Attribution written since the record schema gained it; older
+    /// recordings simply have none.
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    driver: Option<String>,
     #[serde(default)]
     gpus: Vec<GpuSnapshot>,
     #[serde(default)]
@@ -67,8 +73,60 @@ impl GpuBackend for ReplayBackend {
         self.last.processes.clone()
     }
 
+    /// Show what produced the recording, not what is running here. `name()`
+    /// must stay `'static`, so the recorded backend rides along in this line.
+    fn driver_info(&self) -> Option<String> {
+        match (&self.last.backend, &self.last.driver) {
+            (Some(b), Some(d)) => Some(format!("{b} · {d}")),
+            (Some(b), None) => Some(b.clone()),
+            (None, d) => d.clone(),
+        }
+    }
+
     /// Recorded pids belong to the machine that produced the log.
     fn can_signal(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_log(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("gpur-replay-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rec.jsonl");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// Attribution and container come off the record, not off this host.
+    #[test]
+    fn recorded_attribution_survives_playback() {
+        let path = write_log(
+            "attr",
+            concat!(
+                r#"{"ts_ms":1,"backend":"nvml","driver":"550.1","gpus":[],"#,
+                r#""processes":[{"pid":7,"container":"docker:abcdef123456"}]}"#,
+                "\n"
+            ),
+        );
+        let mut b = load(&path).unwrap();
+        assert_eq!(b.driver_info().as_deref(), Some("nvml · 550.1"));
+        assert_eq!(
+            b.processes()[0].container.as_deref(),
+            Some("docker:abcdef123456")
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// Pre-attribution recordings still load; the header just stays blank.
+    #[test]
+    fn legacy_records_without_attribution_still_load() {
+        let path = write_log("legacy", "{\"gpus\":[],\"processes\":[]}\n");
+        let b = load(&path).unwrap();
+        assert_eq!(b.driver_info(), None);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

@@ -7,6 +7,11 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Us
 const SPLASH_MS: u64 = 1500;
 const STATUS_MS: u64 = 4000;
 
+/// Poll-interval floor, shared by the CLI/config clamp and the `+` key.
+/// Two different floors (50 vs 100) meant `--tick-ms 50` plus one `+`
+/// *raised* the interval to 100 with no way back.
+pub const MIN_TICK_MS: u64 = 50;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Gpus,
@@ -219,6 +224,26 @@ pub struct UiState {
     pub sort_by: SortBy,
     pub sort_desc: bool,
     pub tick_ms: u64,
+    /// Whether `tick_ms` was chosen interactively (`+`/`-`). A rate that only
+    /// came from the config or `--tick-ms` must not outrank a later config
+    /// edit — that made an edited `config.toml` silently do nothing forever.
+    /// `None` = written before this flag existed, provenance unknown.
+    #[serde(default)]
+    pub tick_ms_explicit: Option<bool>,
+}
+
+impl UiState {
+    /// The persisted rate, when it should still outrank `config.toml`. A
+    /// pre-flag file is honoured once so nobody's rate changes on upgrade;
+    /// the next clean quit records the truth and config edits work again.
+    pub fn sticky_tick_ms(&self) -> Option<u64> {
+        (self.tick_ms_explicit != Some(false) && self.tick_ms > 0).then_some(self.tick_ms)
+    }
+
+    /// Recorded as a genuine key press, so it stays sticky indefinitely.
+    pub fn tick_chosen_by_key(&self) -> bool {
+        self.tick_ms_explicit == Some(true)
+    }
 }
 
 fn state_path() -> Option<std::path::PathBuf> {
@@ -235,6 +260,9 @@ pub fn load_state() -> Option<UiState> {
 /// Startup knobs for [`App::new`], resolved from CLI + config.
 pub struct AppOptions {
     pub tick_ms: u64,
+    /// `tick_ms` came from an interactive choice (a persisted `+`/`-`), so it
+    /// stays persisted. See [`UiState::tick_ms_explicit`].
+    pub tick_explicit: bool,
     pub history_len: usize,
     pub no_splash: bool,
     pub graph_style: GraphStyle,
@@ -302,8 +330,12 @@ pub struct App {
     poll_failures: u32,
     /// JSONL sink: one line per successful poll when --log is given.
     log: Option<std::io::BufWriter<std::fs::File>>,
-    /// Unfiltered process rows; `procs` is the filtered+sorted view.
-    all_procs: Vec<ProcRow>,
+    /// Unfiltered process rows in a stable order; `procs` is the
+    /// filtered+sorted view. Machine-readable output comes from here.
+    pub all_procs: Vec<ProcRow>,
+    /// Whether the poll rate was set interactively this session (or in a
+    /// previous one) — see [`UiState::tick_ms_explicit`].
+    tick_explicit: bool,
     sys: System,
     users: Users,
 }
@@ -312,6 +344,7 @@ impl App {
     pub fn new(backend: Box<dyn GpuBackend>, theme: UiTheme, opts: AppOptions) -> Self {
         let AppOptions {
             tick_ms,
+            tick_explicit,
             history_len,
             no_splash,
             graph_style,
@@ -319,6 +352,7 @@ impl App {
             log,
         } = opts;
         Self {
+            tick_explicit,
             graph_style,
             mock,
             poll_failures: 0,
@@ -376,6 +410,7 @@ impl App {
             sort_by: self.sort_by,
             sort_desc: self.sort_desc,
             tick_ms: self.tick_ms,
+            tick_ms_explicit: Some(self.tick_explicit),
         };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -406,6 +441,17 @@ impl App {
     /// stays on screen and the error shows in the header until a poll
     /// succeeds again — a driver reset must not kill the monitor.
     pub fn poll(&mut self) {
+        self.poll_inner(true);
+    }
+
+    /// Poll without emitting a log record. The headless path polls twice to
+    /// give delta-based metrics a baseline; only the second sample is the
+    /// snapshot `--once` promises, so only that one is recorded.
+    pub fn poll_priming(&mut self) {
+        self.poll_inner(false);
+    }
+
+    fn poll_inner(&mut self, log: bool) {
         if self.paused {
             return;
         }
@@ -461,23 +507,40 @@ impl App {
             }
         }
         self.refresh_processes();
-        self.write_log();
+        if log {
+            self.write_log();
+        }
+    }
+
+    /// The one machine-readable shape: `--log` lines and `--json` snapshots
+    /// are the same payload, so a recording can be diffed against a snapshot
+    /// and `--replay` reads back everything it needs. `processes` is the
+    /// UNFILTERED table in a stable order — a UI filter must not silently
+    /// drop rows from a bug report, and a script must not have its ordering
+    /// depend on whether a human ever pressed `s`.
+    pub fn record(&self) -> serde_json::Value {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        serde_json::json!({
+            "ts_ms": ts,
+            "backend": self.backend.name(),
+            "driver": self.backend.driver_info(),
+            "gpus": self.gpus,
+            "processes": self.all_procs,
+        })
     }
 
     /// Append one JSONL record per successful poll. A write error drops the
     /// logger with a status message instead of spamming or crashing.
     fn write_log(&mut self) {
         use std::io::Write;
+        if self.log.is_none() {
+            return;
+        }
+        let rec = self.record();
         let Some(w) = self.log.as_mut() else { return };
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let rec = serde_json::json!({
-            "ts_ms": ts,
-            "gpus": self.gpus,
-            "processes": self.all_procs,
-        });
         let ok = serde_json::to_writer(&mut *w, &rec).is_ok()
             && writeln!(w).is_ok()
             && w.flush().is_ok();
@@ -529,7 +592,7 @@ impl App {
                         .clone()
                         .or(p.map(command_of))
                         .unwrap_or_else(|| "?".into()),
-                    container: container_of_pid(gp.pid),
+                    container: gp.container.clone().or_else(|| container_of_pid(gp.pid)),
                     pid: gp.pid,
                     gpu_index: gp.gpu_index,
                     kind: gp.kind,
@@ -538,6 +601,15 @@ impl App {
                 }
             })
             .collect();
+        // Backend enumeration order is an implementation detail (hash maps,
+        // sysfs readdir). Pin one order here so `--json` and `--log` records
+        // are reproducible and diffable regardless of UI sort state.
+        self.all_procs.sort_by(|a, b| {
+            b.gpu_mem_bytes
+                .cmp(&a.gpu_mem_bytes)
+                .then(a.pid.cmp(&b.pid))
+                .then(a.gpu_index.cmp(&b.gpu_index))
+        });
         self.rebuild_proc_view();
     }
 
@@ -581,6 +653,16 @@ impl App {
         self.proc_sel = cursor_key
             .and_then(|key| self.procs.iter().position(|p| (p.pid, p.gpu_index) == key))
             .unwrap_or_else(|| self.proc_sel.min(self.procs.len().saturating_sub(1)));
+    }
+
+    /// Readline `<C-w>`: drop trailing blanks, then the word before them.
+    pub fn filter_delete_word(&mut self) {
+        while self.filter_input.ends_with(char::is_whitespace) {
+            self.filter_input.pop();
+        }
+        while !self.filter_input.is_empty() && !self.filter_input.ends_with(char::is_whitespace) {
+            self.filter_input.pop();
+        }
     }
 
     /// Commit the filter edit buffer (Enter in filter mode).
@@ -720,8 +802,14 @@ impl App {
             },
             Action::NextGpu => self.next_gpu(),
             Action::PrevGpu => self.prev_gpu(),
-            Action::TickFaster => self.tick_ms = (self.tick_ms / 2).max(100),
-            Action::TickSlower => self.tick_ms = (self.tick_ms * 2).min(10_000),
+            Action::TickFaster => {
+                self.tick_ms = (self.tick_ms / 2).max(MIN_TICK_MS);
+                self.tick_explicit = true;
+            }
+            Action::TickSlower => {
+                self.tick_ms = (self.tick_ms * 2).min(10_000);
+                self.tick_explicit = true;
+            }
             Action::Digit(i) => {
                 if i < self.gpus.len() {
                     if self.focus == Focus::Gpus && self.selected == i {
@@ -794,12 +882,48 @@ mod tests {
         }
     }
 
+    /// Stand-in for the replay backend: rows arrive pre-enriched, in an
+    /// order the recording happened to have.
+    struct RecordedBackend;
+
+    impl GpuBackend for RecordedBackend {
+        fn name(&self) -> &'static str {
+            "recorded"
+        }
+        fn poll(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
+            Ok(vec![GpuSnapshot::default()])
+        }
+        fn driver_info(&self) -> Option<String> {
+            Some("recorded driver 1.2".into())
+        }
+        fn processes(&mut self) -> Vec<crate::backend::GpuProcess> {
+            vec![
+                crate::backend::GpuProcess {
+                    pid: 1,
+                    gpu_mem_bytes: 1,
+                    command: Some("idle".into()),
+                    user: Some("root".into()),
+                    ..Default::default()
+                },
+                crate::backend::GpuProcess {
+                    pid: 4242,
+                    gpu_mem_bytes: 2 << 30,
+                    command: Some("train.py".into()),
+                    user: Some("bob".into()),
+                    container: Some("docker:abcdef123456".into()),
+                    ..Default::default()
+                },
+            ]
+        }
+    }
+
     fn app_with(backend: Box<dyn GpuBackend>) -> App {
         App::new(
             backend,
             crate::theme::load(None, crate::theme::detect_color_mode()).unwrap(),
             AppOptions {
                 tick_ms: 1000,
+                tick_explicit: false,
                 history_len: 60,
                 no_splash: true,
                 graph_style: GraphStyle::Ascii,
@@ -956,6 +1080,105 @@ mod tests {
         app.apply(Action::KillTerm);
         assert!(app.pending_kill.is_some());
         assert!(app.input_mode == InputMode::Confirm);
+    }
+
+    /// `+` must never *raise* the interval: the key floor and the CLI floor
+    /// are one constant now.
+    #[test]
+    fn tick_faster_stops_at_the_shared_floor() {
+        let mut app = app_with(Box::new(LocalBackend));
+        app.tick_ms = MIN_TICK_MS;
+        app.apply(Action::TickFaster);
+        assert_eq!(app.tick_ms, MIN_TICK_MS);
+
+        app.tick_ms = MIN_TICK_MS * 2;
+        app.apply(Action::TickFaster);
+        assert_eq!(app.tick_ms, MIN_TICK_MS);
+        // An interactive change is the only thing that makes the rate sticky.
+        assert!(app.tick_explicit);
+    }
+
+    #[test]
+    fn tick_stays_non_sticky_until_a_key_changes_it() {
+        let app = app_with(Box::new(LocalBackend));
+        assert!(!app.tick_explicit);
+    }
+
+    /// A pre-flag state file is honoured once but is not a key press, so the
+    /// next clean quit demotes it and `config.toml` gets its say back.
+    #[test]
+    fn legacy_tick_state_is_honoured_once_then_demoted() {
+        let legacy: UiState = serde_json::from_str(
+            r#"{"folded":[],"sort_by":"Pid","sort_desc":false,"tick_ms":300}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.sticky_tick_ms(), Some(300));
+        assert!(!legacy.tick_chosen_by_key());
+
+        let chosen: UiState = serde_json::from_str(
+            r#"{"folded":[],"sort_by":"Pid","sort_desc":false,"tick_ms":300,"tick_ms_explicit":true}"#,
+        )
+        .unwrap();
+        assert_eq!(chosen.sticky_tick_ms(), Some(300));
+        assert!(chosen.tick_chosen_by_key());
+
+        // Recorded as config/CLI provenance: config.toml wins from now on.
+        let config_only: UiState = serde_json::from_str(
+            r#"{"folded":[],"sort_by":"Pid","sort_desc":false,"tick_ms":300,"tick_ms_explicit":false}"#,
+        )
+        .unwrap();
+        assert_eq!(config_only.sticky_tick_ms(), None);
+    }
+
+    #[test]
+    fn filter_delete_word_removes_one_word_and_its_blanks() {
+        let mut app = app_with(Box::new(LocalBackend));
+        app.filter_input = "python train.py  ".into();
+        app.filter_delete_word();
+        assert_eq!(app.filter_input, "python ");
+        app.filter_delete_word();
+        assert_eq!(app.filter_input, "");
+        // Empty buffer: a no-op, not a panic.
+        app.filter_delete_word();
+        assert_eq!(app.filter_input, "");
+    }
+
+    /// A backend that pre-enriches rows (replay) owns them: the container
+    /// must come off the record, never off this host's /proc.
+    #[test]
+    fn recorded_rows_win_over_local_resolution() {
+        let mut app = app_with(Box::new(RecordedBackend));
+        app.poll();
+        assert_eq!(app.all_procs.len(), 2);
+        assert_eq!(
+            app.all_procs[0].container.as_deref(),
+            Some("docker:abcdef123456")
+        );
+        assert_eq!(app.all_procs[0].command, "train.py");
+    }
+
+    /// One shape for `--log` and `--json`, attribution included, rows
+    /// unfiltered and in a stable order whatever the UI sort says.
+    #[test]
+    fn record_carries_attribution_and_stable_unfiltered_rows() {
+        let mut app = app_with(Box::new(RecordedBackend));
+        app.poll();
+        app.filter = "train".into();
+        app.sort_by = SortBy::Pid;
+        app.sort_desc = false;
+        app.rebuild_proc_view();
+        assert_eq!(app.procs.len(), 1, "filter should narrow the UI view");
+
+        let rec = app.record();
+        assert_eq!(rec["backend"], "recorded");
+        assert_eq!(rec["driver"], "recorded driver 1.2");
+        assert!(rec["ts_ms"].as_u64().unwrap() > 0);
+        assert_eq!(rec["gpus"].as_array().unwrap().len(), 1);
+        let procs = rec["processes"].as_array().unwrap();
+        assert_eq!(procs.len(), 2, "record must not inherit the UI filter");
+        // Descending gpu-mem regardless of the backend's emission order.
+        assert_eq!(procs[0]["pid"], 4242);
+        assert_eq!(procs[0]["container"], "docker:abcdef123456");
     }
 
     #[test]
