@@ -160,8 +160,19 @@ and the process table's `DEV` column keeps pointing at the right card. Killing a
 process stays disabled unless every active backend reports pids that belong to
 this machine.
 
-pdh is the exception — it enumerates every adapter regardless of vendor, so it
-is used only when no vendor backend probed at all (see Current limitations).
+pdh is the one backend that is not vendor-specific: DXGI enumerates every
+adapter regardless of vendor, so it would report an NVIDIA card nvml already
+covers in far more detail. It runs as a peer anyway, filtered — it is told which
+PCI vendors the vendor backends claimed and drops those adapters at probe time,
+so an NVIDIA + Intel Windows laptop lists the dGPU from nvml and the iGPU from
+pdh, each exactly once. When every adapter it can see is already claimed (an
+NVIDIA-only Windows box) it reports nothing and nvml stays the sole backend.
+
+The match is by PCI vendor, not per device: DXGI hands out an adapter LUID and
+NVML a UUID or PCI BDF, and neither maps to the other. The cost of the coarser
+match is that an adapter DXGI enumerates but its own vendor's backend does not
+report is hidden rather than shown twice — the same blind spot pdh had before,
+now narrowed to one vendor.
 
 Intel utilization is derived from per-client fdinfo engine counters (i915
 busy-ns, xe cycles) the same way nvtop does it; power comes from the hwmon
@@ -171,8 +182,9 @@ is reported as unknown rather than zero when neither answers. An Intel iGPU has
 no local memory region at all, so its system-RAM graphics pool is reported in
 the same GTT fields as an AMD APU's.
 
-PDH is the vendor-generic Windows fallback (Task Manager's counters) and reports
-utilization, memory, and split encode/decode.
+PDH is the vendor-generic Windows backend (Task Manager's counters) and reports
+utilization, memory, and split encode/decode for every adapter no vendor backend
+already claimed.
 
 Backend poll failures degrade gracefully: the last snapshot stays on screen with
 a header warning until polling recovers — a driver reset won't kill the monitor.
@@ -192,11 +204,11 @@ Planned depth: Apple temperature/power (SMC/IOReport), Windows AMD ADLX
 
 ## Current limitations
 
-- **Mixed vendors on Windows still show one vendor.** The pdh backend is
-  vendor-generic, so pairing it with nvml would list every NVIDIA card twice; it
-  is therefore skipped whenever a vendor backend probed. An NVIDIA + Intel
-  Windows laptop shows the NVIDIA cards only. Linux and macOS enumerate every
-  vendor.
+- **Windows vendor exclusion is per vendor, not per adapter.** pdh drops every
+  adapter whose PCI vendor a vendor backend claimed, because DXGI's LUID and
+  NVML's UUID/BDF do not map to each other. So a card DXGI enumerates that its
+  own vendor's backend does not report — an NVIDIA card nvml refuses while nvml
+  itself still initializes — is hidden rather than listed twice.
 - **Digit keys cover GPUs 0-9 only.** `--mock` accepts up to 16 and real rigs
   can exceed ten devices; GPUs 10 and above are reachable with `j`/`k` and the
   wheel, but cannot be selected by digit or folded.

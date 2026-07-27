@@ -1,23 +1,31 @@
 //! Windows vendor-generic backend: PDH "GPU Engine" / "GPU Adapter Memory"
 //! performance counters (what Task Manager uses) + DXGI for adapter names and
-//! VRAM totals. Covers AMD and Intel on Windows, where NVML doesn't apply;
-//! detect() tries NVML first, so NVIDIA rigs get the richer backend.
+//! VRAM totals. Covers AMD and Intel on Windows, where NVML doesn't apply.
+//! It runs alongside the vendor backends rather than instead of them —
+//! `detect()` passes the PCI vendors those already cover and the adapters from
+//! those vendors are dropped here, so an NVIDIA dGPU comes from NVML while the
+//! AMD or Intel iGPU beside it still shows up.
 //! Temperature/fan/clocks are not exposed by PDH — those need ADLX (TODO).
 
 use super::GpuBackend;
 
-pub fn probe() -> Option<Box<dyn GpuBackend>> {
+/// `claimed` lists PCI vendor ids another backend already reports devices for.
+/// `None` when nothing is left to report, so an NVIDIA-only rig keeps NVML as
+/// its sole backend instead of gaining an empty peer.
+pub fn probe(claimed: &[u16]) -> Option<Box<dyn GpuBackend>> {
     #[cfg(windows)]
-    if let Some(b) = win::probe() {
+    if let Some(b) = win::probe(claimed) {
         return Some(b);
     }
+    #[cfg(not(windows))]
+    let _ = claimed;
     None
 }
 
-/// PDH instance-name parsing and the iGPU heuristic. Pure functions, kept out
-/// of the `#[cfg(windows)]` module below so they compile and are testable on
-/// any host — a fixed-width LUID slice shipped broken precisely because nothing
-/// off Windows could exercise it.
+/// PDH instance-name parsing, the iGPU heuristic and the claimed-vendor filter.
+/// Pure functions, kept out of the `#[cfg(windows)]` module below so they
+/// compile and are testable on any host — a fixed-width LUID slice shipped
+/// broken precisely because nothing off Windows could exercise it.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod parse {
     /// "pid_1234_luid_0x..._0x..._phys_0_engtype_3d" -> luid key + engine type.
@@ -65,11 +73,48 @@ mod parse {
     pub fn is_integrated(dedicated_bytes: u64, shared_bytes: u64) -> bool {
         dedicated_bytes < 512 * 1024 * 1024 && shared_bytes >= dedicated_bytes.saturating_mul(4)
     }
+
+    /// Drop the adapters a vendor-specific backend already reports, keeping
+    /// DXGI's order for the rest.
+    ///
+    /// Matching is by PCI vendor id, not per device, because the two sides
+    /// share no identifier: `DXGI_ADAPTER_DESC1` carries `VendorId`/`DeviceId`
+    /// and an adapter LUID but no bus/device/function, while NVML identifies a
+    /// device by UUID or PCI BDF. "Is this exact adapter that exact NVML
+    /// device" is therefore unanswerable without dragging in SetupAPI or WMI to
+    /// map LUID to BDF.
+    ///
+    /// Failure mode of the coarser match: a card that DXGI enumerates but its
+    /// vendor's backend does not report — an NVIDIA card NVML refuses while
+    /// NVML still initializes for another — vanishes entirely rather than
+    /// appearing as a PDH row. That is the pre-existing blind spot (PDH used to
+    /// be skipped wholesale whenever NVML probed), now narrowed to one vendor,
+    /// and it fails toward hiding a card rather than listing the same GPU twice
+    /// under two backends, which is the worse and more confusing bug.
+    ///
+    /// `vendor_of` widens to `u32` because that is DXGI's field width; the ids
+    /// themselves are 16-bit, and comparing at full width keeps a nonsense
+    /// high half from matching a real vendor.
+    pub fn retain_unclaimed<T>(
+        adapters: Vec<T>,
+        claimed: &[u16],
+        vendor_of: impl Fn(&T) -> u32,
+    ) -> Vec<T> {
+        adapters
+            .into_iter()
+            .filter(|a| {
+                let vendor = vendor_of(a);
+                !claimed.iter().any(|&c| u32::from(c) == vendor)
+            })
+            .collect()
+    }
 }
 
 #[cfg(windows)]
 mod win {
-    use super::parse::{is_integrated, luid_and_engtype, luid_prefix, pid_prefix};
+    use super::parse::{
+        is_integrated, luid_and_engtype, luid_prefix, pid_prefix, retain_unclaimed,
+    };
     use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind, clamp_pct};
     use anyhow::Result;
     use std::collections::HashMap;
@@ -86,8 +131,12 @@ mod win {
 
     const MICROSOFT_BASIC_RENDER: u32 = 0x1414;
 
-    pub fn probe() -> Option<Box<dyn GpuBackend>> {
-        let adapters = enum_adapters();
+    pub fn probe(claimed: &[u16]) -> Option<Box<dyn GpuBackend>> {
+        // Filtered once, here, and never again: `poll` maps adapters onto
+        // snapshot indices positionally and its contract is that the order is
+        // stable across calls, so recomputing the set per poll would shift the
+        // device list under the user whenever a vendor backend blinked.
+        let adapters = retain_unclaimed(enum_adapters(), claimed, |a| a.vendor_id);
         if adapters.is_empty() {
             return None;
         }
@@ -129,6 +178,9 @@ mod win {
         /// counter instance names.
         luid_key: String,
         name: String,
+        /// DXGI's `VendorId` — the PCI vendor id, used once at probe to drop
+        /// adapters another backend already claims.
+        vendor_id: u32,
         vram_total: u64,
         integrated: bool,
     }
@@ -318,6 +370,7 @@ mod win {
                     desc.AdapterLuid.HighPart as u32, desc.AdapterLuid.LowPart
                 ),
                 name,
+                vendor_id: desc.VendorId,
                 vram_total: if integrated {
                     desc.SharedSystemMemory as u64
                 } else {
@@ -464,5 +517,63 @@ mod tests {
         assert!(!is_integrated(8 * GIB, 16 * GIB));
         // Small dedicated pool that shared does not dominate: discrete.
         assert!(!is_integrated(256 * MIB, 256 * MIB));
+    }
+
+    const NVIDIA: u16 = 0x10de;
+    const AMD: u16 = 0x1002;
+    const INTEL: u16 = 0x8086;
+
+    /// (name, DXGI VendorId) standing in for the `Adapter` the cfg-gated
+    /// module builds, which cannot be constructed off Windows.
+    fn rig() -> Vec<(&'static str, u32)> {
+        vec![
+            ("NVIDIA GeForce RTX 4090", 0x10de),
+            ("AMD Radeon 780M", 0x1002),
+            ("Intel UHD Graphics 770", 0x8086),
+        ]
+    }
+
+    fn kept(claimed: &[u16]) -> Vec<&'static str> {
+        retain_unclaimed(rig(), claimed, |a| a.1)
+            .into_iter()
+            .map(|a| a.0)
+            .collect()
+    }
+
+    #[test]
+    fn unclaimed_adapters_survive_in_dxgi_order() {
+        // Nothing else probed — the AMD/Intel-only Windows box. Unchanged.
+        assert_eq!(
+            kept(&[]),
+            [
+                "NVIDIA GeForce RTX 4090",
+                "AMD Radeon 780M",
+                "Intel UHD Graphics 770"
+            ]
+        );
+        // NVML probed: its card is NVML's, the rest stay in enumeration order.
+        assert_eq!(
+            kept(&[NVIDIA]),
+            ["AMD Radeon 780M", "Intel UHD Graphics 770"]
+        );
+        assert_eq!(kept(&[NVIDIA, INTEL]), ["AMD Radeon 780M"]);
+        // Repeated claims are idempotent, not double-counted.
+        assert_eq!(kept(&[NVIDIA, NVIDIA]), kept(&[NVIDIA]));
+    }
+
+    /// Every adapter claimed leaves nothing to report, which is what makes
+    /// `probe` return None and an NVIDIA-only rig keep NVML alone.
+    #[test]
+    fn a_fully_claimed_rig_keeps_no_adapters() {
+        assert!(kept(&[NVIDIA, AMD, INTEL]).is_empty());
+        assert!(retain_unclaimed(Vec::new(), &[], |a: &(&str, u32)| a.1).is_empty());
+    }
+
+    #[test]
+    fn vendor_ids_are_compared_at_dxgi_width() {
+        // Truncating VendorId to u16 would read this as an NVIDIA claim and
+        // silently drop the adapter.
+        let odd = vec![("weird adapter", 0x0001_10de_u32)];
+        assert_eq!(retain_unclaimed(odd, &[NVIDIA], |a| a.1).len(), 1);
     }
 }

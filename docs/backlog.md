@@ -3,67 +3,40 @@
 Known gaps, carried over from the review passes on `v0.8.1` (`fad7fe9`).
 Everything already fixed lives in `CHANGELOG.md`; only open work is listed here.
 
-Ordered by what is worth doing first rather than strictly by severity — item 1
-unblocks item 2 and cleans up three workarounds already in the tree.
+Roughly ordered by what is worth doing first. Nothing here is a correctness bug
+in the current build; the remainder is granularity, cost, coverage and polish.
 
 ---
 
-## 1. Devices have no identity — `App` keys everything by position
+## 1. Windows vendor exclusion is per vendor, not per adapter
 
-**Severity: medium.** `src/app.rs:250` (`folded: Vec<usize>`), `:317`
-(`HashSet<usize>`), and the `history` / `session` vectors zipped positionally in
-`poll`.
+**Severity: low.** `src/backend/mod.rs` `compose_with_generic`,
+`src/backend/windows.rs` `parse::retain_unclaimed`.
 
-Three fixes already in the tree work around this rather than solving it:
+The mixed-rig case is fixed: PDH is now a peer rather than a fallback, told at
+probe time which PCI vendors the vendor backends claimed, and drops those
+adapters. An NVIDIA + Intel Windows laptop lists both cards, each once.
 
-- `backend/apple.rs` sorts by IOKit registry entry id so the order is at least
-  deterministic — but an eGPU hotplug whose id sorts before an existing device
-  still shifts every later index.
-- `backend/nvidia.rs` pushes a placeholder for a device that errors mid-poll,
-  purely so indices do not shift.
-- The composite backend holds each child's slot count as a high-water mark, for
-  the same reason.
+What remains is the granularity of the match. DXGI gives an adapter LUID (plus
+`VendorId`/`DeviceId`); NVML gives a UUID or PCI BDF. `DXGI_ADAPTER_DESC1`
+carries no bus/device/function, so nothing links a specific adapter to a
+specific NVML device without SetupAPI or WMI to resolve LUID → BDF. The filter
+therefore works at vendor granularity, and an adapter DXGI enumerates that its
+own vendor's backend does not report is hidden rather than duplicated — the
+choice being deliberate, since a card listed twice under two backends is the
+worse bug.
 
-One bug remains outright: `folded` is persisted as bare indices, so adding or
-removing a card between runs folds the wrong GPU on the next start.
+**Fix, if it ever matters:** resolve LUID → PCI BDF via SetupAPI
+(`SPDRP_LOCATION_INFORMATION`) or `Win32_PnPEntity`, and match that against
+`Device::pci_info().bus_id`, falling back to the vendor filter when either side
+declines. Not worth the dependency until someone hits the blind spot.
 
-**Fix:** put an opaque stable device id on `GpuSnapshot` — registry entry id on
-macOS, PCI BDF on Linux, adapter LUID on Windows, NVML UUID — and key `history`,
-`session`, `folded` and `selected` on it instead of on position. Every backend
-already has the value in hand; each currently discards it. The three workarounds
-above can then be simplified or dropped.
+Unverifiable without Windows hardware: only `retain_unclaimed` and the
+composition wiring are covered by unit tests. That DXGI's `VendorId` matches
+`0x10DE`/`0x1002`/`0x8086` on a real adapter, and that NVML and DXGI agree on
+which cards exist, rest on inspection.
 
-## 2. Windows shows one vendor on a mixed rig
-
-**Severity: medium-low.** `src/backend/mod.rs` `detect()`,
-`src/backend/windows.rs`.
-
-Multi-vendor enumeration works on Linux and macOS: every backend that probes is
-composed. PDH is deliberately still a _fallback_, taken only when nothing else
-probed, because it is vendor-generic and would list every NVIDIA card a second
-time alongside NVML's richer entries.
-
-So a Windows box with an NVIDIA card beside an AMD or Intel iGPU shows only the
-NVIDIA one.
-
-**Fix:** filter PDH's adapter list by vendor id and exclude adapters another
-backend already claimed. Doing that reliably needs the device identity from
-item 1.
-
-## 3. Mouse input has no test coverage at all
-
-**Severity: low, but the largest untested surface.** No test in either suite
-emits an SGR mouse sequence.
-
-Unverified as a result: the process-pane hit test (which had an off-by-one that
-selected invisible rows), `card_rects` hit-testing, wheel routing, and the
-modal-dispatch guard that stops clicks moving the selection under an open
-dialog. All four were touched during the review and rest on inspection alone.
-
-**Fix:** the PTY harness can already write arbitrary bytes — `Tui::send` takes a
-`&str`, so an SGR sequence like `\x1b[<0;40;27M` is a one-line addition.
-
-## 4. The `/proc` sweep runs on the render thread
+## 2. The `/proc` sweep runs on the render thread
 
 **Severity: low.** `src/backend/linux.rs` `sweep_clients`, called from
 `App::poll` on the render loop.
@@ -77,12 +50,17 @@ the tick.
 **Fix:** move the sweep to a worker thread handing snapshots to the UI over a
 channel. Deliberately deferred — a structural change, not a bug fix.
 
-## 5. Remaining test gaps
+## 3. Remaining test gaps
 
 - **The kill path's signal branch.** Unit tests in `app.rs` cover every refusal
   and one successful signal against a spawned `sleep`, but no PTY test reaches
   it, because mock and replay now correctly refuse to signal. End-to-end
-  coverage needs a backend stub the test binary can inject.
+  coverage needs a backend stub the test binary can inject — which would also
+  close the one mouse case left untested, the kill dialog as a modal. The filter
+  prompt covers the identical `input_mode != Normal` condition meanwhile.
+- **Mouse kinds with no behaviour attached** — drag, middle and right button,
+  and moves all fall to the `_ => None` arm. Untested because untested is what
+  they are: there is nothing to assert yet.
 - **`--graphs block` / `ascii` rendering.** Only the invalid-config-value error
   path is covered (`tests/smoke.rs:223`). Both alternate renderers — where a
   colour-quantization bug lived — are unasserted.
@@ -95,7 +73,7 @@ channel. Deliberately deferred — a structural change, not a bug fix.
   `windows.rs` and `apple.rs` now have unit tests that run on any host. Closing
   it properly needs a self-hosted runner.
 
-## 6. NVIDIA temperature threshold unread
+## 4. NVIDIA temperature threshold unread
 
 **Severity: low.** `Device::temperature_threshold()` is available in
 `nvml-wrapper 0.12.1` (`device.rs:4048`) and would give the temperature meter a
@@ -107,14 +85,14 @@ the only temperature field ids in `nvml-wrapper-sys 0.9.1` are
 `NVML_FI_DEV_MEMORY_TEMP` (wired up) and the four `*_TLIMIT` margins, which are
 thresholds, not a hotspot reading.
 
-## 7. Waveform history cannot represent "unknown"
+## 5. Waveform history cannot represent "unknown"
 
 **Severity: low.** `src/app.rs`. `utilization_pct` is `Option`, but an
 unreadable sample is recorded as `0` in the history ring because a sparkline has
 no glyph for absent. The meter above the graph carries the distinction; the
 graph does not. Commented at the site.
 
-## 8. Device naming differs per backend
+## 6. Device naming differs per backend
 
 **Severity: low, cosmetic.** `nvidia.rs` gives the marketing name
 (`NVIDIA GeForce RTX 4090`), the Linux backends the pci.ids codename
@@ -125,7 +103,7 @@ brand. Fallbacks differ too: `NVIDIA GPU 0` (index) against
 **Fix:** settle on a convention — prefer the marketing name, fall back to the
 codename, always suffix the card or index — and apply it uniformly.
 
-## 9. `splash::build_path` truncates coordinates to `u8`
+## 7. `splash::build_path` truncates coordinates to `u8`
 
 **Severity: low.** `src/splash.rs:24` — `path.push((r as u8, c as u8, ch))`.
 `art.txt` is 5×33 so this is safe today, and the `u8` is imposed by
@@ -133,7 +111,7 @@ codename, always suffix the card or index — and apply it uniformly.
 scatter the cursor trail. Assert the art's dimensions rather than relying on it
 staying small.
 
-## 10. Residual YAGNI
+## 8. Residual YAGNI
 
 - `src/ui.rs:603` `draw_meter` takes 8 arguments behind
   `#[allow(clippy::too_many_arguments)]` with two production call sites.

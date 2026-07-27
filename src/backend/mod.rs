@@ -162,6 +162,13 @@ pub trait GpuBackend {
 
 const NO_BACKEND: &str = "no supported GPU backend found (run with --mock to demo the UI)";
 
+/// PCI vendor ids, as DXGI's `AdapterDesc1.VendorId` and lspci report them.
+/// Each vendor backend covers exactly one, which is what lets a vendor-generic
+/// backend be told which devices are already accounted for.
+const PCI_VENDOR_NVIDIA: u16 = 0x10de;
+const PCI_VENDOR_AMD: u16 = 0x1002;
+const PCI_VENDOR_INTEL: u16 = 0x8086;
+
 /// One child of a [`CompositeBackend`], plus the bookkeeping that keeps its
 /// devices on the same indices for the life of the session.
 struct Child {
@@ -333,28 +340,46 @@ pub fn detect(
         return Ok(Box::new(mock::MockBackend::new(n.clamp(1, 16))));
     }
     // The vendor backends are disjoint — each claims only its own PCI vendor's
-    // devices — so every one that probes adds cards no other one reports. The
-    // probes that find nothing are a failed `Nvml::init` and two readdirs of
-    // /sys/class/drm, which is why probing all of them is affordable.
-    let mut found: Vec<Box<dyn GpuBackend>> = [
-        nvidia::probe(),
-        amd::probe(),
-        intel::probe(),
-        apple::probe(),
+    // devices — so every one that probes adds cards no other one reports, and
+    // names the vendor it has covered. The probes that find nothing are a
+    // failed `Nvml::init` and two readdirs of /sys/class/drm, which is why
+    // probing all of them is affordable.
+    //
+    // Apple claims no PCI vendor: it is macOS-only and the only backend that
+    // consumes these claims is Windows-only, so the two never meet and naming
+    // a vendor here would assert a fact nothing checks.
+    let found: Vec<(Box<dyn GpuBackend>, &'static [u16])> = [
+        (nvidia::probe(), &[PCI_VENDOR_NVIDIA][..]),
+        (amd::probe(), &[PCI_VENDOR_AMD][..]),
+        (intel::probe(), &[PCI_VENDOR_INTEL][..]),
+        (apple::probe(), &[][..]),
     ]
     .into_iter()
-    .flatten()
+    .filter_map(|(backend, vendors)| backend.map(|b| (b, vendors)))
     .collect();
-    // PDH is vendor-generic (Task Manager's counters): it enumerates every
-    // adapter, including ones a vendor backend above already claimed, so it
-    // stays a fallback rather than a peer — otherwise an NVIDIA rig on Windows
-    // would list each card twice.
-    if found.is_empty()
-        && let Some(b) = windows::probe()
-    {
-        found.push(b);
-    }
-    compose(found)
+    compose_with_generic(found, windows::probe)
+}
+
+/// Compose the vendor backends that probed with a vendor-generic one, told
+/// which PCI vendors are already covered so it only contributes what is left.
+///
+/// Windows PDH (Task Manager's counters) enumerates every adapter DXGI can see,
+/// NVIDIA cards included, so composing it blind would list an NVIDIA card twice
+/// — once from NVML with clocks, power and temperature, once from PDH with
+/// utilization alone. Excluding it wholesale instead, as this used to, hid the
+/// AMD or Intel iGPU sitting beside an NVIDIA dGPU: the common Windows laptop.
+/// Filtering it by claimed vendor is what lets both show up exactly once.
+///
+/// The generic backend answers `None` when nothing survives its filter, so a
+/// single-vendor machine is not wrapped in a one-child composite.
+fn compose_with_generic(
+    found: Vec<(Box<dyn GpuBackend>, &'static [u16])>,
+    generic: impl FnOnce(&[u16]) -> Option<Box<dyn GpuBackend>>,
+) -> Result<Box<dyn GpuBackend>> {
+    let claimed: Vec<u16> = found.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+    let mut backends: Vec<Box<dyn GpuBackend>> = found.into_iter().map(|(b, _)| b).collect();
+    backends.extend(generic(&claimed));
+    compose(backends)
 }
 
 #[cfg(test)]
@@ -602,6 +627,108 @@ mod tests {
             ])
             .can_signal()
         );
+    }
+
+    /// Stands in for `windows::probe`: a vendor-generic backend that sees
+    /// every adapter on the rig and reports the ones no vendor backend
+    /// claimed, or nothing at all when that leaves it empty.
+    fn generic(
+        adapters: &[(&'static str, u16)],
+    ) -> impl FnOnce(&[u16]) -> Option<Box<dyn GpuBackend>> {
+        let adapters = adapters.to_vec();
+        move |claimed| {
+            let kept: Vec<&'static str> = adapters
+                .iter()
+                .filter(|(_, vendor)| !claimed.contains(vendor))
+                .map(|&(name, _)| name)
+                .collect();
+            (!kept.is_empty())
+                .then(|| Box::new(Stub::new("pdh", vec![Some(kept)])) as Box<dyn GpuBackend>)
+        }
+    }
+
+    fn vendor(
+        name: &'static str,
+        vendors: &'static [u16],
+    ) -> (Box<dyn GpuBackend>, &'static [u16]) {
+        (
+            Box::new(Stub::new(name, vec![Some(vec!["card"])])) as Box<dyn GpuBackend>,
+            vendors,
+        )
+    }
+
+    /// The mixed Windows rig: NVML covers the NVIDIA card, PDH contributes the
+    /// AMD iGPU NVML cannot see, and neither card is listed twice.
+    #[test]
+    fn a_generic_backend_contributes_only_unclaimed_vendors() {
+        let nv = (
+            Box::new(Stub::new("nvml", vec![Some(vec!["4090"])])) as Box<dyn GpuBackend>,
+            &[PCI_VENDOR_NVIDIA][..],
+        );
+        let mut b = compose_with_generic(
+            vec![nv],
+            generic(&[("4090", PCI_VENDOR_NVIDIA), ("780M", PCI_VENDOR_AMD)]),
+        )
+        .unwrap();
+        assert_eq!(b.name(), "multi");
+        assert_eq!(names(&b.poll().unwrap()), ["4090", "780M"]);
+    }
+
+    /// Nothing overlapping: every adapter the generic backend sees is new, and
+    /// claims from several vendor backends accumulate rather than the last one
+    /// winning.
+    #[test]
+    fn a_generic_backend_without_overlap_contributes_everything() {
+        let mut b = compose_with_generic(
+            vec![
+                vendor("nvml", &[PCI_VENDOR_NVIDIA]),
+                vendor("amdgpu", &[PCI_VENDOR_AMD]),
+            ],
+            generic(&[("UHD", PCI_VENDOR_INTEL), ("Arc", PCI_VENDOR_INTEL)]),
+        )
+        .unwrap();
+        assert_eq!(names(&b.poll().unwrap()), ["card", "card", "UHD", "Arc"]);
+
+        // And with both of those vendors claimed it would have kept neither.
+        let mut both = compose_with_generic(
+            vec![
+                vendor("nvml", &[PCI_VENDOR_NVIDIA]),
+                vendor("amdgpu", &[PCI_VENDOR_AMD]),
+            ],
+            generic(&[("4090", PCI_VENDOR_NVIDIA), ("780M", PCI_VENDOR_AMD)]),
+        )
+        .unwrap();
+        assert_eq!(names(&both.poll().unwrap()), ["card", "card"]);
+    }
+
+    /// The AMD/Intel-only Windows box: nothing else probes, so the generic
+    /// backend filters nothing and is handed back unwrapped, as before.
+    #[test]
+    fn a_generic_backend_alone_is_unfiltered_and_unwrapped() {
+        let mut b = compose_with_generic(
+            Vec::new(),
+            generic(&[("780M", PCI_VENDOR_AMD), ("UHD", PCI_VENDOR_INTEL)]),
+        )
+        .unwrap();
+        assert_eq!(b.name(), "pdh");
+        assert_eq!(names(&b.poll().unwrap()), ["780M", "UHD"]);
+    }
+
+    /// The NVIDIA-only Windows box: the generic backend has nothing left, so
+    /// NVML stays the whole backend rather than gaining an empty peer.
+    #[test]
+    fn a_fully_claimed_generic_backend_drops_out() {
+        let b = compose_with_generic(
+            vec![vendor("nvml", &[PCI_VENDOR_NVIDIA])],
+            generic(&[("4090", PCI_VENDOR_NVIDIA)]),
+        )
+        .unwrap();
+        assert_eq!(b.name(), "nvml");
+    }
+
+    #[test]
+    fn nothing_probing_at_all_is_still_an_error() {
+        assert!(compose_with_generic(Vec::new(), generic(&[])).is_err());
     }
 
     #[test]
