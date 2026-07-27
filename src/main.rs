@@ -188,13 +188,21 @@ fn snapshot(app: &mut App, json: bool, tick_ms: u64) -> Result<()> {
         return Ok(());
     }
 
+    // `n/a` rather than a fabricated 0: a metric the backend cannot read must
+    // not print as a confident "idle"/"empty" in a scriptable output either.
+    let mib = |b: Option<u64>| {
+        b.map(|b| format!("{}MiB", b / 1024 / 1024))
+            .unwrap_or_else(|| "n/a".to_string())
+    };
     for (i, g) in app.gpus.iter().enumerate() {
         let mut line = format!(
-            "{i}  {}  util {:>3.0}%  vram {}/{}MiB",
+            "{i}  {}  util {}  vram {}/{}",
             g.name,
-            g.utilization_pct,
-            g.vram_used_bytes / 1024 / 1024,
-            g.vram_total_bytes / 1024 / 1024,
+            g.utilization_pct
+                .map(|u| format!("{u:>3.0}%"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            mib(g.vram_used_bytes),
+            mib(g.vram_total_bytes),
         );
         if let Some(t) = g.temperature_c {
             line.push_str(&format!("  {t:.0}°C"));

@@ -250,6 +250,50 @@ fn renders_dashboard_and_process_table() {
     assert!(t.wait_exit().success());
 }
 
+/// A card whose backend publishes no utilization and no VRAM figures — a
+/// mainline-i915 iGPU, a PDH adapter with no matching counter instance, an
+/// Apple accelerator with no PerformanceStatistics. It must read `n/a`, never
+/// a full-width meter confidently claiming `GPU 0%` / `MEM 0M/0M`, and the
+/// session row must not appear at all rather than peak at `0°C  0W`.
+#[test]
+fn unreadable_metrics_render_as_na() {
+    let home = Sandbox::new();
+    let log = home.0.join("rec.jsonl");
+    std::fs::write(
+        &log,
+        concat!(
+            r#"{"ts_ms":1,"backend":"intel","driver":"i915","#,
+            r#""gpus":[{"name":"Unreadable GPU"}],"processes":[]}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    let log = log.to_string_lossy().into_owned();
+
+    let mut t = Tui::spawn_in(
+        &["--no-splash", "--tick-ms", "100", "--replay", &log],
+        &[],
+        home,
+    );
+    t.wait_for("the card", |s| s.contains("Unreadable GPU"));
+    let s = t.drain(Duration::from_millis(400));
+    assert!(
+        s.contains("GPU n/a"),
+        "utilization not marked unknown:\n{s}"
+    );
+    assert!(s.contains("MEM n/a"), "vram not marked unknown:\n{s}");
+    assert!(
+        meter_line(&s, "GPU ").is_none() && meter_line(&s, "MEM ").is_none(),
+        "an unreadable metric still drew a meter track:\n{s}"
+    );
+    assert!(
+        !s.contains("session"),
+        "session row rendered with nothing measured:\n{s}"
+    );
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
 #[test]
 fn fold_toggles_card() {
     let mut t = Tui::spawn(&[]);

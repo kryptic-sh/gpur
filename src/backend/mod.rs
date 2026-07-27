@@ -21,8 +21,9 @@ pub struct GpuSnapshot {
     pub name: String,
     /// Integrated (APU/iGPU) as opposed to a discrete card.
     pub integrated: bool,
-    /// Core utilization, 0..=100.
-    pub utilization_pct: f64,
+    /// Core utilization, 0..=100. `None` means the backend cannot read it —
+    /// never substitute 0, which renders as a confident "the GPU is idle".
+    pub utilization_pct: Option<f64>,
     /// Memory-controller busy %, distinct from VRAM fill level.
     pub mem_util_pct: Option<f64>,
     /// Video engine busy % — unified (VCN/media) engines report here.
@@ -33,8 +34,12 @@ pub struct GpuSnapshot {
     /// Active clock-throttle cause ("thermal", "power-limit", ...), when
     /// known or confidently derivable.
     pub throttle: Option<String>,
-    pub vram_used_bytes: u64,
-    pub vram_total_bytes: u64,
+    /// VRAM fill level. `None` on the several devices whose driver publishes
+    /// no figure at all (mainline i915, some APU configs, a PDH adapter with
+    /// no matching counter instance) — `0/0` there is indistinguishable from
+    /// a genuinely empty pool.
+    pub vram_used_bytes: Option<u64>,
+    pub vram_total_bytes: Option<u64>,
     pub temperature_c: Option<f64>,
     /// Hotspot / memory-junction temperatures where exposed (AMD temp2/3).
     pub temp_junction_c: Option<f64>,
@@ -65,11 +70,12 @@ pub struct GpuSnapshot {
 }
 
 impl GpuSnapshot {
-    pub fn vram_pct(&self) -> f64 {
-        if self.vram_total_bytes == 0 {
-            return 0.0;
-        }
-        self.vram_used_bytes as f64 / self.vram_total_bytes as f64 * 100.0
+    /// Fill level, or `None` when either figure is unknown or the pool has no
+    /// size. A meter drawn from a fabricated 0 here is the whole point of the
+    /// `Option`s above, so this refuses to invent one.
+    pub fn vram_pct(&self) -> Option<f64> {
+        let (used, total) = (self.vram_used_bytes?, self.vram_total_bytes?);
+        (total > 0).then(|| used as f64 / total as f64 * 100.0)
     }
 }
 

@@ -299,9 +299,9 @@ mod linux_impl {
         GpuSnapshot {
             name: d.name.clone(),
             integrated: d.integrated,
-            utilization_pct: clamp_pct(
-                read_u64(&d.dev.join("gpu_busy_percent")).unwrap_or(0) as f64
-            ),
+            // Absent on older ASICs and some APU configs; report the absence
+            // rather than a 0% that reads as an idle GPU.
+            utilization_pct: read_u64(&d.dev.join("gpu_busy_percent")).map(|v| clamp_pct(v as f64)),
             mem_util_pct: read_u64(&d.dev.join("mem_busy_percent")).map(|v| clamp_pct(v as f64)),
             // amdgpu names enc/dec rings separately, so report the split as
             // well as the total (which also carries the genuinely unified
@@ -310,8 +310,9 @@ mod linux_impl {
             enc_util_pct: media.and_then(|m| m.enc).map(clamp_pct),
             dec_util_pct: media.and_then(|m| m.dec).map(clamp_pct),
             throttle,
-            vram_used_bytes: read_u64(&d.dev.join("mem_info_vram_used")).unwrap_or(0),
-            vram_total_bytes: read_u64(&d.dev.join("mem_info_vram_total")).unwrap_or(0),
+            // Absent on some APUs, which have no VRAM carve-out to report.
+            vram_used_bytes: read_u64(&d.dev.join("mem_info_vram_used")),
+            vram_total_bytes: read_u64(&d.dev.join("mem_info_vram_total")),
             // temp1 = edge sensor (millidegrees); power in microwatts with
             // the APU fallback and cap-of-0 handling done above.
             temperature_c,
@@ -567,11 +568,11 @@ drm-engine-enc:\t9770559248 ns
             assert!(!gpus.is_empty());
             for g in &gpus {
                 println!(
-                    "{}: util={}% vram={}/{}MiB temp={:?}C power={:?}W fan={:?}% core={:?}MHz mem={:?}MHz video={:?} enc={:?} dec={:?} pcie_rx={:?} pcie_tx={:?}",
+                    "{}: util={:?}% vram={:?}/{:?}MiB temp={:?}C power={:?}W fan={:?}% core={:?}MHz mem={:?}MHz video={:?} enc={:?} dec={:?} pcie_rx={:?} pcie_tx={:?}",
                     g.name,
                     g.utilization_pct,
-                    g.vram_used_bytes / 1024 / 1024,
-                    g.vram_total_bytes / 1024 / 1024,
+                    g.vram_used_bytes.map(|b| b / 1024 / 1024),
+                    g.vram_total_bytes.map(|b| b / 1024 / 1024),
                     g.temperature_c,
                     g.power_w,
                     g.fan_pct,
@@ -583,7 +584,10 @@ drm-engine-enc:\t9770559248 ns
                     g.pcie_rx_kbs,
                     g.pcie_tx_kbs,
                 );
-                assert!(g.vram_total_bytes > 0, "vram total should be nonzero");
+                assert!(
+                    g.vram_total_bytes.is_some_and(|b| b > 0),
+                    "vram total should be a real figure, not absent or zero"
+                );
             }
             // Two samples so engine-ns deltas can produce utilization.
             let _ = backend.processes();

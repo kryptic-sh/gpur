@@ -260,21 +260,23 @@ mod win {
                 .adapters
                 .iter()
                 .map(|a| {
+                    // No counter instance matched this adapter's LUID: PDH
+                    // published nothing for it, which is not the same as the
+                    // adapter sitting idle with an empty pool.
                     let used = if a.integrated {
-                        shared.get(&a.luid_key).copied().unwrap_or(0)
+                        shared.get(&a.luid_key).copied()
                     } else {
-                        dedicated.get(&a.luid_key).copied().unwrap_or(0)
+                        dedicated.get(&a.luid_key).copied()
                     };
                     GpuSnapshot {
                         name: a.name.clone(),
                         integrated: a.integrated,
-                        utilization_pct: clamp_pct(
-                            util_by_luid.get(&a.luid_key).copied().unwrap_or(0.0),
-                        ),
+                        utilization_pct: util_by_luid.get(&a.luid_key).copied().map(clamp_pct),
                         enc_util_pct: enc_by_luid.get(&a.luid_key).copied().map(clamp_pct),
                         dec_util_pct: dec_by_luid.get(&a.luid_key).copied().map(clamp_pct),
                         vram_used_bytes: used,
-                        vram_total_bytes: a.vram_total,
+                        // DXGI always reports a total for a real adapter.
+                        vram_total_bytes: Some(a.vram_total),
                         ..Default::default()
                     }
                 })

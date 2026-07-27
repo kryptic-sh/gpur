@@ -92,6 +92,50 @@ fn replay_round_trips_a_log_recording() {
     );
 }
 
+/// A metric the backend could not read is `null` in the record and `n/a` in
+/// the plain line — never a 0 that a consumer reads as a real idle sample.
+#[test]
+fn absent_metrics_are_null_not_zero() {
+    let sb = Sandbox::new("nulls");
+    let log = sb.path().join("rec.jsonl");
+    std::fs::write(
+        &log,
+        "{\"gpus\":[{\"name\":\"Unreadable GPU\"}],\"processes\":[]}\n",
+    )
+    .unwrap();
+
+    let out = sb
+        .cmd()
+        .args(["--json", "--tick-ms", "100", "--replay"])
+        .arg(&log)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let g = &v["gpus"][0];
+    assert_eq!(g["name"], "Unreadable GPU");
+    for key in ["utilization_pct", "vram_used_bytes", "vram_total_bytes"] {
+        assert!(g[key].is_null(), "{key} should be null, got {}", g[key]);
+    }
+
+    let out = sb
+        .cmd()
+        .args(["--once", "--tick-ms", "100", "--replay"])
+        .arg(&log)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("util n/a"),
+        "plain output fabricated a util: {s}"
+    );
+    assert!(
+        s.contains("vram n/a/n/a"),
+        "plain output fabricated a vram pool: {s}"
+    );
+}
+
 #[test]
 fn unknown_flag_fails() {
     let sb = Sandbox::new("badflag");

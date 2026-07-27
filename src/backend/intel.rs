@@ -106,20 +106,21 @@ mod linux_impl {
                     GpuSnapshot {
                         name: d.name.clone(),
                         integrated: !d.discrete,
-                        utilization_pct: clamp_pct(sweep.util.remove(&i).unwrap_or(0.0)),
+                        // Summed over this device's DRM clients: no clients is
+                        // a measured 0%, not an unreadable counter.
+                        utilization_pct: Some(clamp_pct(sweep.util.remove(&i).unwrap_or(0.0))),
                         mem_util_pct: None,
                         video_util_pct: sweep.video_util.remove(&i).map(clamp_pct),
                         enc_util_pct: None,
                         dec_util_pct: None,
                         throttle: None,
-                        // Summed client-resident device-local memory; 0 on an
-                        // iGPU, which has no local region at all.
-                        vram_used_bytes: local_mem.remove(&i).unwrap_or(0),
-                        // 0 here still means "unknown" rather than "empty" —
-                        // finding 7 turns these into Options. Nothing is
-                        // fabricated: `vram_total` returns None when no driver
-                        // publishes a figure.
-                        vram_total_bytes: d.vram_total.unwrap_or(0),
+                        // Summed client-resident device-local memory. Only
+                        // meaningful where a local pool exists at all: an iGPU
+                        // has none, and reporting 0 there would claim an empty
+                        // VRAM pool that the device does not have.
+                        vram_used_bytes: d.vram_total.map(|_| local_mem.remove(&i).unwrap_or(0)),
+                        // None, never 0: mainline i915 publishes no total.
+                        vram_total_bytes: d.vram_total,
                         temperature_c: hwmon_u64(h, "temp1_input").map(|v| v as f64 / 1000.0),
                         power_w,
                         power_limit_w: hwmon_u64(h, "power1_max")

@@ -103,37 +103,64 @@ fn command_of(p: &sysinfo::Process) -> String {
     }
 }
 
-/// Running min/max/avg per GPU since launch (HWiNFO-style session stats).
-#[derive(Default, Clone, serde::Serialize)]
+/// Running mean over the samples that actually carried a value. A sensor the
+/// backend reports only intermittently must be averaged over its own readings,
+/// not diluted toward zero by every sample that had none.
+#[derive(Default)]
+struct Mean {
+    sum: f64,
+    n: u64,
+}
+
+impl Mean {
+    fn add(&mut self, v: f64) {
+        self.sum += v;
+        self.n += 1;
+    }
+
+    fn get(&self) -> Option<f64> {
+        (self.n > 0).then(|| self.sum / self.n as f64)
+    }
+}
+
+/// Fold `v` into a running peak that starts *unknown* rather than at 0.
+fn peak(slot: &mut Option<f64>, v: f64) {
+    *slot = Some(slot.map_or(v, |m| m.max(v)));
+}
+
+/// Running peak/mean per GPU since launch (HWiNFO-style session stats).
+/// Every reading is optional: a backend with no thermal or power sensor would
+/// otherwise report a peak of `0°C` / `0W`, which reads as a real measurement.
+#[derive(Default)]
 pub struct SessionStats {
-    pub max_util_pct: f64,
-    pub max_temp_c: f64,
-    pub max_power_w: f64,
-    sum_util: f64,
-    sum_power: f64,
-    samples: u64,
+    pub max_util_pct: Option<f64>,
+    pub max_temp_c: Option<f64>,
+    pub max_power_w: Option<f64>,
+    util: Mean,
+    power: Mean,
 }
 
 impl SessionStats {
-    fn add(&mut self, g: &GpuSnapshot) {
-        self.max_util_pct = self.max_util_pct.max(g.utilization_pct);
+    pub(crate) fn add(&mut self, g: &GpuSnapshot) {
+        if let Some(u) = g.utilization_pct {
+            peak(&mut self.max_util_pct, u);
+            self.util.add(u);
+        }
         if let Some(t) = g.temperature_c {
-            self.max_temp_c = self.max_temp_c.max(t);
+            peak(&mut self.max_temp_c, t);
         }
         if let Some(w) = g.power_w {
-            self.max_power_w = self.max_power_w.max(w);
+            peak(&mut self.max_power_w, w);
+            self.power.add(w);
         }
-        self.sum_util += g.utilization_pct;
-        self.sum_power += g.power_w.unwrap_or(0.0);
-        self.samples += 1;
     }
 
-    pub fn avg_util_pct(&self) -> f64 {
-        self.sum_util / self.samples.max(1) as f64
+    pub fn avg_util_pct(&self) -> Option<f64> {
+        self.util.get()
     }
 
-    pub fn avg_power_w(&self) -> f64 {
-        self.sum_power / self.samples.max(1) as f64
+    pub fn avg_power_w(&self) -> Option<f64> {
+        self.power.get()
     }
 }
 
@@ -490,8 +517,12 @@ impl App {
             sess.add(gpu);
         }
         for (gpu, hist) in self.gpus.iter().zip(&mut self.history) {
-            hist.util.push(gpu.utilization_pct.round() as u64);
-            hist.vram.push(gpu.vram_pct().round() as u64);
+            // A waveform has no glyph for "unknown", so an unreadable metric
+            // records as a flat 0 line. The meter above it says `n/a`, which
+            // is where the distinction is actually made.
+            hist.util
+                .push(gpu.utilization_pct.unwrap_or(0.0).round() as u64);
+            hist.vram.push(gpu.vram_pct().unwrap_or(0.0).round() as u64);
             hist.power.push(gpu.power_w.unwrap_or(0.0).round() as u64);
             hist.temp
                 .push(gpu.temperature_c.unwrap_or(0.0).round() as u64);
@@ -635,6 +666,16 @@ impl App {
             .collect();
 
         rows.sort_by(|a, b| {
+            // A row with no GPU% is unmeasured, not idle. Sink it below every
+            // measured row in BOTH directions — folding it in as 0.0 would
+            // hand it the top of an ascending sort.
+            if self.sort_by == SortBy::GpuUtil {
+                match (a.gpu_util_pct.is_none(), b.gpu_util_pct.is_none()) {
+                    (false, true) => return std::cmp::Ordering::Less,
+                    (true, false) => return std::cmp::Ordering::Greater,
+                    _ => {}
+                }
+            }
             let ord = match self.sort_by {
                 SortBy::GpuMem => a.gpu_mem_bytes.cmp(&b.gpu_mem_bytes),
                 SortBy::GpuUtil => a
@@ -1179,6 +1220,86 @@ mod tests {
         // Descending gpu-mem regardless of the backend's emission order.
         assert_eq!(procs[0]["pid"], 4242);
         assert_eq!(procs[0]["container"], "docker:abcdef123456");
+    }
+
+    /// Finding 11: a backend with no thermal or power sensor must leave those
+    /// peaks unknown rather than reporting a run that never got above 0°C/0W.
+    #[test]
+    fn session_peaks_stay_unknown_without_a_sensor() {
+        let mut s = SessionStats::default();
+        for util in [10.0, 90.0, 40.0] {
+            s.add(&GpuSnapshot {
+                utilization_pct: Some(util),
+                ..Default::default()
+            });
+        }
+        assert_eq!(s.max_util_pct, Some(90.0));
+        assert_eq!(s.avg_util_pct(), Some(140.0 / 3.0));
+        assert_eq!(s.max_temp_c, None);
+        assert_eq!(s.max_power_w, None);
+        assert_eq!(s.avg_power_w(), None);
+
+        // And a backend reporting nothing at all contributes nothing.
+        let mut blind = SessionStats::default();
+        blind.add(&GpuSnapshot::default());
+        assert_eq!(blind.max_util_pct, None);
+        assert_eq!(blind.avg_util_pct(), None);
+    }
+
+    /// An intermittently-reported sensor is averaged over its own readings;
+    /// folding the silent samples in as 0 diluted the average toward zero.
+    #[test]
+    fn averages_ignore_samples_with_no_reading() {
+        let mut s = SessionStats::default();
+        let sample = |w| GpuSnapshot {
+            utilization_pct: Some(50.0),
+            power_w: w,
+            ..Default::default()
+        };
+        s.add(&sample(Some(100.0)));
+        s.add(&sample(None));
+        s.add(&sample(None));
+        s.add(&sample(Some(200.0)));
+        assert_eq!(s.avg_power_w(), Some(150.0));
+        assert_eq!(s.max_power_w, Some(200.0));
+        // Utilization was present every time, so its own count is unaffected.
+        assert_eq!(s.avg_util_pct(), Some(50.0));
+    }
+
+    /// Finding 7 in the process table: "unmeasured" must not win an ascending
+    /// GPU% sort by masquerading as 0.
+    #[test]
+    fn rows_with_unknown_gpu_util_sink_in_both_directions() {
+        let mut app = app_with(Box::new(LocalBackend));
+        let row = |pid, util| ProcRow {
+            pid,
+            gpu_index: 0,
+            kind: ProcKind::Compute,
+            gpu_util_pct: util,
+            gpu_mem_bytes: 0,
+            user: "me".into(),
+            cpu_pct: 0.0,
+            host_mem_bytes: 0,
+            command: "x".into(),
+            container: None,
+        };
+        app.all_procs = vec![row(1, Some(10.0)), row(2, None), row(3, Some(90.0))];
+        app.sort_by = SortBy::GpuUtil;
+
+        app.sort_desc = true;
+        app.rebuild_proc_view();
+        assert_eq!(
+            app.procs.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![3, 1, 2]
+        );
+
+        app.sort_desc = false;
+        app.rebuild_proc_view();
+        assert_eq!(
+            app.procs.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![1, 3, 2],
+            "an unmeasured row sorted as if it were 0%"
+        );
     }
 
     #[test]

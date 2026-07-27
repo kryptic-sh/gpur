@@ -43,7 +43,7 @@ mod parse {
         io_class.is_some_and(|c| c.starts_with("AGX"))
     }
 
-    pub fn snapshot(a: &RawAccel, cpu_brand: Option<&str>, system_mem: u64) -> GpuSnapshot {
+    pub fn snapshot(a: &RawAccel, cpu_brand: Option<&str>, system_mem: Option<u64>) -> GpuSnapshot {
         let agx = is_agx(a.io_class.as_deref());
         let name = if agx {
             let soc = cpu_brand.unwrap_or("Apple GPU");
@@ -60,17 +60,18 @@ mod parse {
             .vram_total_mb
             .filter(|mb| *mb > 0)
             .map(|mb| (mb as u64).saturating_mul(1024 * 1024))
-            .unwrap_or(system_mem);
+            .or(system_mem);
 
         GpuSnapshot {
             name,
             integrated: agx,
-            // The `unwrap_or(0)` pair below is forced by the snapshot fields
-            // being non-Option: a missing property renders as a confident
-            // "idle"/"empty" rather than "unknown". `RawAccel` keeps the
-            // distinction so this collapses to a `?` once they become Option.
-            utilization_pct: clamp_pct(a.util_pct.unwrap_or(0) as f64),
-            vram_used_bytes: a.vram_used_bytes.unwrap_or(0).max(0) as u64,
+            // An accelerator that publishes no PerformanceStatistics (the
+            // paravirt one on CI, some Intel-Mac drivers) must read "unknown",
+            // not "idle" — `RawAccel` keeps the distinction and it survives
+            // to here untouched.
+            utilization_pct: a.util_pct.map(|v| clamp_pct(v as f64)),
+            // Negative byte counts are garbage, not 16 exabytes.
+            vram_used_bytes: a.vram_used_bytes.map(|v| v.max(0) as u64),
             vram_total_bytes: total,
             ..Default::default()
         }
@@ -173,14 +174,16 @@ mod macos {
                 sysctl_string("kern.osversion").as_deref(),
             ),
             cpu_brand: sysctl_string("machdep.cpu.brand_string"),
-            total_mem: sysctl_u64("hw.memsize").unwrap_or(0),
+            total_mem: sysctl_u64("hw.memsize").filter(|m| *m > 0),
         }))
     }
 
     struct AppleBackend {
         driver: Option<String>,
         cpu_brand: Option<String>,
-        total_mem: u64,
+        /// `hw.memsize`, the unified-memory pool. None if the sysctl fails —
+        /// an Apple Silicon card then reports no VRAM total rather than 0.
+        total_mem: Option<u64>,
     }
 
     impl GpuBackend for AppleBackend {
@@ -375,25 +378,25 @@ mod tests {
 
     #[test]
     fn apple_silicon_name_folds_in_soc_and_core_count() {
-        let s = snapshot(&agx(Some(38)), Some("Apple M2 Max"), 64 << 30);
+        let s = snapshot(&agx(Some(38)), Some("Apple M2 Max"), Some(64 << 30));
         assert_eq!(s.name, "Apple M2 Max (38-core GPU)");
         assert!(s.integrated);
         // Unified memory: no VRAM,totalMB, so system RAM is the pool.
-        assert_eq!(s.vram_total_bytes, 64 << 30);
+        assert_eq!(s.vram_total_bytes, Some(64 << 30));
 
         // Missing core count or SoC name must not fabricate either.
         assert_eq!(
-            snapshot(&agx(None), Some("Apple M1"), 0).name,
+            snapshot(&agx(None), Some("Apple M1"), None).name,
             "Apple M1".to_string()
         );
         assert_eq!(
-            snapshot(&agx(Some(8)), None, 0).name,
+            snapshot(&agx(Some(8)), None, None).name,
             "Apple GPU (8-core GPU)"
         );
-        assert_eq!(snapshot(&agx(None), None, 0).name, "Apple GPU");
+        assert_eq!(snapshot(&agx(None), None, None).name, "Apple GPU");
         // A zero/garbage core count is worse than saying nothing.
         assert_eq!(
-            snapshot(&agx(Some(0)), Some("Apple M1"), 0).name,
+            snapshot(&agx(Some(0)), Some("Apple M1"), None).name,
             "Apple M1"
         );
     }
@@ -406,19 +409,22 @@ mod tests {
             vram_used_bytes: Some(1024 * 1024 * 1024),
             ..Default::default()
         };
-        let s = snapshot(&a, Some("Intel Core i9"), 32 << 30);
+        let s = snapshot(&a, Some("Intel Core i9"), Some(32 << 30));
         assert_eq!(s.name, "AMDRadeonX6000");
         assert!(!s.integrated);
-        assert_eq!(s.vram_total_bytes, 8 << 30);
-        assert_eq!(s.vram_used_bytes, 1 << 30);
+        assert_eq!(s.vram_total_bytes, Some(8 << 30));
+        assert_eq!(s.vram_used_bytes, Some(1 << 30));
         // Nameless accelerator still renders as something.
-        assert_eq!(snapshot(&RawAccel::default(), None, 0).name, "GPU");
+        assert_eq!(snapshot(&RawAccel::default(), None, None).name, "GPU");
         // VRAM,totalMB of 0 is not a real pool; fall back to system RAM.
         let zero = RawAccel {
             vram_total_mb: Some(0),
             ..Default::default()
         };
-        assert_eq!(snapshot(&zero, None, 16 << 30).vram_total_bytes, 16 << 30);
+        assert_eq!(
+            snapshot(&zero, None, Some(16 << 30)).vram_total_bytes,
+            Some(16 << 30)
+        );
     }
 
     #[test]
@@ -428,15 +434,30 @@ mod tests {
             vram_used_bytes: Some(used),
             ..Default::default()
         };
-        assert_eq!(snapshot(&with(42, 0), None, 0).utilization_pct, 42.0);
-        assert_eq!(snapshot(&with(140, 0), None, 0).utilization_pct, 100.0);
-        assert_eq!(snapshot(&with(-5, 0), None, 0).utilization_pct, 0.0);
+        assert_eq!(
+            snapshot(&with(42, 0), None, None).utilization_pct,
+            Some(42.0)
+        );
+        assert_eq!(
+            snapshot(&with(140, 0), None, None).utilization_pct,
+            Some(100.0)
+        );
+        assert_eq!(
+            snapshot(&with(-5, 0), None, None).utilization_pct,
+            Some(0.0)
+        );
         // A negative byte count must not become 18 exabytes.
-        assert_eq!(snapshot(&with(0, -1), None, 0).vram_used_bytes, 0);
-        // Absent properties currently render as zero; see the note in snapshot.
-        let s = snapshot(&RawAccel::default(), None, 0);
-        assert_eq!(s.utilization_pct, 0.0);
-        assert_eq!(s.vram_used_bytes, 0);
+        assert_eq!(snapshot(&with(0, -1), None, None).vram_used_bytes, Some(0));
+    }
+
+    /// An accelerator with no PerformanceStatistics reports nothing, and
+    /// "nothing" must never arrive at the UI dressed up as an idle GPU.
+    #[test]
+    fn absent_properties_stay_absent() {
+        let s = snapshot(&RawAccel::default(), None, None);
+        assert_eq!(s.utilization_pct, None);
+        assert_eq!(s.vram_used_bytes, None);
+        assert_eq!(s.vram_total_bytes, None);
     }
 
     #[test]
@@ -445,7 +466,7 @@ mod tests {
             vram_total_mb: Some(i64::MAX),
             ..Default::default()
         };
-        assert_eq!(snapshot(&a, None, 0).vram_total_bytes, u64::MAX);
+        assert_eq!(snapshot(&a, None, None).vram_total_bytes, Some(u64::MAX));
     }
 
     fn kext(id: &str) -> RawAccel {

@@ -79,9 +79,7 @@ impl GpuBackend for NvmlBackend {
                 // is the one signal that can flag a Jetson iGPU; anything else,
                 // including an unsupported/missing query, stays discrete.
                 integrated: dev.bus_type().is_ok_and(|b| matches!(b, BusType::Fpci)),
-                utilization_pct: super::clamp_pct(
-                    util.as_ref().map(|u| u.gpu as f64).unwrap_or(0.0),
-                ),
+                utilization_pct: util.as_ref().map(|u| super::clamp_pct(u.gpu as f64)),
                 mem_util_pct: util.as_ref().map(|u| super::clamp_pct(u.memory as f64)),
                 video_util_pct: None,
                 enc_util_pct: dev
@@ -93,8 +91,8 @@ impl GpuBackend for NvmlBackend {
                     .ok()
                     .map(|u| super::clamp_pct(u.utilization as f64)),
                 throttle: dev.current_throttle_reasons().ok().and_then(throttle_label),
-                vram_used_bytes: memory.as_ref().map(|m| m.used).unwrap_or(0),
-                vram_total_bytes: memory.as_ref().map(|m| m.total).unwrap_or(0),
+                vram_used_bytes: memory.as_ref().map(|m| m.used),
+                vram_total_bytes: memory.as_ref().map(|m| m.total),
                 temperature_c: dev
                     .temperature(TemperatureSensor::Gpu)
                     .ok()

@@ -1,4 +1,4 @@
-use crate::app::{App, GraphStyle};
+use crate::app::{App, GraphStyle, SessionStats};
 use crate::backend::GpuSnapshot;
 use crate::theme::UiTheme;
 use ratatui::Frame;
@@ -266,15 +266,20 @@ fn draw_gpu_folded(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, 
     let mut line = vec![
         Span::styled(" ▸ ", marker),
         Span::styled(format!("{idx}·{}  ", gpu.name), t.title),
-        Span::styled(format!("GPU {:>3.0}%  ", gpu.utilization_pct), t.spark_util),
-        Span::styled(
-            format!(
-                "MEM {}/{}  ",
-                human_bytes(gpu.vram_used_bytes),
-                human_bytes(gpu.vram_total_bytes)
-            ),
-            Style::new().fg(t.accent),
-        ),
+        Span::styled(format!("GPU {}  ", pct_or_na(gpu.utilization_pct)), {
+            if gpu.utilization_pct.is_some() {
+                t.spark_util
+            } else {
+                t.dim
+            }
+        }),
+        Span::styled(format!("MEM {}  ", vram_value(gpu)), {
+            if gpu.vram_pct().is_some() {
+                Style::new().fg(t.accent)
+            } else {
+                t.dim
+            }
+        }),
     ];
     if let Some(c) = gpu.temperature_c {
         line.push(temp_span(t, c, "", "  "));
@@ -292,6 +297,27 @@ fn draw_gpu_folded(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, 
 // Readouts both the folded and the full card draw. Format and style live
 // here so they cannot drift apart; only the surrounding padding, which
 // differs between the two layouts, is caller-supplied.
+
+/// A percentage the backend could read, or `n/a`. Padded to the same four
+/// columns either way so a card whose sensor comes and goes doesn't jitter.
+fn pct_or_na(v: Option<f64>) -> String {
+    v.map(|p| format!("{p:>3.0}%"))
+        .unwrap_or_else(|| " n/a".to_string())
+}
+
+fn bytes_or_na(b: Option<u64>) -> String {
+    b.map(human_bytes).unwrap_or_else(|| "n/a".to_string())
+}
+
+/// The MEM readout. A device that publishes neither figure (mainline i915, a
+/// PDH adapter with no counter instance) says so once instead of claiming an
+/// empty `0M/0M` pool.
+fn vram_value(gpu: &GpuSnapshot) -> String {
+    match (gpu.vram_used_bytes, gpu.vram_total_bytes) {
+        (None, None) => "n/a".to_string(),
+        (used, total) => format!("{}/{}", bytes_or_na(used), bytes_or_na(total)),
+    }
+}
 
 /// Temperature, colored by the warn/crit thresholds.
 fn temp_span(t: &UiTheme, c: f64, lead: &str, trail: &str) -> Span<'static> {
@@ -414,8 +440,13 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         return;
     }
 
-    // Session-stats line only when the card has breathing room.
-    let show_session = inner.height >= 7 && app.session.get(idx).is_some();
+    // Session-stats line only when the card has breathing room AND at least
+    // one of its terms was ever measured — an all-empty row is noise.
+    let session_line = (inner.height >= 7)
+        .then(|| app.session.get(idx))
+        .flatten()
+        .and_then(|s| session_line(s, t));
+    let show_session = session_line.is_some();
     let [util_row, vram_row, spark_row, session_row, info_row] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -425,25 +456,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
     ])
     .areas(inner);
 
-    if show_session && let Some(sess) = app.session.get(idx) {
-        let line = Line::from(vec![
-            Span::styled(" session ", t.dim),
-            Span::styled(
-                format!(
-                    "peak {:>3.0}%  {:>3.0}°C  {:>3.0}W   ",
-                    sess.max_util_pct, sess.max_temp_c, sess.max_power_w
-                ),
-                Style::new().fg(t.fg),
-            ),
-            Span::styled(
-                format!(
-                    "avg {:>3.0}%  {:>3.0}W",
-                    sess.avg_util_pct(),
-                    sess.avg_power_w()
-                ),
-                t.dim,
-            ),
-        ]);
+    if let Some(line) = session_line {
         frame.render_widget(Paragraph::new(line), session_row);
     }
 
@@ -452,8 +465,8 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         frame,
         util_row,
         "GPU ",
-        gpu.utilization_pct / 100.0,
-        format!(" {:>3.0}% ", gpu.utilization_pct),
+        gpu.utilization_pct.map(|u| u / 100.0),
+        format!(" {} ", pct_or_na(gpu.utilization_pct)),
         &t.util_stops(),
         t,
         app.graph_style,
@@ -462,12 +475,8 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         frame,
         vram_row,
         "MEM ",
-        gpu.vram_pct() / 100.0,
-        format!(
-            " {}/{} ",
-            human_bytes(gpu.vram_used_bytes),
-            human_bytes(gpu.vram_total_bytes)
-        ),
+        gpu.vram_pct().map(|p| p / 100.0),
+        format!(" {} ", vram_value(gpu)),
         &t.vram_stops(),
         t,
         app.graph_style,
@@ -554,14 +563,49 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
     frame.render_widget(Paragraph::new(Line::from(info)), info_row);
 }
 
+/// `session peak 87%  72°C  310W   avg 42%  180W`, each term dropped when its
+/// sensor never reported. A card with no thermal sensor printing `0°C` is a
+/// fabricated reading, not a cold GPU. `None` when nothing was measured at all.
+fn session_line(s: &SessionStats, t: &UiTheme) -> Option<Line<'static>> {
+    let fmt = |v: Option<f64>, unit: &str| v.map(|v| format!("{v:>3.0}{unit}"));
+    let peak: Vec<String> = [
+        fmt(s.max_util_pct, "%"),
+        fmt(s.max_temp_c, "°C"),
+        fmt(s.max_power_w, "W"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let avg: Vec<String> = [fmt(s.avg_util_pct(), "%"), fmt(s.avg_power_w(), "W")]
+        .into_iter()
+        .flatten()
+        .collect();
+    if peak.is_empty() && avg.is_empty() {
+        return None;
+    }
+    let mut spans = vec![Span::styled(" session ", t.dim)];
+    if !peak.is_empty() {
+        spans.push(Span::styled(
+            format!("peak {}   ", peak.join("  ")),
+            Style::new().fg(t.fg),
+        ));
+    }
+    if !avg.is_empty() {
+        spans.push(Span::styled(format!("avg {}", avg.join("  ")), t.dim));
+    }
+    Some(Line::from(spans))
+}
+
 /// btop-style meter: `LABEL ■■■■■■■■····  42%` with a position gradient over
-/// the filled squares.
+/// the filled squares. `frac` of `None` is "the backend cannot read this" and
+/// draws no track at all — a full-width track of empty glyphs is exactly the
+/// confident "0%" this is meant to stop rendering.
 #[allow(clippy::too_many_arguments)]
 fn draw_meter(
     frame: &mut Frame,
     area: Rect,
     label: &str,
-    frac: f64,
+    frac: Option<f64>,
     value: String,
     stops: &[(u8, u8, u8)],
     t: &UiTheme,
@@ -570,6 +614,16 @@ fn draw_meter(
     if area.height == 0 {
         return;
     }
+    let Some(frac) = frac else {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(label.to_string(), Style::new().fg(t.fg)),
+                Span::styled(value.trim_start().to_string(), t.dim),
+            ])),
+            area,
+        );
+        return;
+    };
     let (fill, empty) = match style {
         GraphStyle::Ascii => ("=", "."),
         _ => ("■", "·"),
@@ -992,6 +1046,119 @@ fn kbs(v: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn theme() -> UiTheme {
+        crate::theme::load(None, crate::theme::detect_color_mode()).unwrap()
+    }
+
+    /// Render one meter into a single-row terminal and return what it drew.
+    fn meter(gpu: &GpuSnapshot) -> String {
+        let t = theme();
+        let mut term = Terminal::new(TestBackend::new(40, 1)).unwrap();
+        term.draw(|f| {
+            draw_meter(
+                f,
+                f.area(),
+                "GPU ",
+                gpu.utilization_pct.map(|u| u / 100.0),
+                format!(" {} ", pct_or_na(gpu.utilization_pct)),
+                &t.util_stops(),
+                &t,
+                GraphStyle::Ascii,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        (0..40)
+            .filter_map(|x| buf.cell((x, 0)).map(|c| c.symbol().to_string()))
+            .collect()
+    }
+
+    /// The core of finding 7: a backend that cannot read utilization must not
+    /// be rendered as one reading 0%.
+    #[test]
+    fn unknown_utilization_renders_na_not_a_zero_meter() {
+        let unknown = meter(&GpuSnapshot::default());
+        assert!(unknown.contains("n/a"), "{unknown:?}");
+        assert!(
+            !unknown.contains('=') && !unknown.contains('.'),
+            "unknown metric drew a meter track: {unknown:?}"
+        );
+
+        // A genuine 0% still gets its meter, and never says n/a.
+        let idle = meter(&GpuSnapshot {
+            utilization_pct: Some(0.0),
+            ..Default::default()
+        });
+        assert!(idle.contains('.'), "idle GPU lost its meter: {idle:?}");
+        assert!(idle.trim_end().ends_with("0%"), "{idle:?}");
+        assert!(!idle.contains("n/a"), "{idle:?}");
+    }
+
+    /// `0M/0M` is a claim about an empty pool; absence has to say so instead.
+    #[test]
+    fn vram_readout_distinguishes_absent_from_empty() {
+        assert_eq!(vram_value(&GpuSnapshot::default()), "n/a");
+        assert_eq!(
+            vram_value(&GpuSnapshot {
+                vram_used_bytes: Some(0),
+                vram_total_bytes: Some(0),
+                ..Default::default()
+            }),
+            "0M/0M"
+        );
+        // One half known is still worth printing.
+        assert_eq!(
+            vram_value(&GpuSnapshot {
+                vram_used_bytes: Some(2 << 30),
+                ..Default::default()
+            }),
+            "2.0G/n/a"
+        );
+    }
+
+    /// Finding 11: a sensorless card must omit the term, not peak at 0°C/0W.
+    #[test]
+    fn session_line_omits_sensors_that_never_reported() {
+        let t = theme();
+        let text = |s: &SessionStats| {
+            session_line(s, &t).map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+        };
+
+        // Utilization only — the Windows PDH / Apple / Intel iGPU case.
+        let mut util_only = SessionStats::default();
+        util_only.add(&GpuSnapshot {
+            utilization_pct: Some(80.0),
+            ..Default::default()
+        });
+        let line = text(&util_only).expect("a session line");
+        assert!(line.contains("peak  80%"), "{line:?}");
+        assert!(!line.contains("°C"), "fabricated a temperature: {line:?}");
+        assert!(!line.contains('W'), "fabricated a power draw: {line:?}");
+
+        // Nothing measured at all: no row rather than an empty one.
+        let mut nothing = SessionStats::default();
+        nothing.add(&GpuSnapshot::default());
+        assert_eq!(text(&nothing), None);
+
+        // Fully sensored cards keep every term.
+        let mut full = SessionStats::default();
+        full.add(&GpuSnapshot {
+            utilization_pct: Some(80.0),
+            temperature_c: Some(71.0),
+            power_w: Some(300.0),
+            ..Default::default()
+        });
+        let line = text(&full).expect("a session line");
+        assert!(line.contains("71°C") && line.contains("300W"), "{line:?}");
+    }
 
     #[test]
     fn proc_pane_height_never_overflows() {
