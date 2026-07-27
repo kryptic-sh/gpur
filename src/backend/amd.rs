@@ -14,12 +14,12 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use crate::backend::linux::{
-        self, FdClient, card_name, cards_with_vendor, first_dir, hwmon_u64, pdev_of, read_trim,
-        read_u64,
+        self, ClientSample, FdClient, SweepDevice, card_name, cards_with_vendor, first_dir,
+        hwmon_u64, pdev_of, read_trim, read_u64,
     };
     use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, clamp_pct};
     use anyhow::Result;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
@@ -133,90 +133,87 @@ mod linux_impl {
         }
 
         fn driver_info(&self) -> Option<String> {
-            kernel_release().map(|k| format!("amdgpu · kernel {k}"))
+            linux::driver_line("amdgpu")
         }
     }
 
     impl AmdBackend {
         /// Returns per-device media-engine utilization; refreshes last_procs.
         fn sweep_clients(&mut self) -> HashMap<usize, MediaUtil> {
-            let pdev_to_gpu: HashMap<&str, usize> = self
+            let devices: Vec<SweepDevice> = self
                 .devices
                 .iter()
-                .enumerate()
-                .filter_map(|(i, d)| d.pdev.as_deref().map(|p| (p, i)))
-                .collect();
-
-            // (pid, gpu) -> aggregated stats across that process's DRM clients.
-            let mut agg: HashMap<(u32, usize), (f64, u64, bool)> = HashMap::new();
-            let mut media: HashMap<usize, MediaUtil> = HashMap::new();
-            let mut seen_clients: HashSet<(u32, u64)> = HashSet::new();
-            let now = Instant::now();
-
-            for pid in linux::proc_pids() {
-                for client in linux::drm_clients(pid, "amdgpu") {
-                    let Some(&gpu) = client.pdev.as_deref().and_then(|p| pdev_to_gpu.get(p)) else {
-                        continue;
-                    };
-                    // The same client shows once per duplicated fd — count once.
-                    if !seen_clients.insert((pid, client.id)) {
-                        continue;
-                    }
-                    let engine_ns = client.total_engine_ns();
-                    let video_ns = client.engine_ns_where(is_video_engine);
-                    let enc_ns = client.engine_ns_where(is_enc_engine);
-                    let dec_ns = client.engine_ns_where(is_dec_engine);
-                    // ns_delta_util turns one (counter, counter) pair into two
-                    // percentages; run it twice over the same interval to also
-                    // get the enc/dec split amdgpu names separately.
-                    let prev = self.engine_state.get(&(pid, client.id)).copied();
-                    let (util, vutil) = linux::ns_delta_util(
-                        prev.map(|p| (p.total_ns, p.video_ns, p.at)).as_ref(),
-                        engine_ns,
-                        video_ns,
-                        now,
-                    );
-                    let (enc_util, dec_util) = linux::ns_delta_util(
-                        prev.map(|p| (p.enc_ns, p.dec_ns, p.at)).as_ref(),
-                        enc_ns,
-                        dec_ns,
-                        now,
-                    );
-                    self.engine_state.insert(
-                        (pid, client.id),
-                        EngineSample {
-                            total_ns: engine_ns,
-                            video_ns,
-                            enc_ns,
-                            dec_ns,
-                            at: now,
-                        },
-                    );
-
-                    let m = media.entry(gpu).or_default();
-                    m.video += vutil;
-                    if client.engine_ns.keys().any(|k| is_enc_engine(k)) {
-                        *m.enc.get_or_insert(0.0) += enc_util;
-                    }
-                    if client.engine_ns.keys().any(|k| is_dec_engine(k)) {
-                        *m.dec.get_or_insert(0.0) += dec_util;
-                    }
-                    let e = agg.entry((pid, gpu)).or_insert((0.0, 0, false));
-                    e.0 += util;
-                    e.1 += client_mem_bytes(&client, self.devices[gpu].integrated);
-                    e.2 |= client.engine_ns.get("gfx").copied().unwrap_or(0) > 0;
-                }
-            }
-
-            // Forget clients that vanished so the map doesn't grow forever.
-            self.engine_state.retain(|k, _| seen_clients.contains(k));
-
-            self.last_procs = agg
-                .into_iter()
-                .map(|((pid, gpu_index), (util, vram, graphics))| {
-                    linux::build_proc(pid, gpu_index, util, vram, graphics)
+                .map(|d| SweepDevice {
+                    pdev: d.pdev.clone(),
+                    driver: "amdgpu".into(),
                 })
                 .collect();
+            let integrated: Vec<bool> = self.devices.iter().map(|d| d.integrated).collect();
+
+            // The enc/dec split is the one thing the shared sweep can't carry:
+            // amdgpu is the only driver naming the two ring classes apart, and
+            // "never reported" has to stay distinguishable from 0%.
+            let mut media: HashMap<usize, MediaUtil> = HashMap::new();
+            let now = Instant::now();
+            let engine_state = &mut self.engine_state;
+
+            let mut sweep = linux::sweep_clients(&devices, |pid, gpu, client| {
+                let engine_ns = client.total_engine_ns();
+                let video_ns = client.engine_ns_where(is_video_engine);
+                let enc_ns = client.engine_ns_where(is_enc_engine);
+                let dec_ns = client.engine_ns_where(is_dec_engine);
+                // ns_delta_util turns one (counter, counter) pair into two
+                // percentages; run it twice over the same interval to also get
+                // the enc/dec split amdgpu names separately.
+                let prev = engine_state.get(&(pid, client.id)).copied();
+                let (util, vutil) = linux::ns_delta_util(
+                    prev.map(|p| (p.total_ns, p.video_ns, p.at)).as_ref(),
+                    engine_ns,
+                    video_ns,
+                    now,
+                );
+                let (enc_util, dec_util) = linux::ns_delta_util(
+                    prev.map(|p| (p.enc_ns, p.dec_ns, p.at)).as_ref(),
+                    enc_ns,
+                    dec_ns,
+                    now,
+                );
+                engine_state.insert(
+                    (pid, client.id),
+                    EngineSample {
+                        total_ns: engine_ns,
+                        video_ns,
+                        enc_ns,
+                        dec_ns,
+                        at: now,
+                    },
+                );
+
+                let m = media.entry(gpu).or_default();
+                if client.engine_ns.keys().any(|k| is_enc_engine(k)) {
+                    *m.enc.get_or_insert(0.0) += enc_util;
+                }
+                if client.engine_ns.keys().any(|k| is_dec_engine(k)) {
+                    *m.dec.get_or_insert(0.0) += dec_util;
+                }
+
+                ClientSample {
+                    util_pct: util,
+                    video_pct: vutil,
+                    mem_bytes: client_mem_bytes(client, integrated[gpu]),
+                    graphics: client.engine_ns.get("gfx").copied().unwrap_or(0) > 0,
+                }
+            });
+
+            // Forget clients that vanished so the map doesn't grow forever.
+            self.engine_state.retain(|k, _| sweep.seen.contains(k));
+            self.last_procs = std::mem::take(&mut sweep.procs);
+            // The sweep already totals video util per device; a device with no
+            // clients at all stays absent from both maps, which is what keeps
+            // video_util_pct None rather than a fabricated 0%.
+            for (gpu, video) in sweep.video_util {
+                media.entry(gpu).or_default().video = video;
+            }
             media
         }
     }
@@ -297,6 +294,7 @@ mod linux_impl {
             throttle_parts.push("power-limit");
         }
         let throttle = crate::backend::join_throttle(&throttle_parts);
+        let (pcie_gen, pcie_width, pcie_max_gen, pcie_max_width) = linux::pcie_link(&d.dev);
 
         GpuSnapshot {
             name: d.name.clone(),
@@ -332,14 +330,10 @@ mod linux_impl {
             clock_mhz: clock_mhz(h, "freq1_input", &d.dev.join("pp_dpm_sclk")),
             // APUs have no freq2_input; the active DPM level has it.
             mem_clock_mhz: clock_mhz(h, "freq2_input", &d.dev.join("pp_dpm_mclk")),
-            pcie_gen: read_trim(&d.dev.join("current_link_speed"))
-                .as_deref()
-                .and_then(gts_to_gen),
-            pcie_width: read_trim(&d.dev.join("current_link_width")).and_then(|w| w.parse().ok()),
-            pcie_max_gen: read_trim(&d.dev.join("max_link_speed"))
-                .as_deref()
-                .and_then(gts_to_gen),
-            pcie_max_width: read_trim(&d.dev.join("max_link_width")).and_then(|w| w.parse().ok()),
+            pcie_gen,
+            pcie_width,
+            pcie_max_gen,
+            pcie_max_width,
             // `pcie_bw` only exists where the ASIC implements
             // asic_funcs->get_pcie_usage (Vega10/20, Navi 1x/2x); the kernel
             // marks it unsupported on APUs and it is unimplemented on RDNA3.
@@ -361,20 +355,6 @@ mod linux_impl {
             .ok()
             .and_then(|b| b.get(2).copied())
             .is_some_and(|rev| rev >= 2)
-    }
-
-    /// "16.0 GT/s PCIe" -> Some(4). Gen1=2.5, doubling each gen after Gen2.
-    fn gts_to_gen(speed: &str) -> Option<u8> {
-        let gts: f64 = speed.split_whitespace().next()?.parse().ok()?;
-        Some(match gts {
-            s if s >= 128.0 => 7,
-            s if s >= 64.0 => 6,
-            s if s >= 32.0 => 5,
-            s if s >= 16.0 => 4,
-            s if s >= 8.0 => 3,
-            s if s >= 5.0 => 2,
-            _ => 1,
-        })
     }
 
     /// hwmon `freqN_input` (Hz) as MHz, falling back to the DPM table's active
@@ -457,22 +437,9 @@ mod linux_impl {
         Some(pwm as f64 / max as f64 * 100.0)
     }
 
-    fn kernel_release() -> Option<String> {
-        sysinfo::System::kernel_version()
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
-
-        #[test]
-        fn pcie_gen_from_gts_string() {
-            assert_eq!(gts_to_gen("2.5 GT/s PCIe"), Some(1));
-            assert_eq!(gts_to_gen("8.0 GT/s PCIe"), Some(3));
-            assert_eq!(gts_to_gen("16.0 GT/s PCIe"), Some(4));
-            assert_eq!(gts_to_gen("32.0 GT/s PCIe"), Some(5));
-            assert_eq!(gts_to_gen("garbage"), None);
-        }
 
         /// Fake sysfs root for one test, wiped so a rerun can't see stale files.
         fn fake_sysfs(name: &str) -> PathBuf {

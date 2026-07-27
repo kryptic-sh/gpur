@@ -152,7 +152,7 @@ mod linux_impl {
             let drivers: std::collections::BTreeSet<&str> =
                 self.devices.iter().map(|d| d.driver.as_str()).collect();
             let names = drivers.into_iter().collect::<Vec<_>>().join("+");
-            sysinfo::System::kernel_version().map(|k| format!("{names} · kernel {k}"))
+            linux::driver_line(&names)
         }
     }
 

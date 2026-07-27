@@ -153,35 +153,32 @@ where
         .enumerate()
         .filter_map(|(i, d)| d.pdev.as_deref().map(|p| (p, i)))
         .collect();
-    // One fdinfo pass per distinct driver, not per device.
-    let mut drivers: Vec<&str> = devices.iter().map(|d| d.driver.as_str()).collect();
-    drivers.sort_unstable();
-    drivers.dedup();
 
     let mut sweep = Sweep::default();
     // (pid, gpu) -> aggregated stats across that process's DRM clients.
     let mut agg: HashMap<(u32, usize), (f64, u64, bool)> = HashMap::new();
 
     for pid in proc_pids() {
-        for driver in &drivers {
-            for client in drm_clients(pid, driver) {
-                let Some(&gpu) = client.pdev.as_deref().and_then(|p| pdev_to_gpu.get(p)) else {
-                    continue;
-                };
-                if devices[gpu].driver != *driver {
-                    continue;
-                }
-                if !sweep.seen.insert((pid, client.id)) {
-                    continue;
-                }
-                let s = per_client(pid, gpu, &client);
-                *sweep.util.entry(gpu).or_default() += s.util_pct;
-                *sweep.video_util.entry(gpu).or_default() += s.video_pct;
-                let e = agg.entry((pid, gpu)).or_insert((0.0, 0, false));
-                e.0 += s.util_pct;
-                e.1 += s.mem_bytes;
-                e.2 |= s.graphics;
+        // One walk of each pid's fd dir, however many drivers are in play: the
+        // readdir+stat+read cost is per fd, so a pass per driver name paid it
+        // again for every fd the process holds.
+        for client in drm_clients(pid) {
+            let Some(&gpu) = client.pdev.as_deref().and_then(|p| pdev_to_gpu.get(p)) else {
+                continue;
+            };
+            if devices[gpu].driver != client.driver {
+                continue;
             }
+            if !sweep.seen.insert((pid, client.id)) {
+                continue;
+            }
+            let s = per_client(pid, gpu, &client);
+            *sweep.util.entry(gpu).or_default() += s.util_pct;
+            *sweep.video_util.entry(gpu).or_default() += s.video_pct;
+            let e = agg.entry((pid, gpu)).or_insert((0.0, 0, false));
+            e.0 += s.util_pct;
+            e.1 += s.mem_bytes;
+            e.2 |= s.graphics;
         }
     }
 
@@ -204,9 +201,10 @@ pub fn proc_pids() -> Vec<u32> {
         .unwrap_or_default()
 }
 
-/// Parse every DRM client of `pid` whose fdinfo names `driver`. Restricted
-/// to fds that stat as DRM character devices to avoid reading every fdinfo.
-pub fn drm_clients(pid: u32, driver: &str) -> Vec<FdClient> {
+/// Parse every DRM client of `pid`, whatever driver it belongs to — callers
+/// filter on `FdClient::driver`. Restricted to fds that stat as DRM character
+/// devices to avoid reading every fdinfo.
+pub fn drm_clients(pid: u32) -> Vec<FdClient> {
     let fd_dir = format!("/proc/{pid}/fd");
     let Ok(entries) = fs::read_dir(&fd_dir) else {
         return Vec::new(); // other users' processes without privileges
@@ -221,8 +219,7 @@ pub fn drm_clients(pid: u32, driver: &str) -> Vec<FdClient> {
             let fd = e.file_name();
             let info =
                 fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", fd.to_string_lossy())).ok()?;
-            let client = parse_fdinfo(&info)?;
-            (client.driver == driver).then_some(client)
+            parse_fdinfo(&info)
         })
         .collect()
 }
@@ -370,6 +367,13 @@ pub fn pcie_link(dev: &Path) -> (Option<u8>, Option<u32>, Option<u8>, Option<u32
         speed("max_link_speed"),
         width("max_link_width"),
     )
+}
+
+/// The UI's driver line, "amdgpu · kernel 6.12.1-arch1-1". Every Linux backend
+/// has the same answer to "which driver, which kernel"; only the prefix, which
+/// may name several drivers, differs. None when the kernel release is unreadable.
+pub fn driver_line(prefix: &str) -> Option<String> {
+    sysinfo::System::kernel_version().map(|k| format!("{prefix} · kernel {k}"))
 }
 
 /// Total system RAM in bytes. i915 and xe size their system memory region at
