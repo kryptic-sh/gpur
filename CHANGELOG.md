@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-27
+
 ### Fixed
 
 - **Devices now carry a stable identity.** `GpuSnapshot` gained an opaque
@@ -183,10 +185,20 @@ and this project adheres to
   it cannot shift another vendor's indices and detach its graphs, `poll()` fails
   only when every child fails, and `can_signal()` is the AND of the children.
   The composite reports `multi` and carries vendor identity in `driver_info()`.
-  PDH remains a fallback rather than a peer: it is vendor-generic and would list
-  NVIDIA cards a second time next to NVML.
 - Apple `driver_info()`, from the OS product and build plus the accelerators'
   kext bundle ids — macOS ships no per-GPU driver version.
+- **Mixed-vendor Windows rigs list every card.** The PDH backend was taken only
+  when no vendor backend probed, because DXGI enumerates every adapter and would
+  list an NVIDIA card twice next to NVML's richer entry — so an NVIDIA laptop
+  with an AMD or Intel iGPU showed only the discrete card. PDH is now a peer,
+  told at probe time which PCI vendors the vendor backends claimed, and drops
+  those adapters. Matching is by vendor rather than by adapter, since
+  `DXGI_ADAPTER_DESC1` carries no bus/device/function; an adapter its own
+  vendor's backend does not report is hidden rather than duplicated.
+- Mouse input has test coverage for the first time: clicks on process rows and
+  GPU cards, the pane border that must select nothing, wheel routing and its
+  clamps at both ends, and the guard that ignores mouse events under an open
+  modal. Each is proven load-bearing against a deliberate source mutation.
 
 ### Breaking
 
@@ -201,6 +213,11 @@ and this project adheres to
   `null`.
 - The `--once` VRAM pair carries its unit on each side (`vram 40MiB/24560MiB`)
   so `n/a` reads correctly in either position.
+- **`state.json` stores folded cards by device id** in a new `folded_devices`
+  key. The old positional `folded` list is dropped rather than migrated — which
+  GPU a bare index meant is precisely what was unknowable, so honouring it would
+  re-apply the bug being fixed. Folds must be set once more after upgrading;
+  sort order and poll rate carry over untouched.
 
 ## [0.8.1] - 2026-07-03
 
@@ -421,7 +438,8 @@ and this project adheres to
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.9.0
 [0.8.1]: https://github.com/kryptic-sh/gpur/releases/tag/v0.8.1
 [0.8.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.7.0
