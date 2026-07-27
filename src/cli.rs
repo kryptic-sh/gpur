@@ -6,7 +6,8 @@ use std::path::PathBuf;
     name = "gpur",
     version,
     about = "btop-style GPU monitor — NVIDIA, AMD, Intel, Apple Silicon",
-    before_help = include_str!("art.txt")
+    // Same banner the splash animates, not a second copy of the file.
+    before_help = crate::splash::ART
 )]
 pub struct Cli {
     /// Use deterministic mock GPUs (demo the UI without hardware).

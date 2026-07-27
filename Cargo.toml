@@ -59,5 +59,4 @@ signal-hook = "0.4"
 
 [dev-dependencies]
 portable-pty = "0.9"
-serde_json = "1.0.150"
 vt100 = "0.16"
