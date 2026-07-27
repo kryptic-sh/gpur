@@ -53,20 +53,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(Line::from(head)), header);
     }
 
-    // Process pane takes only what it needs, up to 30% of the body; the GPU
-    // cards get the rest. Careful on tiny terminals: the cap can drop below
-    // the 4-row minimum.
-    let want = app.procs.len() as u16 + 3;
-    let cap = ((body.height * 3) / 10).max(4);
-    let proc_height = want.min(cap).min(body.height);
+    let proc_height = proc_pane_height(body.height, app.procs.len());
     let [gpus_area, proc_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(proc_height)]).areas(body);
 
     app.gpus_rect = gpus_area;
     app.proc_rect = proc_area;
     // Braille packs 2 samples per column; retain enough history for the
-    // full frame width so wide terminals can fill their graphs.
-    app.history_need = app.history_need.max(area.width as usize * 2);
+    // full frame width so wide terminals can fill their graphs. Assigned,
+    // not accumulated — a high-water mark would pin every GPU's four
+    // history vectors to the widest size the terminal ever had.
+    app.history_need = area.width as usize * 2;
     draw_gpus(frame, gpus_area, app);
     draw_processes(frame, proc_area, app);
 
@@ -78,15 +75,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled("  (Enter apply · empty clears · Esc cancel)", app.theme.dim),
         ])
     } else {
-        Line::styled(
-            " q quit  ␣ pause  p procs  0-9 gpu  j/k move  s sort  r rev  / filter  x/X kill  +/- rate",
-            app.theme.dim,
-        )
+        Line::styled(crate::keys::footer_hints(), app.theme.dim)
     };
     frame.render_widget(Paragraph::new(footer_line), footer);
 
     draw_confirm_popup(frame, area, app);
     draw_help_popup(frame, area, app);
+}
+
+/// Rows the process pane gets: what it wants (one per row plus borders and
+/// header), capped at 30% of the body, and never the entire body — the GPU
+/// pane keeps a row so it can at least say "no GPUs reported".
+///
+/// Computed in `u32`: `body_height * 3` overflows `u16` above 21845 rows,
+/// which a programmatic PTY resize can reach.
+fn proc_pane_height(body_height: u16, procs: usize) -> u16 {
+    let want = (procs as u64).saturating_add(3).min(u16::MAX as u64) as u16;
+    let cap = ((body_height as u32 * 3) / 10).max(4).min(u16::MAX as u32) as u16;
+    want.min(cap).min(body_height.saturating_sub(1))
 }
 
 /// `?` overlay listing every binding; any key closes it.
@@ -122,6 +128,12 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Popup width for the widest of `lines`, plus borders and padding.
+fn popup_width(lines: &[&str]) -> u16 {
+    let widest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    widest.saturating_add(6).min(u16::MAX as usize) as u16
+}
+
 /// Centered y/N dialog for a pending kill.
 fn draw_confirm_popup(frame: &mut Frame, area: Rect, app: &App) {
     let Some(k) = &app.pending_kill else {
@@ -131,7 +143,9 @@ fn draw_confirm_popup(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     let sig = if k.force { "SIGKILL" } else { "SIGTERM" };
     let text = format!("send {sig} to {pid}?");
-    let popup = centered(area, text.len().max(cmd.len()) as u16 + 6, 5);
+    // Width in columns, not bytes: a non-ASCII command path would otherwise
+    // size the dialog several cells too wide per multibyte char.
+    let popup = centered(area, popup_width(&[&text, cmd]), 5);
     frame.render_widget(ratatui::widgets::Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -263,15 +277,37 @@ fn draw_gpu_folded(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, 
         ),
     ];
     if let Some(c) = gpu.temperature_c {
-        line.push(Span::styled(format!("{c:.0}°C  "), t.temp_style(c)));
+        line.push(temp_span(t, c, "", "  "));
     }
     if let Some(w) = gpu.power_w {
-        line.push(Span::styled(format!("{w:.0}W  "), t.spark_power));
+        // Folded rows have no room for the limit.
+        line.push(power_span(t, w, None, "", "  "));
     }
     if let Some(reason) = &gpu.throttle {
-        line.push(Span::styled(format!("⚠ {reason}  "), t.temp_crit));
+        line.push(throttle_span(t, reason));
     }
     frame.render_widget(Paragraph::new(Line::from(line)), area);
+}
+
+// Readouts both the folded and the full card draw. Format and style live
+// here so they cannot drift apart; only the surrounding padding, which
+// differs between the two layouts, is caller-supplied.
+
+/// Temperature, colored by the warn/crit thresholds.
+fn temp_span(t: &UiTheme, c: f64, lead: &str, trail: &str) -> Span<'static> {
+    Span::styled(format!("{lead}{c:.0}°C{trail}"), t.temp_style(c))
+}
+
+/// Power draw, with the board limit when the backend reports one.
+fn power_span(t: &UiTheme, w: f64, limit: Option<f64>, lead: &str, trail: &str) -> Span<'static> {
+    let limit = limit.map(|l| format!("/{l:.0}")).unwrap_or_default();
+    Span::styled(format!("{lead}{w:.0}{limit}W{trail}"), t.spark_power)
+}
+
+/// Throttle badge. The space after ⚠ is deliberate — terminals render the
+/// glyph at ambiguous width and it collides with the reason without it.
+fn throttle_span(t: &UiTheme, reason: &str) -> Span<'static> {
+    Span::styled(format!("⚠ {reason}  "), t.temp_crit)
 }
 
 /// btop-style border caption: `┐ text ┌` sitting in the border line.
@@ -445,7 +481,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
 
     let mut info: Vec<Span> = vec![Span::raw(" ")];
     if let Some(reason) = &gpu.throttle {
-        info.push(Span::styled(format!("⚠ {reason}  "), t.temp_crit));
+        info.push(throttle_span(t, reason));
     }
     if let Some(c) = gpu.temperature_c {
         if let Some(h) = hist {
@@ -454,7 +490,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
                 t.dim,
             ));
         }
-        info.push(Span::styled(format!(" {c:.0}°C "), t.temp_style(c)));
+        info.push(temp_span(t, c, " ", " "));
         if let Some(j) = gpu.temp_junction_c {
             info.push(Span::styled(format!("junc {j:.0}° "), t.dim));
         }
@@ -471,11 +507,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
                 t.dim,
             ));
         }
-        let limit = gpu
-            .power_limit_w
-            .map(|l| format!("/{l:.0}"))
-            .unwrap_or_default();
-        info.push(Span::styled(format!(" {w:.0}{limit}W  "), t.spark_power));
+        info.push(power_span(t, w, gpu.power_limit_w, " ", "  "));
     }
     if let (Some(rx), Some(tx)) = (gpu.pcie_rx_kbs, gpu.pcie_tx_kbs) {
         info.push(Span::styled(
@@ -573,7 +605,6 @@ fn mini_spark(data: &[u64], max: u64, style: GraphStyle) -> String {
     const CELLS: usize = 5;
     let max = max.max(1);
     if style != GraphStyle::Braille {
-        const ASCII_RAMP: [char; 5] = ['_', '.', '-', '+', '#'];
         return (0..CELLS)
             .map(|c| {
                 let v = windowed(data, c, CELLS).min(max);
@@ -616,6 +647,10 @@ fn human_bytes(b: u64) -> String {
 
 /// Lower-block glyphs by filled eighths (index 0..=8).
 const EIGHTHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Ascii coverage ramp indexed by fill level 0..=4. Level 0 is the baseline
+/// `_`, drawn by `mini_spark` so an all-zero sparkline still shows a line;
+/// the waveform skips empty cells outright and never indexes it.
+const ASCII_RAMP: [char; 5] = ['_', '.', '-', '+', '#'];
 const BRAILLE_BASE: u32 = 0x2800;
 /// Braille dot bit for (sub-column, dot-row counted from cell top).
 const DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
@@ -742,8 +777,9 @@ fn draw_waveform_cells(
     let cols = area.width as usize;
     // Sub-units per cell: 8 block eighths or 4 ascii coverage steps.
     let unit = if style == GraphStyle::Block { 8 } else { 4 };
-    const ASCII_RAMP: [char; 5] = [' ', '.', '-', '+', '#'];
-    let bg = crate::theme::rgb_of(Some(t.bg), (0x1e, 0x1e, 0x2e));
+    // Quantize like every other color: t.bg is already painted, so deriving
+    // from it would re-emit an Indexed color as 24-bit.
+    let bg = crate::theme::paint(t.mode, t.bg_rgb);
 
     waveform_halves(
         frame,
@@ -767,12 +803,7 @@ fn draw_waveform_cells(
                         } else {
                             // Complement trick: paint the empty lower part in
                             // the background color over a bar-colored cell.
-                            (
-                                EIGHTHS[8 - in_cell],
-                                Style::new()
-                                    .fg(ratatui::style::Color::Rgb(bg.0, bg.1, bg.2))
-                                    .bg(color),
-                            )
+                            (EIGHTHS[8 - in_cell], Style::new().fg(bg).bg(color))
                         }
                     }
                     _ => (ASCII_RAMP[in_cell], Style::new().fg(color)),
@@ -809,7 +840,9 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
     if !app.filter.is_empty() {
         counter = format!("filter:{} · {counter}", app.filter);
     }
-    if max_scroll > 0 {
+    // `visible == 0` (pane too short for a data row) would render an
+    // inverted `1-0/24` range.
+    if max_scroll > 0 && visible > 0 {
         counter.push_str(&format!(
             " · {}-{}/{total}",
             app.proc_scroll + 1,
@@ -831,13 +864,21 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
         .border_style(border);
 
     if app.procs.is_empty() {
+        // An active filter is the likelier cause than permissions, and
+        // sending the user to root when their own filter emptied the list
+        // is both wrong and (see the kill path) bad advice.
+        let msg = if app.filter.is_empty() {
+            "no GPU processes visible (need same-user or root for fdinfo)".to_string()
+        } else {
+            format!(
+                "no processes match filter '{}' ({} hidden; press / to change)",
+                app.filter,
+                app.all_procs.len()
+            )
+        };
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        frame.render_widget(
-            Paragraph::new("no GPU processes visible (need same-user or root for fdinfo)")
-                .style(t.dim),
-            inner,
-        );
+        frame.render_widget(Paragraph::new(msg).style(t.dim), inner);
         return;
     }
 
@@ -945,5 +986,66 @@ fn kbs(v: u64) -> String {
         format!("{:.1}MiB/s", v as f64 / 1024.0)
     } else {
         format!("{v}KiB/s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_pane_height_never_overflows() {
+        // body_height * 3 wraps u16 above 21845; PtySize::rows is a u16.
+        for h in [21845, 21846, 30000, u16::MAX] {
+            let p = proc_pane_height(h, 4);
+            assert!(p < h, "gpu pane starved at {h}");
+        }
+        // ...and neither does the row count.
+        assert!(proc_pane_height(100, usize::MAX) <= 30);
+    }
+
+    #[test]
+    fn proc_pane_height_leaves_the_gpu_pane_a_row() {
+        // Short terminals used to hand the whole body to the process pane,
+        // leaving draw_gpus a zero-height rect.
+        for h in 0..=8u16 {
+            let p = proc_pane_height(h, 50);
+            assert!(p <= h.saturating_sub(1), "no room left for GPUs at {h}");
+        }
+        assert_eq!(proc_pane_height(0, 3), 0);
+        assert_eq!(proc_pane_height(1, 3), 0);
+        assert_eq!(proc_pane_height(5, 3), 4);
+    }
+
+    #[test]
+    fn proc_pane_height_caps_at_30_percent() {
+        assert_eq!(proc_pane_height(100, 50), 30);
+        // Wants less than the cap: takes only what it needs.
+        assert_eq!(proc_pane_height(100, 5), 8);
+    }
+
+    #[test]
+    fn popup_width_counts_chars_not_bytes() {
+        // "kill 42?" plus a command path with multibyte chars.
+        let ascii = popup_width(&["send SIGTERM to 42?", "/usr/bin/renderer"]);
+        let wide = popup_width(&["send SIGTERM to 42?", "/usr/bin/rendérér"]);
+        assert_eq!(ascii, 19 + 6);
+        assert_eq!(wide, ascii, "accents must not widen the dialog");
+        assert_eq!(popup_width(&[]), 6); // borders only
+    }
+
+    #[test]
+    fn ascii_ramp_baseline_only_reachable_from_mini_spark() {
+        // The waveform indexes 1..=4 (it skips empty cells); mini_spark
+        // indexes 0..=4 and relies on the baseline glyph.
+        assert_eq!(ASCII_RAMP[0], '_');
+        assert_eq!(
+            mini_spark(&[0, 0, 0, 0, 0], 100, GraphStyle::Ascii),
+            "_____"
+        );
+        assert_eq!(
+            mini_spark(&[100, 100, 100, 100, 100], 100, GraphStyle::Ascii),
+            "#####"
+        );
     }
 }

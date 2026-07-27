@@ -76,6 +76,10 @@ pub struct UiTheme {
     pub mode: ColorMode,
     pub fg: RColor,
     pub bg: RColor,
+    /// Unquantized background, for callers that must build a derived color
+    /// (the block waveform paints the empty part of a cell in it) — going
+    /// through `bg` would leak an `Indexed` back out as truecolor.
+    pub bg_rgb: (u8, u8, u8),
     pub border: Style,
     pub border_selected: Style,
     pub title: Style,
@@ -137,6 +141,7 @@ impl UiTheme {
             } else {
                 p(rgb(bg))
             },
+            bg_rgb: rgb(bg),
             border: Style::new().fg(p(dim)),
             border_selected: Style::new().fg(p(accent)).add_modifier(Modifier::BOLD),
             title: Style::new().fg(p(accent)).add_modifier(Modifier::BOLD),
@@ -184,13 +189,6 @@ impl UiTheme {
     }
 }
 
-pub fn rgb_of(c: Option<RColor>, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
-    match c {
-        Some(RColor::Rgb(r, g, b)) => (r, g, b),
-        _ => fallback,
-    }
-}
-
 fn rgb(c: Color) -> (u8, u8, u8) {
     (c.r, c.g, c.b)
 }
@@ -198,6 +196,14 @@ fn rgb(c: Color) -> (u8, u8, u8) {
 /// Piecewise-linear interpolation through `stops` at `frac` in 0..=1,
 /// quantized for the active color mode.
 pub fn gradient(stops: &[(u8, u8, u8)], frac: f64, mode: ColorMode) -> RColor {
+    // Degenerate ramps have nothing to interpolate; without these the index
+    // math underflows (empty) or reads stops[1] out of bounds (single stop).
+    let Some(first) = stops.first() else {
+        return paint(mode, (0, 0, 0));
+    };
+    if stops.len() < 2 {
+        return paint(mode, *first);
+    }
     let seg = frac.clamp(0.0, 1.0) * (stops.len() - 1) as f64;
     let i = (seg.floor() as usize).min(stops.len().saturating_sub(2));
     let f = seg - i as f64;
@@ -233,6 +239,39 @@ mod tests {
         assert_eq!(
             gradient(&[(0, 0, 0), (255, 255, 255)], 0.5, ColorMode::Mono),
             RColor::Reset
+        );
+    }
+
+    #[test]
+    fn gradient_survives_degenerate_ramps() {
+        // Single stop: constant, no OOB read at stops[1].
+        for frac in [0.0, 0.5, 1.0] {
+            assert_eq!(
+                gradient(&[(1, 2, 3)], frac, ColorMode::Truecolor),
+                RColor::Rgb(1, 2, 3)
+            );
+        }
+        // Empty: no underflow on stops.len() - 1.
+        assert_eq!(
+            gradient(&[], 0.5, ColorMode::Truecolor),
+            RColor::Rgb(0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn gradient_interpolates_endpoints_and_midpoint() {
+        let stops = [(0, 0, 0), (100, 100, 100), (200, 200, 200)];
+        assert_eq!(
+            gradient(&stops, 0.0, ColorMode::Truecolor),
+            RColor::Rgb(0, 0, 0)
+        );
+        assert_eq!(
+            gradient(&stops, 0.5, ColorMode::Truecolor),
+            RColor::Rgb(100, 100, 100)
+        );
+        assert_eq!(
+            gradient(&stops, 1.0, ColorMode::Truecolor),
+            RColor::Rgb(200, 200, 200)
         );
     }
 }

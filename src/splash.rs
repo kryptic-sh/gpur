@@ -4,7 +4,7 @@ use crate::theme::UiTheme;
 use hjkl_splash::{CellKind, Layout, Rgb, Splash, default_trail_color};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Paragraph;
 
 pub const ART: &str = include_str!("art.txt");
@@ -47,8 +47,11 @@ pub fn render(
         let style = match cell.kind {
             CellKind::Art => Style::new().fg(theme.accent),
             CellKind::Trail { age } => {
+                // The trail colour comes from hjkl_splash as raw RGB, so it has
+                // to be quantized like every other colour or a 16/256-colour
+                // terminal gets a truecolor escape it can't render.
                 let Rgb(r, g, b) = default_trail_color(age);
-                Style::new().fg(Color::Rgb(r, g, b))
+                Style::new().fg(crate::theme::paint(theme.mode, (r, g, b)))
             }
             CellKind::Cursor => Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
         };
