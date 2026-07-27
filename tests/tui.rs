@@ -159,6 +159,20 @@ impl Tui {
         self.writer.flush().unwrap();
     }
 
+    /// One SGR mouse report over a 0-based screen cell. The encoding is
+    /// 1-based, `M` presses and `m` releases; the wheel buttons have no
+    /// release, exactly as a real terminal reports them.
+    fn mouse(&mut self, button: u8, col: u16, row: u16) {
+        self.send(&format!("\x1b[<{button};{};{}M", col + 1, row + 1));
+        if button < WHEEL_UP {
+            self.send(&format!("\x1b[<{button};{};{}m", col + 1, row + 1));
+        }
+    }
+
+    fn click(&mut self, col: u16, row: u16) {
+        self.mouse(MOUSE_LEFT, col, row);
+    }
+
     /// Like [`wait_for`], but over every byte the app has written — for
     /// states that flash by between frames and would be erased from the
     /// screen before the next poll of the emulator.
@@ -203,19 +217,160 @@ impl Tui {
     }
 }
 
-/// PIDs of the process-table data rows, in the order they are drawn. Card
-/// lines never qualify: their first cell is a label or a graph glyph.
+/// SGR button numbers, as the app's mouse capture reports them.
+const MOUSE_LEFT: u8 = 0;
+const WHEEL_UP: u8 = 64;
+const WHEEL_DOWN: u8 = 65;
+
+/// The pid a process-table data row leads with, if the line is one. Card
+/// lines never qualify: their first cell is a label or a graph glyph, and
+/// the PCIe readout's `MiB/s` sits behind one of those.
+fn row_pid(line: &str) -> Option<u32> {
+    let l = line.trim_start_matches('│').trim_start();
+    if !l.contains("MiB") {
+        return None;
+    }
+    l.split_whitespace().next()?.parse().ok()
+}
+
+/// PIDs of the process-table data rows, in the order they are drawn.
 fn proc_pids(screen: &str) -> Vec<u32> {
-    screen
-        .lines()
-        .filter_map(|l| {
-            let l = l.trim_start_matches('│').trim_start();
-            if !l.contains("MiB") {
-                return None;
-            }
-            l.split_whitespace().next()?.parse().ok()
-        })
+    screen.lines().filter_map(row_pid).collect()
+}
+
+/// Text of one screen row. Mouse coordinates are row numbers, so anything
+/// feeding them has to come off the cell grid rather than out of
+/// `screen_text().lines()`, whose split need not line up with it.
+fn row_text(screen: &vt100::Screen, row: u16) -> String {
+    (0..COLS)
+        .filter_map(|c| screen.cell(row, c).map(|cl| cl.contents()))
         .collect()
+}
+
+/// Screen row of the first line containing `needle`.
+fn row_y(t: &Tui, needle: &str) -> u16 {
+    let screen = t.parser.screen();
+    (0..ROWS)
+        .find(|&y| row_text(screen, y).contains(needle))
+        .unwrap_or_else(|| panic!("no row containing {needle:?}; screen:\n{}", t.screen_text()))
+}
+
+/// `(screen row, pid)` for every drawn process data row, top to bottom.
+fn proc_rows(t: &Tui) -> Vec<(u16, u32)> {
+    let screen = t.parser.screen();
+    (0..ROWS)
+        .filter_map(|y| Some((y, row_pid(&row_text(screen, y))?)))
+        .collect()
+}
+
+/// The process pane's window caption — `1-7/12` reads as `(1, 7, 12)`:
+/// first and last visible row over the total. `None` while everything fits,
+/// which is also when the caption is absent.
+fn proc_window(screen: &str) -> Option<(usize, usize, usize)> {
+    let line = screen.lines().find(|l| l.contains("┐processes┌"))?;
+    // The caption abuts the border glyphs (`1-7/12┌╮`), so trim to digits.
+    let num = |s: &str| s.trim_matches(|c: char| !c.is_ascii_digit()).parse().ok();
+    let tok = line
+        .split_whitespace()
+        .find(|w| w.contains('-') && w.contains('/'))?;
+    let (range, total) = tok.split_once('/')?;
+    let (first, last) = range.split_once('-')?;
+    Some((num(first)?, num(last)?, num(total)?))
+}
+
+/// Pid of the row carrying the selection background, when it is a process
+/// row that carries it.
+fn selected_pid(t: &mut Tui) -> Option<u32> {
+    row_pid(&highlighted_row(t)?)
+}
+
+/// `(screen row, pid)` for a full window of `rows` process rows. The pty
+/// hands a frame over in pieces, so a bare read can catch a table with rows
+/// still to be painted — and after a popup closes, a whole band of them.
+fn wait_for_procs(t: &mut Tui, rows: usize) -> Vec<(u16, u32)> {
+    t.wait_for("a full window of process rows", move |s| {
+        proc_pids(s).len() == rows
+    });
+    proc_rows(t)
+}
+
+/// Pid under the process cursor, once a row carries the cursor at all.
+fn wait_for_selection(t: &mut Tui) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(pid) = selected_pid(t) {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for a selected process row; screen:\n{}",
+            t.screen_text()
+        );
+        t.pump_once(Duration::from_millis(100));
+    }
+}
+
+/// Index of the GPU card drawn with the selected border (accent #cba6f7,
+/// against #6c7086 for every other card) — a direct read of the card
+/// selection, which no key or caption otherwise spells out.
+fn selected_card(t: &mut Tui) -> Option<usize> {
+    t.pump_once(Duration::from_millis(50));
+    let screen = t.parser.screen();
+    (0..ROWS).find_map(|y| {
+        let cell = screen.cell(y, 0)?;
+        if cell.contents() != "╭" || cell.fgcolor() != vt100::Color::Rgb(0xcb, 0xa6, 0xf7) {
+            return None;
+        }
+        // `╭┐3·Mock GPU 3┌───…` — the index leads the card title.
+        let text = row_text(screen, y);
+        let (before, _) = text.split_once("·Mock GPU")?;
+        before
+            .trim_start_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .ok()
+    })
+}
+
+/// Index of the selected GPU card, once one is drawn.
+fn wait_for_a_selected_card(t: &mut Tui) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(idx) = selected_card(t) {
+            return idx;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for a selected GPU card; screen:\n{}",
+            t.screen_text()
+        );
+        t.pump_once(Duration::from_millis(100));
+    }
+}
+
+/// Poll until the card selection lands on `idx`.
+fn wait_for_selected_card(t: &mut Tui, idx: usize, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while selected_card(t) != Some(idx) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}; screen:\n{}",
+            t.screen_text()
+        );
+        t.pump_once(Duration::from_millis(100));
+    }
+}
+
+/// Poll until the process cursor sits on `pid`.
+fn wait_for_selected_pid(t: &mut Tui, pid: u32, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while selected_pid(t) != Some(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}; screen:\n{}",
+            t.screen_text()
+        );
+        t.pump_once(Duration::from_millis(100));
+    }
 }
 
 /// A drawn meter line — `label`, a run of meter glyphs, then the value.
@@ -695,9 +850,7 @@ fn highlighted_row(t: &mut Tui) -> Option<String> {
             screen.cell(row, 2).map(|c| c.bgcolor()),
             Some(vt100::Color::Rgb(0x45, 0x47, 0x5a))
         ) {
-            let text: String = (0..COLS)
-                .filter_map(|c| screen.cell(row, c).map(|cl| cl.contents()))
-                .collect();
+            let text = row_text(screen, row);
             if !text.trim().is_empty() {
                 return Some(text);
             }
@@ -723,6 +876,285 @@ fn kill_is_refused_under_the_mock_backend() {
         !matches!(t.child.try_wait(), Ok(Some(_))),
         "app died after a refused kill"
     );
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+// --- mouse input ---------------------------------------------------------
+//
+// `--mock 4` publishes 12 process rows, of which 7 fit at 120x36: enough
+// for a click or a wheel to be able to scroll the window, which is what the
+// hit test's bounds are about. Every coordinate below is read off the
+// rendered screen so a layout change moves the tests with it.
+
+/// Ordering barrier for the negative assertions. `-` halves the poll rate,
+/// and the app reads its input in order, so once the new rate is on screen
+/// every byte sent before it has been consumed — where waiting a fixed
+/// delay would only be a guess. It touches nothing else the tests look at.
+fn tick_marker(t: &mut Tui, now_ms: u64) {
+    t.send("-");
+    let needle = format!("{now_ms}ms");
+    t.wait_for("the tick marker", move |s| s.contains(&needle));
+}
+
+/// A click selects the row under the cursor and focuses the pane. The last
+/// visible row is the interesting one: it borders the frame, which
+/// `Rect::contains` counts as part of the pane.
+#[test]
+fn click_selects_the_process_row_under_the_cursor() {
+    let mut t = Tui::spawn(&["--mock", "4"]);
+    t.wait_for("a windowed table", |s| proc_window(s) == Some((1, 7, 12)));
+    let rows = wait_for_procs(&mut t, 7);
+    let (last_y, last_pid) = *rows.last().expect("data rows");
+    t.click(10, last_y);
+    wait_for_selected_pid(&mut t, last_pid, "the clicked row to be selected");
+    assert_eq!(
+        wait_for_procs(&mut t, 7),
+        rows,
+        "clicking a visible row scrolled the table"
+    );
+    // Focus followed the click, so j walks the process list from there —
+    // one past the last visible row, which does scroll.
+    t.send("j");
+    t.wait_for("the cursor to move on within the process pane", |s| {
+        proc_window(s) == Some((2, 8, 12))
+    });
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+/// The pane's bottom border is inside `proc_rect` as far as
+/// `Rect::contains` is concerned. Clicking it must select nothing: bounded
+/// by the row count instead of by the window, it picked a row that was
+/// never on screen and scrolled the view to reveal it.
+#[test]
+fn click_on_the_process_pane_border_selects_nothing() {
+    let mut t = Tui::spawn(&["--mock", "4"]);
+    t.wait_for("a windowed table", |s| proc_window(s) == Some((1, 7, 12)));
+    let rows = wait_for_procs(&mut t, 7);
+    let before_sel = wait_for_selection(&mut t);
+    let border_y = rows.last().expect("data rows").0 + 1;
+    let border = row_text(t.parser.screen(), border_y);
+    assert!(
+        border.starts_with('╰'),
+        "row {border_y} is not the pane's bottom border: {border:?}"
+    );
+    t.click(10, border_y);
+    tick_marker(&mut t, 200);
+    assert_eq!(
+        proc_window(&t.screen_text()),
+        Some((1, 7, 12)),
+        "a click on the border scrolled the table"
+    );
+    assert_eq!(wait_for_procs(&mut t, 7), rows);
+    assert_eq!(
+        wait_for_selection(&mut t),
+        before_sel,
+        "a click on the border moved the cursor"
+    );
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+/// The wheel over the process pane walks the cursor, and clamps at both
+/// ends rather than wrapping or running off the list.
+#[test]
+fn wheel_over_the_process_pane_scrolls_and_clamps() {
+    let mut t = Tui::spawn(&["--mock", "4"]);
+    t.wait_for("a windowed table", |s| proc_window(s) == Some((1, 7, 12)));
+    let rows = wait_for_procs(&mut t, 7);
+    let (first_pid, second_pid) = (rows[0].1, rows[1].1);
+    let y = rows[3].0; // mid-pane: never a border, whatever the window shows
+
+    // The cursor starts on the first row, so wheel-up has nowhere to go.
+    t.mouse(WHEEL_UP, 10, y);
+    tick_marker(&mut t, 200);
+    assert_eq!(
+        wait_for_selection(&mut t),
+        first_pid,
+        "wheel-up at the top of the list moved the cursor"
+    );
+    assert_eq!(proc_window(&t.screen_text()), Some((1, 7, 12)));
+
+    t.mouse(WHEEL_DOWN, 10, y);
+    wait_for_selected_pid(&mut t, second_pid, "the cursor to step down a row");
+
+    // Far more notches than there are rows: the window must stop at the end.
+    for _ in 0..20 {
+        t.mouse(WHEEL_DOWN, 10, y);
+    }
+    t.wait_for("the last page of rows", |s| {
+        proc_window(s) == Some((6, 12, 12))
+    });
+    tick_marker(&mut t, 400);
+    assert_eq!(
+        proc_window(&t.screen_text()),
+        Some((6, 12, 12)),
+        "the wheel ran off the end of the list"
+    );
+    let last_pid = wait_for_procs(&mut t, 7).last().expect("data rows").1;
+    assert_eq!(
+        wait_for_selection(&mut t),
+        last_pid,
+        "the cursor is not on the final row"
+    );
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+/// Clicking a card selects that GPU: `card_rects` hit-testing.
+#[test]
+fn click_selects_the_gpu_card_under_the_cursor() {
+    let mut t = Tui::spawn(&[]);
+    t.wait_for("both cards", |s| {
+        s.contains("0·Mock GPU 0") && s.contains("1·Mock GPU 1")
+    });
+    wait_for_selected_card(&mut t, 0, "GPU 0 to be selected at startup");
+    // Two rows below the title: inside the second card, clear of its border.
+    let y = row_y(&t, "1·Mock GPU 1") + 2;
+    t.click(10, y);
+    wait_for_selected_card(&mut t, 1, "the clicked card to be selected");
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+/// The wheel over the GPU pane moves the card selection, dragging the card
+/// window with it, and clamps at both ends. Eight cards do not fit at
+/// 120x36, so the selection is visible in what the pane shows.
+#[test]
+fn wheel_over_the_gpu_pane_moves_the_card_selection() {
+    let mut t = Tui::spawn(&["--mock", "8"]);
+    t.wait_for("windowed cards", |s| {
+        s.contains("0·Mock GPU 0") && !s.contains("Mock GPU 7")
+    });
+    // Fixed for the whole test: the GPU pane keeps its rows while the cards
+    // inside it scroll.
+    let y = row_y(&t, "0·Mock GPU 0") + 2;
+
+    // GPU 0 is selected at startup, so wheel-up must not wrap to the last.
+    t.mouse(WHEEL_UP, 10, y);
+    tick_marker(&mut t, 200);
+    assert_eq!(
+        wait_for_a_selected_card(&mut t),
+        0,
+        "wheel-up wrapped past the first card"
+    );
+
+    for _ in 0..7 {
+        t.mouse(WHEEL_DOWN, 10, y);
+    }
+    wait_for_selected_card(&mut t, 7, "the wheel to reach the last card");
+    t.wait_for("the card window to follow the selection", |s| {
+        s.contains("7·Mock GPU 7") && !s.contains("Mock GPU 0")
+    });
+
+    for _ in 0..5 {
+        t.mouse(WHEEL_DOWN, 10, y);
+    }
+    tick_marker(&mut t, 400);
+    assert_eq!(
+        wait_for_a_selected_card(&mut t),
+        7,
+        "wheel-down past the last card did not clamp"
+    );
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+/// Modals own the screen: with the help overlay up, a click or a wheel must
+/// not move the process cursor, the card selection or the focus underneath
+/// it.
+#[test]
+fn mouse_is_ignored_while_the_help_overlay_is_open() {
+    let mut t = Tui::spawn(&["--mock", "4"]);
+    t.wait_for("a windowed table", |s| proc_window(s) == Some((1, 7, 12)));
+    let rows = wait_for_procs(&mut t, 7);
+    let before_sel = wait_for_selection(&mut t);
+    let proc_y = rows.last().expect("data rows").0;
+    let gpu_y = row_y(&t, "0·Mock GPU 0") + 2;
+
+    t.send("?");
+    t.wait_for("help overlay", |s| s.contains("any key closes"));
+    t.click(10, proc_y);
+    for _ in 0..3 {
+        t.mouse(WHEEL_DOWN, 10, proc_y);
+    }
+    t.mouse(WHEEL_DOWN, 10, gpu_y);
+    // Closing the overlay takes a key, and input is read in order: once the
+    // overlay is gone, every mouse event above has been read.
+    t.send("x");
+    t.wait_for("overlay gone", |s| !s.contains("any key closes"));
+
+    assert_eq!(
+        wait_for_procs(&mut t, 7),
+        rows,
+        "the table scrolled under the overlay"
+    );
+    assert_eq!(
+        wait_for_selection(&mut t),
+        before_sel,
+        "the process cursor moved under the overlay"
+    );
+    assert_eq!(
+        wait_for_a_selected_card(&mut t),
+        0,
+        "the card selection moved under the overlay"
+    );
+    // Focus is still on the GPU pane, so the digit folds the card it
+    // already selects. Had the click stolen the focus, the same key would
+    // merely take it back.
+    t.send("0");
+    t.wait_for("GPU 0 folded by the digit", |s| {
+        s.contains("▸ 0·Mock GPU 0")
+    });
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+/// The same guard covers every non-Normal input mode, not just the help
+/// overlay: the filter prompt must swallow mouse input too. (The kill
+/// dialog is the third such mode, but no mock or replay backend will open
+/// one — it is refused before the dialog exists.)
+#[test]
+fn mouse_is_ignored_while_the_filter_prompt_is_open() {
+    let mut t = Tui::spawn(&["--mock", "4"]);
+    t.wait_for("a windowed table", |s| proc_window(s) == Some((1, 7, 12)));
+    let rows = wait_for_procs(&mut t, 7);
+    let before_sel = wait_for_selection(&mut t);
+    let proc_y = rows.last().expect("data rows").0;
+    let gpu_y = row_y(&t, "0·Mock GPU 0") + 2;
+
+    t.send("/");
+    t.wait_for("filter prompt", |s| s.contains("filter>"));
+    t.click(10, proc_y);
+    for _ in 0..3 {
+        t.mouse(WHEEL_DOWN, 10, proc_y);
+    }
+    t.mouse(WHEEL_DOWN, 10, gpu_y);
+    // A typed character reaches the prompt only after the mouse bytes ahead
+    // of it have been read.
+    t.send("z");
+    t.wait_for("the typed character", |s| s.contains("filter> z"));
+
+    assert_eq!(
+        wait_for_procs(&mut t, 7),
+        rows,
+        "the table scrolled under the filter prompt"
+    );
+    assert_eq!(
+        wait_for_selection(&mut t),
+        before_sel,
+        "the process cursor moved under the filter prompt"
+    );
+    assert_eq!(
+        wait_for_a_selected_card(&mut t),
+        0,
+        "the card selection moved under the filter prompt"
+    );
+    // Back out with an empty filter — the table must come back untouched.
+    t.send("\x7f\r");
+    t.wait_for("prompt closed", |s| !s.contains("filter>"));
+    assert_eq!(wait_for_procs(&mut t, 7), rows);
     t.send("q");
     assert!(t.wait_exit().success());
 }
