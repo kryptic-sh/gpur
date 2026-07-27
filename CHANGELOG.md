@@ -78,6 +78,20 @@ and this project adheres to
   Mouse events also no longer move the selection underneath an open modal.
 - `--mock` silently rewrote out-of-range counts (0 → 1, 100 → 16); the count is
   now range-checked by clap and rejected with an error.
+- **CoreFoundation values are type-checked before use.** `dict_get_dict` and
+  `dict_get_i64` reinterpreted an arbitrary `CFTypeRef` as a concrete type
+  without checking, while `dict_get_string` alongside them already downcast
+  properly. Reading a `CFData` as a `CFNumber` is undefined behaviour and not
+  hypothetical: device-tree properties such as `gpu-core-count` are commonly
+  published as a raw little-endian blob.
+- The process pane could take the whole body, leaving the GPU pane zero rows and
+  rendering nothing at all on a short terminal, and the same expression
+  overflowed `u16` above 21845 rows and panicked.
+- `theme::gradient` panicked on ramps shorter than two stops; the scroll caption
+  rendered an inverted range when nothing was visible; the confirm popup was
+  sized in bytes rather than characters.
+- An empty process list blamed fdinfo permissions even when the user's own
+  filter was what emptied it.
 - The test suite read and overwrote the developer's real
   `~/.cache/gpur/state.json`, so `sort_cycle` and the smoke sort assertion
   failed on any machine whose cached sort differed from the default. Each test
@@ -108,7 +122,26 @@ and this project adheres to
   hands them the shared memory pool as their VRAM total. The PDH counter array
   is allocated as `Vec<PDH_FMT_COUNTERVALUE_ITEM_W>` so the buffer carries the
   item's alignment instead of relying on the allocator.
-- AMD device utilization is routed through `clamp_pct` like every other backend.
+- AMD device utilization is routed through `clamp_pct` like every other backend,
+  as is Windows per-process utilization — `proc_engine` sums engine instances of
+  the same type and could exceed 100%.
+- **Every colour is quantized.** The block waveform rebuilt its background as
+  24-bit RGB from a hardcoded fallback, and the splash trail emitted raw RGB, so
+  16- and 256-colour terminals — the ordinary tmux and ssh case — received
+  truecolor escapes they cannot render. Measured with `--graphs block`: 158
+  escapes under `TERM=xterm` before, none after.
+- Session peaks omit sensors that never reported instead of showing `0°C` /
+  `0W`, and the power average covers only the samples that carried a reading
+  rather than being diluted toward zero by those that did not.
+- Apple accelerators are ordered by registry entry id. IOKit does not document
+  its iteration order, and `App` keys history and session peaks positionally, so
+  a reorder silently swapped two GPUs' graphs mid-session.
+- Per-process memory on APUs counts GTT, where an APU puts almost everything —
+  the process rows previously contradicted the card's own GTT line. Verified
+  against a live VAAPI encode: the same pid goes from 58 MiB to 79 MiB.
+- The fdinfo sweep reads each pid's `fd` directory once rather than once per
+  driver name, roughly halving sweep cost on an i915+xe host (4.2 ms against
+  7.8-9.9 ms over 588 pids).
 
 ### Added
 
@@ -129,6 +162,32 @@ and this project adheres to
   card overflow scrolling, and the `GPUR_MOCK_FAIL` degradation and re-detect
   paths; four assertions that passed vacuously (dashboard, filter, row content,
   completions) are now pinned to behavior.
+- **All vendors are enumerated at once.** `detect()` returned the first backend
+  that probed, so a hybrid machine — an NVIDIA dGPU beside an AMD APU or Intel
+  iGPU — showed one vendor and hid the other. Successful probes are now
+  composed; a single-vendor machine is handed its backend unwrapped and behaves
+  identically. A child that fails or shrinks keeps its slots as placeholders so
+  it cannot shift another vendor's indices and detach its graphs, `poll()` fails
+  only when every child fails, and `can_signal()` is the AND of the children.
+  The composite reports `multi` and carries vendor identity in `driver_info()`.
+  PDH remains a fallback rather than a peer: it is vendor-generic and would list
+  NVIDIA cards a second time next to NVML.
+- Apple `driver_info()`, from the OS product and build plus the accelerators'
+  kext bundle ids — macOS ships no per-GPU driver version.
+
+### Breaking
+
+- **`utilization_pct`, `vram_used_bytes` and `vram_total_bytes` are now
+  optional** and serialize as `null` in `--json` and `--log` when the backend
+  genuinely cannot read them; `--once` prints `n/a` and the TUI draws no meter
+  track at all. They were the only headline metrics that substituted `0` for a
+  missing source, so an unreadable sensor rendered as a confident idle GPU —
+  which is why a truncated LUID key, an Arc card with no VRAM total, and an iGPU
+  whose memory regions never matched all looked like ordinary idle behaviour. A
+  measured zero is still `0`. Consumers that assumed a number must handle
+  `null`.
+- The `--once` VRAM pair carries its unit on each side (`vram 40MiB/24560MiB`)
+  so `n/a` reads correctly in either position.
 
 ## [0.8.1] - 2026-07-03
 
