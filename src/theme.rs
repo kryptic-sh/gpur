@@ -92,8 +92,11 @@ pub struct UiTheme {
     pub accent: RColor,
     /// Cursor-row highlight for lists.
     pub selection: Style,
-    util_stops: [(u8, u8, u8); 3],
-    vram_stops: [(u8, u8, u8); 2],
+    /// Gradient stops for utilization-like meters/graphs: cool at the start,
+    /// hot at the end. Raw RGB — quantization happens in `gradient`.
+    pub util_stops: [(u8, u8, u8); 3],
+    /// Gradient stops for memory meters/graphs.
+    pub vram_stops: [(u8, u8, u8); 2],
 }
 
 pub fn load(path: Option<&Path>, mode: ColorMode) -> anyhow::Result<UiTheme> {
@@ -165,17 +168,6 @@ impl UiTheme {
             util_stops: [green, yellow, red],
             vram_stops: [blue, accent],
         }
-    }
-
-    /// Gradient stops for utilization-like meters/graphs: cool at the start,
-    /// hot at the end. Raw RGB — quantization happens in `gradient`.
-    pub fn util_stops(&self) -> [(u8, u8, u8); 3] {
-        self.util_stops
-    }
-
-    /// Gradient stops for memory meters/graphs.
-    pub fn vram_stops(&self) -> [(u8, u8, u8); 2] {
-        self.vram_stops
     }
 
     pub fn temp_style(&self, c: f64) -> Style {

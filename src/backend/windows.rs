@@ -145,9 +145,6 @@ mod win {
         last_procs: Vec<GpuProcess>,
     }
 
-    // PDH handles are plain opaque values owned by this struct.
-    unsafe impl Send for PdhBackend {}
-
     impl Drop for PdhBackend {
         fn drop(&mut self) {
             unsafe { PdhCloseQuery(self.query) };
@@ -245,7 +242,7 @@ mod win {
                     pid: key.0,
                     gpu_index,
                     kind,
-                    gpu_util_pct: util_by_proc.get(&key).copied(),
+                    gpu_util_pct: util_by_proc.get(&key).copied().map(clamp_pct),
                     gpu_mem_bytes: mem,
                     ..Default::default()
                 };

@@ -10,8 +10,6 @@ mod nvidia;
 mod replay;
 mod windows;
 
-pub use mock::MockBackend;
-
 use anyhow::Result;
 
 /// One sample of one GPU at one instant.
@@ -154,7 +152,148 @@ pub trait GpuBackend {
     }
 }
 
-/// Pick the first backend that reports usable devices on this machine.
+const NO_BACKEND: &str = "no supported GPU backend found (run with --mock to demo the UI)";
+
+/// One child of a [`CompositeBackend`], plus the bookkeeping that keeps its
+/// devices on the same indices for the life of the session.
+struct Child {
+    backend: Box<dyn GpuBackend>,
+    /// Slots this child owns in the concatenated snapshot vec — a high-water
+    /// mark, never shrunk. `App` keys history, session peaks and folded state
+    /// positionally, so a child that fails or returns short for one tick must
+    /// not slide every later child's devices onto another card's graphs.
+    /// Growth (a hotplugged device) does shift the children after it, once —
+    /// nothing positional can avoid that without device identity.
+    slots: usize,
+    /// Device names from the last poll that saw each slot, to label the
+    /// placeholders that hold the slots open.
+    names: Vec<String>,
+}
+
+/// Every backend that reported devices, polled as one. Mixed-vendor rigs — an
+/// NVIDIA dGPU beside an AMD APU, an Intel iGPU beside an AMD dGPU — are the
+/// common laptop and workstation case, and stopping at the first probe hid
+/// whichever vendor came later in the chain.
+struct CompositeBackend {
+    children: Vec<Child>,
+}
+
+impl CompositeBackend {
+    fn new(backends: Vec<Box<dyn GpuBackend>>) -> Self {
+        Self {
+            children: backends
+                .into_iter()
+                .map(|backend| Child {
+                    backend,
+                    slots: 0,
+                    names: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl GpuBackend for CompositeBackend {
+    /// Fixed: the child set is only known at runtime and this returns
+    /// `&'static str`. The vendors show up in `driver_info`, which the header
+    /// prints right after the name, and in each card's device name.
+    fn name(&self) -> &'static str {
+        "multi"
+    }
+
+    fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        for c in &mut self.children {
+            let mut snaps = match c.backend.poll() {
+                Ok(s) => s,
+                // One vendor's driver going away must not take the others'
+                // cards off screen with it, so a failed child degrades to
+                // placeholders instead of aborting the whole poll.
+                Err(e) => {
+                    errors.push(format!("{}: {e:#}", c.backend.name()));
+                    Vec::new()
+                }
+            };
+            c.slots = c.slots.max(snaps.len());
+            c.names.resize(c.slots, String::new());
+            for (slot, snap) in c.names.iter_mut().zip(&snaps) {
+                snap.name.clone_into(slot);
+            }
+            for i in snaps.len()..c.slots {
+                let label = match c.names.get(i) {
+                    Some(n) if !n.is_empty() => n.clone(),
+                    _ => format!("{} GPU {i}", c.backend.name()),
+                };
+                snaps.push(GpuSnapshot {
+                    name: format!("{label} (unavailable)"),
+                    ..Default::default()
+                });
+            }
+            out.append(&mut snaps);
+        }
+        if !errors.is_empty() && errors.len() == self.children.len() {
+            anyhow::bail!("{}", errors.join("; "));
+        }
+        Ok(out)
+    }
+
+    fn processes(&mut self) -> Vec<GpuProcess> {
+        let mut out = Vec::new();
+        let mut base = 0;
+        for c in &mut self.children {
+            for mut p in c.backend.processes() {
+                // A row outside its own child's span would be drawn against
+                // another vendor's card. Dropping it loses one row; keeping it
+                // misattributes it.
+                if p.gpu_index >= c.slots {
+                    continue;
+                }
+                p.gpu_index += base;
+                out.push(p);
+            }
+            base += c.slots;
+        }
+        out
+    }
+
+    /// Names each child, since `name()` cannot. The vendor backends' own lines
+    /// already lead with their module name ("amdgpu · kernel 7.1"), so only
+    /// prefix the ones that don't.
+    fn driver_info(&self) -> Option<String> {
+        let parts: Vec<String> = self
+            .children
+            .iter()
+            .map(|c| {
+                let name = c.backend.name();
+                match c.backend.driver_info() {
+                    Some(d) if d.contains(name) => d,
+                    Some(d) => format!("{name} {d}"),
+                    None => name.to_string(),
+                }
+            })
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// One un-signalable child disables the kill path for every row: the
+    /// process table is a single list and a fabricated pid in it is exactly
+    /// the hazard `can_signal` exists to stop.
+    fn can_signal(&self) -> bool {
+        self.children.iter().all(|c| c.backend.can_signal())
+    }
+}
+
+/// Wrap only what needs wrapping: the single-vendor machine — the common case
+/// — gets its backend back untouched, so it pays nothing for this.
+fn compose(mut found: Vec<Box<dyn GpuBackend>>) -> Result<Box<dyn GpuBackend>> {
+    if found.len() <= 1 {
+        return found.pop().ok_or_else(|| anyhow::anyhow!(NO_BACKEND));
+    }
+    Ok(Box::new(CompositeBackend::new(found)))
+}
+
+/// Every backend that reports usable devices on this machine, as one backend.
 pub fn detect(
     mock: Option<usize>,
     replay: Option<&std::path::Path>,
@@ -165,23 +304,222 @@ pub fn detect(
     if let Some(n) = mock {
         // The CLI range-validates `--mock`; this clamp only guards internal
         // callers (re-detect) from a count the mock backend can't render.
-        return Ok(Box::new(MockBackend::new(n.clamp(1, 16))));
+        return Ok(Box::new(mock::MockBackend::new(n.clamp(1, 16))));
     }
-    if let Some(b) = nvidia::probe() {
-        return Ok(b);
+    // The vendor backends are disjoint — each claims only its own PCI vendor's
+    // devices — so every one that probes adds cards no other one reports. The
+    // probes that find nothing are a failed `Nvml::init` and two readdirs of
+    // /sys/class/drm, which is why probing all of them is affordable.
+    let mut found: Vec<Box<dyn GpuBackend>> = [
+        nvidia::probe(),
+        amd::probe(),
+        intel::probe(),
+        apple::probe(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    // PDH is vendor-generic (Task Manager's counters): it enumerates every
+    // adapter, including ones a vendor backend above already claimed, so it
+    // stays a fallback rather than a peer — otherwise an NVIDIA rig on Windows
+    // would list each card twice.
+    if found.is_empty()
+        && let Some(b) = windows::probe()
+    {
+        found.push(b);
     }
-    if let Some(b) = amd::probe() {
-        return Ok(b);
+    compose(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scripted child: one entry per poll, `None` meaning that poll fails.
+    /// The last entry repeats once the script runs out.
+    struct Stub {
+        name: &'static str,
+        ticks: Vec<Option<Vec<&'static str>>>,
+        tick: usize,
+        /// (pid, child-local gpu_index)
+        procs: Vec<(u32, usize)>,
+        driver: Option<&'static str>,
+        signal: bool,
     }
-    if let Some(b) = intel::probe() {
-        return Ok(b);
+
+    impl Stub {
+        fn new(name: &'static str, ticks: Vec<Option<Vec<&'static str>>>) -> Self {
+            Self {
+                name,
+                ticks,
+                tick: 0,
+                procs: Vec::new(),
+                driver: None,
+                signal: true,
+            }
+        }
+        fn procs(mut self, procs: &[(u32, usize)]) -> Self {
+            self.procs = procs.to_vec();
+            self
+        }
+        fn driver(mut self, driver: &'static str) -> Self {
+            self.driver = Some(driver);
+            self
+        }
+        fn no_signal(mut self) -> Self {
+            self.signal = false;
+            self
+        }
     }
-    if let Some(b) = apple::probe() {
-        return Ok(b);
+
+    impl GpuBackend for Stub {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
+            let i = self.tick.min(self.ticks.len() - 1);
+            self.tick += 1;
+            match &self.ticks[i] {
+                Some(names) => Ok(names
+                    .iter()
+                    .map(|n| GpuSnapshot {
+                        name: (*n).to_string(),
+                        ..Default::default()
+                    })
+                    .collect()),
+                None => anyhow::bail!("{} is down", self.name),
+            }
+        }
+        fn processes(&mut self) -> Vec<GpuProcess> {
+            self.procs
+                .iter()
+                .map(|&(pid, gpu_index)| GpuProcess {
+                    pid,
+                    gpu_index,
+                    ..Default::default()
+                })
+                .collect()
+        }
+        fn driver_info(&self) -> Option<String> {
+            self.driver.map(str::to_string)
+        }
+        fn can_signal(&self) -> bool {
+            self.signal
+        }
     }
-    // Vendor-generic Windows fallback (Task Manager counters).
-    if let Some(b) = windows::probe() {
-        return Ok(b);
+
+    fn names(snaps: &[GpuSnapshot]) -> Vec<&str> {
+        snaps.iter().map(|s| s.name.as_str()).collect()
     }
-    anyhow::bail!("no supported GPU backend found (run with --mock to demo the UI)")
+
+    #[test]
+    fn one_backend_is_not_wrapped() {
+        let b = compose(vec![Box::new(Stub::new("solo", vec![Some(vec!["a"])]))]).unwrap();
+        assert_eq!(b.name(), "solo");
+        assert!(compose(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn children_concatenate_in_probe_order() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new("nv", vec![Some(vec!["4090", "4080"])])),
+            Box::new(Stub::new("amd", vec![Some(vec!["APU"])])),
+        ]);
+        assert_eq!(names(&b.poll().unwrap()), ["4090", "4080", "APU"]);
+        assert_eq!(b.name(), "multi");
+    }
+
+    #[test]
+    fn process_indices_rebase_onto_the_child_offset() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new("nv", vec![Some(vec!["4090", "4080"])]).procs(&[(1, 0), (2, 1)])),
+            Box::new(Stub::new("amd", vec![Some(vec!["APU"])]).procs(&[(3, 0)])),
+        ]);
+        b.poll().unwrap();
+        let procs: Vec<(u32, usize)> = b.processes().iter().map(|p| (p.pid, p.gpu_index)).collect();
+        assert_eq!(procs, [(1, 0), (2, 1), (3, 2)]);
+    }
+
+    #[test]
+    fn a_failing_child_holds_its_slots_open() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new("nv", vec![Some(vec!["4090", "4080"]), None]).procs(&[(1, 0)])),
+            Box::new(Stub::new("amd", vec![Some(vec!["APU"])]).procs(&[(3, 0)])),
+        ]);
+        b.poll().unwrap();
+        let snaps = b.poll().unwrap();
+        assert_eq!(
+            names(&snaps),
+            ["4090 (unavailable)", "4080 (unavailable)", "APU"]
+        );
+        // The surviving child's card and its process rows stay on index 2.
+        let procs: Vec<(u32, usize)> = b.processes().iter().map(|p| (p.pid, p.gpu_index)).collect();
+        assert_eq!(procs, [(1, 0), (3, 2)]);
+    }
+
+    #[test]
+    fn a_short_child_holds_its_slots_open() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new(
+                "nv",
+                vec![Some(vec!["4090", "4080"]), Some(vec!["4090"])],
+            )),
+            Box::new(Stub::new("amd", vec![Some(vec!["APU"])])),
+        ]);
+        b.poll().unwrap();
+        assert_eq!(
+            names(&b.poll().unwrap()),
+            ["4090", "4080 (unavailable)", "APU"]
+        );
+    }
+
+    #[test]
+    fn a_process_outside_its_child_span_is_dropped() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new("nv", vec![Some(vec!["4090"])]).procs(&[(1, 0), (2, 7)])),
+            Box::new(Stub::new("amd", vec![Some(vec!["APU"])]).procs(&[(3, 0)])),
+        ]);
+        b.poll().unwrap();
+        let procs: Vec<(u32, usize)> = b.processes().iter().map(|p| (p.pid, p.gpu_index)).collect();
+        assert_eq!(procs, [(1, 0), (3, 1)]);
+    }
+
+    #[test]
+    fn every_child_failing_is_a_poll_error() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new("nv", vec![None])),
+            Box::new(Stub::new("amd", vec![None])),
+        ]);
+        let err = format!("{:#}", b.poll().unwrap_err());
+        assert!(
+            err.contains("nv is down") && err.contains("amd is down"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn can_signal_is_the_and_of_the_children() {
+        let live = || Box::new(Stub::new("nv", vec![Some(vec!["4090"])]));
+        assert!(CompositeBackend::new(vec![live(), live()]).can_signal());
+        assert!(
+            !CompositeBackend::new(vec![
+                live(),
+                Box::new(Stub::new("mock", vec![Some(vec!["fake"])]).no_signal()),
+            ])
+            .can_signal()
+        );
+    }
+
+    #[test]
+    fn driver_info_joins_and_names_the_children() {
+        let b = CompositeBackend::new(vec![
+            Box::new(Stub::new("nvml", vec![Some(vec!["4090"])]).driver("driver 550.1")),
+            Box::new(Stub::new("amdgpu", vec![Some(vec!["APU"])]).driver("amdgpu · kernel 7.1")),
+            Box::new(Stub::new("intel", vec![Some(vec!["iGPU"])])),
+        ]);
+        assert_eq!(
+            b.driver_info().as_deref(),
+            Some("nvml driver 550.1 · amdgpu · kernel 7.1 · intel")
+        );
+    }
 }

@@ -136,8 +136,24 @@ _done_ = feature-complete against what the source exposes and exercised on real
 hardware or fully deterministic. _beta_ = implemented with fixture-tested
 parsers, but not yet confirmed against a real GPU — see Status above.
 
-Probe order: nvml → amdgpu → intel → ioaccel → pdh; the first backend that
-probes successfully is the only one used (see Current limitations).
+Probe order: nvml → amdgpu → intel → ioaccel, then pdh. **Every vendor backend
+that finds devices is used**, not just the first: a mixed-vendor machine — an
+NVIDIA dGPU beside an AMD APU, an Intel iGPU beside an AMD dGPU — lists all of
+its GPUs in probe order, in one card list and one process table. The vendor
+backends are disjoint (each claims only its own PCI vendor's devices), so
+nothing is counted twice.
+
+When two or more probe, the header reads `[multi]` and the driver line names
+each one (`nvml driver 550.1 · amdgpu · kernel 7.1`); a single-vendor machine is
+unchanged and still reports that backend by name. Device indices are pinned for
+the session: if one vendor's driver goes away mid-run its cards stay in place as
+`… (unavailable)` rather than sliding the other vendor's GPUs onto their graphs,
+and the process table's `DEV` column keeps pointing at the right card. Killing a
+process stays disabled unless every active backend reports pids that belong to
+this machine.
+
+pdh is the exception — it enumerates every adapter regardless of vendor, so it
+is used only when no vendor backend probed at all (see Current limitations).
 
 Intel utilization is derived from per-client fdinfo engine counters (i915
 busy-ns, xe cycles) the same way nvtop does it; power comes from the hwmon
@@ -168,10 +184,11 @@ Planned depth: Apple temperature/power (SMC/IOReport), Windows AMD ADLX
 
 ## Current limitations
 
-- **One vendor at a time.** `detect()` keeps the first backend that probes
-  successfully, so on a mixed-vendor machine — an NVIDIA dGPU beside an AMD APU
-  or Intel iGPU, say — only that vendor's GPUs appear. nvtop enumerates every
-  vendor simultaneously; gpur does not yet.
+- **Mixed vendors on Windows still show one vendor.** The pdh backend is
+  vendor-generic, so pairing it with nvml would list every NVIDIA card twice; it
+  is therefore skipped whenever a vendor backend probed. An NVIDIA + Intel
+  Windows laptop shows the NVIDIA cards only. Linux and macOS enumerate every
+  vendor.
 - **Digit keys cover GPUs 0-9 only.** `--mock` accepts up to 16 and real rigs
   can exceed ten devices; GPUs 10 and above are reachable with `j`/`k` and the
   wheel, but cannot be selected by digit or folded.

@@ -83,10 +83,17 @@ impl GpuBackend for MockBackend {
                     pcie_tx_kbs: Some((util * 3000.0) as u64),
                     fan_rpm: Some(800 + (util * 14.0) as u64),
                     temp_junction_c: Some(50.0 + util * 0.45),
+                    // Memory sensor sits between core and junction.
+                    temp_mem_c: Some(48.0 + util * 0.42),
+                    // NVML-style performance state: P0 under load, P8 at idle.
+                    perf_level: Some(if util > 50.0 {
+                        "P0".into()
+                    } else {
+                        "P8".into()
+                    }),
                     gtt_used_bytes: Some((util * 2e7) as u64),
                     gtt_total_bytes: Some(8 * 1024 * 1024 * 1024),
                     volt_mv: Some(700 + (util * 4.0) as u64),
-                    ..Default::default()
                 }
             })
             .collect();

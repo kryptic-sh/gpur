@@ -1,7 +1,8 @@
 //! Shared Linux DRM plumbing: sysfs readers, pci.ids lookup, and the
 //! /proc fdinfo scan that powers per-process GPU attribution for both the
 //! amdgpu and Intel (i915/xe) backends.
-#![cfg(target_os = "linux")]
+//!
+//! Gated once, by `#[cfg(target_os = "linux")] mod linux;` in the parent.
 
 use super::{GpuProcess, ProcKind, clamp_pct};
 use std::collections::{HashMap, HashSet};

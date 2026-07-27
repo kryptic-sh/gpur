@@ -991,7 +991,7 @@ mod tests {
 
     #[test]
     fn fabricated_backends_refuse_to_signal() {
-        assert!(!crate::backend::MockBackend::new(2).can_signal());
+        assert!(!crate::backend::detect(Some(2), None).unwrap().can_signal());
         assert!(LocalBackend.can_signal());
         // Replay is private; drive it through detect() on a one-line log.
         let dir = std::env::temp_dir().join(format!("gpur-can-signal-{}", std::process::id()));
@@ -1025,7 +1025,7 @@ mod tests {
 
     #[test]
     fn kill_refuses_when_the_backend_is_not_local() {
-        let mut app = app_with(Box::new(crate::backend::MockBackend::new(1)));
+        let mut app = app_with(crate::backend::detect(Some(1), None).unwrap());
         arm(&mut app, 424242, 0);
         app.confirm_kill();
         assert!(

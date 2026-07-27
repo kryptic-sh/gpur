@@ -467,7 +467,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         "GPU ",
         gpu.utilization_pct.map(|u| u / 100.0),
         format!(" {} ", pct_or_na(gpu.utilization_pct)),
-        &t.util_stops(),
+        &t.util_stops,
         t,
         app.graph_style,
     );
@@ -477,7 +477,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         "MEM ",
         gpu.vram_pct().map(|p| p / 100.0),
         format!(" {} ", vram_value(gpu)),
-        &t.vram_stops(),
+        &t.vram_stops,
         t,
         app.graph_style,
     );
@@ -733,14 +733,12 @@ fn waveform_halves(
 ) {
     let top_rows = (area.height / 2) as usize;
     let bot_rows = area.height as usize - top_rows;
-    let up_stops = t.util_stops();
-    let down_stops = t.vram_stops();
     let buf = frame.buffer_mut();
     for half in 0..2 {
         let (rows, data, stops) = if half == 0 {
-            (top_rows, up_data, &up_stops[..])
+            (top_rows, up_data, &t.util_stops[..])
         } else {
-            (bot_rows, down_data, &down_stops[..])
+            (bot_rows, down_data, &t.vram_stops[..])
         };
         for cy in 0..rows {
             // cy counts away from the midline in both halves.
@@ -1064,7 +1062,7 @@ mod tests {
                 "GPU ",
                 gpu.utilization_pct.map(|u| u / 100.0),
                 format!(" {} ", pct_or_na(gpu.utilization_pct)),
-                &t.util_stops(),
+                &t.util_stops,
                 &t,
                 GraphStyle::Ascii,
             );
