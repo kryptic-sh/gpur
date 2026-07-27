@@ -1,12 +1,49 @@
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_gpur"))
+/// A throwaway XDG root for one test. gpur resolves its config/cache/data
+/// through hjkl-config, which honours `XDG_*_HOME` on every platform
+/// (Windows and macOS included — it deliberately does not use `%APPDATA%`
+/// or `~/Library`), so redirecting the three vars is enough to keep the
+/// suite off the developer's real `~/.cache/gpur/state.json`.
+struct Sandbox(PathBuf);
+
+impl Sandbox {
+    fn new(tag: &str) -> Self {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "gpur-test-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Sandbox(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn cmd(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gpur"));
+        cmd.env("XDG_CONFIG_HOME", &self.0);
+        cmd.env("XDG_CACHE_HOME", &self.0);
+        cmd.env("XDG_DATA_HOME", &self.0);
+        cmd
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
 fn version_prints_name_and_semver() {
-    let out = bin().arg("--version").output().unwrap();
+    let sb = Sandbox::new("version");
+    let out = sb.cmd().arg("--version").output().unwrap();
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.starts_with("gpur "), "unexpected --version output: {s}");
@@ -14,7 +51,8 @@ fn version_prints_name_and_semver() {
 
 #[test]
 fn help_shows_usage_and_art() {
-    let out = bin().arg("--help").output().unwrap();
+    let sb = Sandbox::new("help");
+    let out = sb.cmd().arg("--help").output().unwrap();
     assert!(out.status.success());
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("Usage:"), "no usage section: {s}");
@@ -23,18 +61,19 @@ fn help_shows_usage_and_art() {
 
 #[test]
 fn replay_round_trips_a_log_recording() {
-    let dir = std::env::temp_dir().join(format!("gpur-replay-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let log = dir.join("rec.jsonl");
+    let sb = Sandbox::new("replay");
+    let log = sb.path().join("rec.jsonl");
 
-    let rec = bin()
+    let rec = sb
+        .cmd()
         .args(["--mock", "--once", "--tick-ms", "100", "--log"])
         .arg(&log)
         .output()
         .unwrap();
     assert!(rec.status.success());
 
-    let out = bin()
+    let out = sb
+        .cmd()
         .args(["--json", "--tick-ms", "100", "--replay"])
         .arg(&log)
         .output()
@@ -51,18 +90,20 @@ fn replay_round_trips_a_log_recording() {
             .any(|p| p["command"].as_str().unwrap().contains("gpur")),
         "recorded command lost in replay"
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn unknown_flag_fails() {
-    let out = bin().arg("--definitely-not-a-flag").output().unwrap();
+    let sb = Sandbox::new("badflag");
+    let out = sb.cmd().arg("--definitely-not-a-flag").output().unwrap();
     assert!(!out.status.success());
 }
 
 #[test]
 fn json_snapshot_emits_valid_shape() {
-    let out = bin()
+    let sb = Sandbox::new("json");
+    let out = sb
+        .cmd()
         .args(["--mock", "--json", "--tick-ms", "100"])
         .output()
         .unwrap();
@@ -97,15 +138,51 @@ fn json_snapshot_emits_valid_shape() {
 
 #[test]
 fn completions_flag_covers_all_shells() {
-    for shell in ["bash", "zsh", "fish", "powershell", "elvish", "nushell"] {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_gpur"))
+    // A shell-specific dispatch line, not just the binary name: every
+    // generator prints "gpur" in its preamble, so a generator emitting only
+    // a comment header would pass a bare-name assertion.
+    for (shell, marker) in [
+        ("bash", "complete -F _gpur"),
+        ("zsh", "#compdef gpur"),
+        ("fish", "complete -c gpur"),
+        (
+            "powershell",
+            "Register-ArgumentCompleter -Native -CommandName 'gpur'",
+        ),
+        ("elvish", "set edit:completion:arg-completer[gpur]"),
+        ("nushell", "export extern gpur"),
+    ] {
+        let sb = Sandbox::new(shell);
+        let out = sb
+            .cmd()
             .args(["--completions", shell])
             .output()
             .expect("spawn gpur");
         assert!(out.status.success(), "--completions {shell} failed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            String::from_utf8_lossy(&out.stdout).contains("gpur"),
-            "{shell} completions empty"
+            stdout.contains(marker),
+            "{shell} completions missing {marker:?}:\n{stdout}"
         );
     }
+}
+
+/// Proves the sandbox is the directory the binary actually reads from: a
+/// config planted in it must reach the binary. Without this, a broken
+/// redirect would silently fall back to the developer's real dotfiles and
+/// every other test in this file would go back to being non-hermetic.
+#[test]
+fn config_is_read_from_the_sandboxed_xdg_dir() {
+    let sb = Sandbox::new("config");
+    let dir = sb.path().join("gpur");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), "graphs = \"nope\"\n").unwrap();
+
+    let out = sb.cmd().args(["--mock", "--json"]).output().unwrap();
+    assert!(!out.status.success(), "invalid sandbox config was ignored");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("unknown graphs value"),
+        "config not loaded from XDG_CONFIG_HOME: {err}"
+    );
 }

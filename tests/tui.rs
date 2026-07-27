@@ -5,11 +5,39 @@
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const COLS: u16 = 120;
 const ROWS: u16 = 36;
+
+/// A throwaway XDG root for one test. gpur resolves its config/cache/data
+/// through hjkl-config, which honours `XDG_*_HOME` on every platform, so
+/// redirecting the three vars keeps the suite off the developer's real
+/// `~/.cache/gpur/state.json` — which the app both reads at startup and
+/// overwrites on a clean quit.
+struct Sandbox(PathBuf);
+
+impl Sandbox {
+    fn new() -> Self {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "gpur-tui-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Sandbox(dir)
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 struct Tui {
     parser: vt100::Parser,
@@ -18,11 +46,34 @@ struct Tui {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Every byte the app ever wrote, for teardown-sequence assertions.
     raw: Vec<u8>,
+    /// Removed on drop; keep it alive for the whole run.
+    home: Sandbox,
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
 impl Tui {
     fn spawn(extra_args: &[&str]) -> Self {
+        Self::spawn_with_env(extra_args, &[])
+    }
+
+    fn spawn_with_env(extra_args: &[&str], env: &[(&str, &str)]) -> Self {
+        // Defaults, omitted when the caller passes its own — clap rejects a
+        // repeated flag rather than letting the last one win.
+        let mut args = vec!["--no-splash"];
+        if !extra_args.contains(&"--mock") {
+            args.push("--mock");
+        }
+        if !extra_args.contains(&"--tick-ms") {
+            args.extend(["--tick-ms", "100"]);
+        }
+        args.extend_from_slice(extra_args);
+        Self::spawn_in(&args, env, Sandbox::new())
+    }
+
+    /// Full control over the command line and the sandbox — for tests that
+    /// plant a cache file, or that need a persisted setting to win because
+    /// no CLI flag overrides it.
+    fn spawn_in(args: &[&str], env: &[(&str, &str)], home: Sandbox) -> Self {
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: ROWS,
@@ -32,10 +83,15 @@ impl Tui {
             })
             .unwrap();
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_gpur"));
-        cmd.args(["--mock", "--no-splash", "--tick-ms", "100"]);
-        cmd.args(extra_args);
+        cmd.args(args);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        cmd.env("XDG_CONFIG_HOME", &home.0);
+        cmd.env("XDG_CACHE_HOME", &home.0);
+        cmd.env("XDG_DATA_HOME", &home.0);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         let child = pty.slave.spawn_command(cmd).unwrap();
         drop(pty.slave);
 
@@ -56,8 +112,14 @@ impl Tui {
             writer: pty.master.take_writer().unwrap(),
             child,
             raw: Vec::new(),
+            home,
             _master: pty.master,
         }
+    }
+
+    /// Where the app persists its UI state under this test's sandbox.
+    fn state_file(&self) -> PathBuf {
+        self.home.0.join("gpur").join("state.json")
     }
 
     fn pump_once(&mut self, timeout: Duration) -> bool {
@@ -97,6 +159,35 @@ impl Tui {
         self.writer.flush().unwrap();
     }
 
+    /// Like [`wait_for`], but over every byte the app has written — for
+    /// states that flash by between frames and would be erased from the
+    /// screen before the next poll of the emulator.
+    fn wait_for_raw(&mut self, what: &str, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if String::from_utf8_lossy(&self.raw).contains(needle) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}; screen:\n{}",
+                self.screen_text()
+            );
+            self.pump_once(Duration::from_millis(100));
+        }
+    }
+
+    /// Pump for a fixed window, then return the screen. The app repaints on
+    /// every tick even when nothing changed, so waiting for the pty to fall
+    /// silent would never return.
+    fn drain(&mut self, window: Duration) -> String {
+        let until = Instant::now() + window;
+        while Instant::now() < until {
+            self.pump_once(Duration::from_millis(50));
+        }
+        self.screen_text()
+    }
+
     fn wait_exit(&mut self) -> portable_pty::ExitStatus {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -112,6 +203,32 @@ impl Tui {
     }
 }
 
+/// PIDs of the process-table data rows, in the order they are drawn. Card
+/// lines never qualify: their first cell is a label or a graph glyph.
+fn proc_pids(screen: &str) -> Vec<u32> {
+    screen
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim_start_matches('│').trim_start();
+            if !l.contains("MiB") {
+                return None;
+            }
+            l.split_whitespace().next()?.parse().ok()
+        })
+        .collect()
+}
+
+/// A drawn meter line — `label`, a run of meter glyphs, then the value.
+/// Matching on the glyph run is the point: the process-table header alone
+/// carries both "GPU " and "MEM ".
+fn meter_line(screen: &str, label: &str) -> Option<String> {
+    screen
+        .lines()
+        .map(|l| l.trim_start_matches('│').trim_end().trim_end_matches('│'))
+        .find(|l| l.starts_with(label) && (l.contains('■') || l.contains('·')))
+        .map(str::to_string)
+}
+
 #[test]
 fn renders_dashboard_and_process_table() {
     let mut t = Tui::spawn(&[]);
@@ -119,7 +236,16 @@ fn renders_dashboard_and_process_table() {
         s.contains("Mock GPU 0") && s.contains("Mock GPU 1")
     });
     t.wait_for("process table", |s| s.contains("COMMAND"));
-    t.wait_for("meters", |s| s.contains("GPU ") && s.contains("MEM "));
+    t.wait_for("meters", |s| meter_line(s, "GPU ").is_some());
+    let s = t.screen_text();
+    let util = meter_line(&s, "GPU ").expect("GPU meter");
+    let glyphs = util.chars().filter(|c| "■·".contains(*c)).count();
+    assert!(glyphs >= 40, "GPU meter has no bar: {util:?}");
+    assert!(util.trim_end().ends_with('%'), "GPU meter value: {util:?}");
+    let vram = meter_line(&s, "MEM ").expect("MEM meter");
+    let glyphs = vram.chars().filter(|c| "■·".contains(*c)).count();
+    assert!(glyphs >= 40, "MEM meter has no bar: {vram:?}");
+    assert!(vram.contains('/'), "MEM meter value: {vram:?}");
     t.send("q");
     assert!(t.wait_exit().success());
 }
@@ -140,10 +266,28 @@ fn fold_toggles_card() {
 #[test]
 fn filter_narrows_process_table() {
     let mut t = Tui::spawn(&[]);
-    t.wait_for("process rows", |s| s.contains("COMMAND"));
-    // The mock's first process row is this test binary itself.
+    t.wait_for("all rows", |s| proc_pids(s).len() == 6);
+    // The mock's first process row is this test binary itself; the other
+    // five are fabricated (ollama, blender, Xorg, ffmpeg, firefox) and must
+    // all drop out — the caption alone renders unconditionally.
     t.send("/gpur\r");
-    t.wait_for("filter caption", |s| s.contains("filter:gpur"));
+    t.wait_for("narrowed table", |s| {
+        s.contains("filter:gpur") && proc_pids(s).len() == 1
+    });
+    let s = t.screen_text();
+    assert!(!s.contains("ollama runner"), "filtered-out row still drawn");
+    assert!(!s.contains("blender -b"), "filtered-out row still drawn");
+    assert_eq!(
+        proc_pids(&s),
+        vec![t.child.process_id().expect("child pid")],
+        "the surviving row is not gpur's own"
+    );
+    // Re-opening seeds the edit buffer with the committed filter, so
+    // backspace it away: an empty filter clears and every row comes back.
+    t.send("/\x7f\x7f\x7f\x7f\r");
+    t.wait_for("filter cleared", |s| {
+        !s.contains("filter:") && proc_pids(s).len() == 6
+    });
     t.send("q");
     t.wait_exit();
 }
@@ -257,11 +401,17 @@ fn sigterm_restores_terminal_modes() {
 #[test]
 fn process_rows_show_real_content() {
     let mut t = Tui::spawn(&[]);
-    // The mock's first process row is the app itself: its pid must appear
-    // in the table with the binary name, enriched by sysinfo.
+    // The mock's first process row is the app itself, left un-enriched so
+    // sysinfo fills the host columns. Anchor on that one row: "gpur" alone
+    // also matches the header on every frame.
     let pid = t.child.process_id().expect("child pid").to_string();
     t.wait_for("own process row", move |s| {
-        s.contains(&pid) && s.contains("gpur")
+        s.lines().any(|l| {
+            let l = l.trim_start_matches('│').trim_start();
+            l.split_whitespace().next() == Some(pid.as_str())
+                && l.contains("gpur") // the resolved command, not the header
+                && l.contains("MiB")
+        })
     });
     t.send("q");
     t.wait_exit();
@@ -277,6 +427,161 @@ fn sort_cycle_and_reverse_update_caption() {
     t.wait_for("reversed arrow", |s| s.contains("gpu%↑"));
     t.send("q");
     t.wait_exit();
+}
+
+/// The caption is not the behaviour: reversing must reorder the rows.
+#[test]
+fn sort_reverse_reorders_rows() {
+    let mut t = Tui::spawn(&[]);
+    t.wait_for("all rows", |s| {
+        s.contains("gpu-mem↓") && proc_pids(s).len() == 6
+    });
+    let desc = proc_pids(&t.screen_text());
+    t.send("r");
+    let asc: Vec<u32> = desc.iter().rev().copied().collect();
+    let want = asc.clone();
+    t.wait_for("rows in ascending gpu-mem order", move |s| {
+        s.contains("gpu-mem↑") && proc_pids(s) == want
+    });
+    assert_ne!(desc, asc, "mock rows are not distinguishable by order");
+    t.send("q");
+    t.wait_exit();
+}
+
+/// Space pauses polling: the badge appears and the screen stops changing.
+#[test]
+fn pause_freezes_the_dashboard() {
+    let mut t = Tui::spawn(&[]);
+    t.wait_for("cards", |s| s.contains("Mock GPU 0"));
+    t.send(" ");
+    t.wait_for("paused badge", |s| s.contains("PAUSED"));
+    let frozen = t.drain(Duration::from_millis(400));
+    // Six ticks' worth of wall clock: a live poll would move the meters.
+    let later = t.drain(Duration::from_millis(600));
+    assert_eq!(frozen, later, "screen changed while paused");
+    t.send(" ");
+    t.wait_for("resumed", |s| !s.contains("PAUSED"));
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+/// `-` halves the poll rate, `+` restores it, and the 100 ms floor holds.
+#[test]
+fn tick_keys_change_the_poll_interval() {
+    let mut t = Tui::spawn(&["--tick-ms", "400"]);
+    t.wait_for("initial rate", |s| s.contains("400ms"));
+    t.send("-");
+    t.wait_for("slower", |s| s.contains("800ms"));
+    t.send("+");
+    t.wait_for("faster", |s| s.contains("400ms"));
+    t.send("+");
+    t.wait_for("faster again", |s| s.contains("200ms"));
+    t.send("+");
+    t.wait_for("at the floor", |s| s.contains("100ms"));
+    // The floor must hold rather than wrap around to a slower rate.
+    t.send("+");
+    let s = t.drain(Duration::from_millis(400));
+    let header = s.lines().next().unwrap_or_default();
+    assert!(s.contains("100ms"), "tick left the 100ms floor: {header:?}");
+    t.send("q");
+    t.wait_exit();
+}
+
+/// Eight cards cannot fit at 120x36, so the card list must window and
+/// scroll to keep the selection visible.
+#[test]
+fn gpu_cards_scroll_when_they_overflow() {
+    let mut t = Tui::spawn(&["--mock", "8"]);
+    t.wait_for("windowed cards", |s| {
+        s.contains("Mock GPU 0") && !s.contains("Mock GPU 7")
+    });
+    t.wait_for("card scrollbar", |s| s.contains('║'));
+    // Selecting a card below the window scrolls it into view.
+    t.send("5");
+    t.wait_for("scrolled to GPU 5", |s| {
+        s.contains("Mock GPU 5") && !s.contains("Mock GPU 0")
+    });
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+/// A failing backend must not kill the monitor: the banner shows, the last
+/// good snapshot stays on screen, and quitting is still clean.
+#[test]
+fn poll_failure_degrades_gracefully() {
+    let mut t = Tui::spawn_with_env(&[], &[("GPUR_MOCK_FAIL", "2")]);
+    t.wait_for("cards", |s| s.contains("Mock GPU 0"));
+    // Every second poll fails, so the banner is only up for one frame.
+    t.wait_for_raw("poll-failure banner", "poll failed: simulated driver reset");
+    let s = t.screen_text();
+    assert!(s.contains("Mock GPU 0"), "snapshot dropped on poll failure");
+    assert!(meter_line(&s, "GPU ").is_some(), "meters dropped");
+    assert!(
+        !matches!(t.child.try_wait(), Ok(Some(_))),
+        "app exited on a backend failure"
+    );
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+/// Every poll fails: the banner stays up, the GPU pane degrades to its
+/// empty state, and the 5th consecutive failure triggers a re-detect.
+#[test]
+fn persistent_poll_failure_redetects_the_backend() {
+    let mut t = Tui::spawn_with_env(&[], &[("GPUR_MOCK_FAIL", "1")]);
+    t.wait_for("failure banner", |s| {
+        s.contains("⚠ poll failed: simulated driver reset")
+    });
+    t.wait_for("empty GPU pane", |s| {
+        s.contains("no GPUs reported by backend")
+    });
+    t.wait_for("re-detect status", |s| s.contains("backend re-detected"));
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+/// Sort and fold state round-trips through the cache dir — and lands in
+/// this test's sandbox, never the developer's real `~/.cache/gpur`.
+#[test]
+fn ui_state_is_saved_into_the_sandboxed_cache() {
+    let mut t = Tui::spawn(&[]);
+    t.wait_for("default sort", |s| s.contains("gpu-mem↓"));
+    t.send("s");
+    t.wait_for("cycled sort", |s| s.contains("gpu%↓"));
+    t.send("0");
+    t.wait_for("folded card", |s| s.contains("▸ 0·Mock GPU 0"));
+    t.send("q");
+    assert!(t.wait_exit().success());
+
+    let path = t.state_file();
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("no state at {}: {e}", path.display()));
+    let v: serde_json::Value = serde_json::from_str(&text).expect("valid state JSON");
+    assert_eq!(v["sort_by"], "GpuUtil");
+    assert_eq!(v["tick_ms"], 100);
+    assert_eq!(v["folded"], serde_json::json!([0]));
+}
+
+/// A cached state file must be honoured on startup — the same read path
+/// that used to pick up the developer's real preferences.
+#[test]
+fn saved_state_is_restored_on_startup() {
+    let home = Sandbox::new();
+    let dir = home.0.join("gpur");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("state.json"),
+        r#"{"folded":[1],"sort_by":"Pid","sort_desc":false,"tick_ms":300}"#,
+    )
+    .unwrap();
+
+    // No --tick-ms here: the persisted 300 must be what the header shows.
+    let mut t = Tui::spawn_in(&["--no-splash", "--mock"], &[], home);
+    t.wait_for("restored sort", |s| s.contains("pid↑"));
+    t.wait_for("restored fold", |s| s.contains("▸ 1·Mock GPU 1"));
+    t.wait_for("restored tick", |s| s.contains("300ms"));
+    t.send("q");
+    assert!(t.wait_exit().success());
 }
 
 #[test]
