@@ -3,6 +3,22 @@
 use super::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind};
 use anyhow::Result;
 
+/// Mock pids start well above anything the kernel hands out (Linux caps
+/// pid_max at 2^22, and the classic default is 32768), so a demo can never
+/// point a row at a live system process the way plain `1..3n` did.
+const PID_BASE: u32 = 1_000_000;
+
+/// Synthetic rows: mock pids resolve to nothing on this host, so supply the
+/// host columns here instead of rendering a table full of "?".
+const FAKE: [(&str, &str); 6] = [
+    ("alice", "python train.py --epochs 30 --amp"),
+    ("bob", "ollama runner --model llama3:70b"),
+    ("alice", "blender -b scene.blend -f 120"),
+    ("root", "/usr/lib/xorg/Xorg vt2 -displayfd 3"),
+    ("bob", "ffmpeg -hwaccel cuda -i in.mkv out.mp4"),
+    ("carol", "/usr/lib/firefox/firefox -contentproc"),
+];
+
 pub struct MockBackend {
     tick: u64,
     count: usize,
@@ -85,18 +101,36 @@ impl GpuBackend for MockBackend {
         let util = self.wave(0.4, 53.0);
         // A few rows per GPU so the table can overflow and scroll in demos.
         (0..self.count * 3)
-            .map(|i| GpuProcess {
-                pid: if i == 0 { std::process::id() } else { i as u32 },
-                gpu_index: i % self.count,
-                kind: if i % 3 == 0 {
-                    ProcKind::Graphics
-                } else {
-                    ProcKind::Compute
-                },
-                gpu_util_pct: Some((util * (0.9 - 0.1 * i as f64)).max(0.0)),
-                gpu_mem_bytes: (3000 >> i.min(8)) as u64 * 1024 * 1024 + 64 * 1024 * 1024,
-                ..Default::default()
+            .map(|i| {
+                // Row 0 is gpur itself, left un-enriched so sysinfo fills in
+                // genuine host columns for one row; the rest are fabricated.
+                let own = i == 0;
+                let (user, command) = FAKE[i % FAKE.len()];
+                GpuProcess {
+                    pid: if own {
+                        std::process::id()
+                    } else {
+                        PID_BASE + i as u32
+                    },
+                    gpu_index: i % self.count,
+                    kind: if i % 3 == 0 {
+                        ProcKind::Graphics
+                    } else {
+                        ProcKind::Compute
+                    },
+                    gpu_util_pct: Some((util * (0.9 - 0.1 * i as f64)).max(0.0)),
+                    gpu_mem_bytes: (3000 >> i.min(8)) as u64 * 1024 * 1024 + 64 * 1024 * 1024,
+                    user: (!own).then(|| user.to_string()),
+                    command: (!own).then(|| command.to_string()),
+                    cpu_pct: (!own).then(|| (util * (0.5 - 0.05 * i as f64)).max(0.0) as f32),
+                    host_mem_bytes: (!own).then(|| (400 >> i.min(6)) as u64 * 1024 * 1024),
+                }
             })
             .collect()
+    }
+
+    /// Mock pids are fabricated; nothing here may be signalled.
+    fn can_signal(&self) -> bool {
+        false
     }
 }

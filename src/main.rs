@@ -291,11 +291,16 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
                         }
                         MouseEventKind::Down(MouseButton::Left) if in_procs => {
                             app.focus = Focus::Procs;
-                            // Rows start after the top border + header line.
+                            // Rows start after the top border + header line
+                            // and stop before the bottom border — which
+                            // proc_rect.contains() counts as inside.
                             let first_row_y = app.proc_rect.y + 2;
-                            if m.row >= first_row_y {
+                            let border_y = app.proc_rect.bottom().saturating_sub(1);
+                            if m.row >= first_row_y && m.row < border_y {
                                 let clicked = app.proc_scroll + (m.row - first_row_y) as usize;
-                                if clicked < app.procs.len() {
+                                // Only rows actually on screen: a click must
+                                // select what was clicked, never scroll.
+                                if clicked < app.proc_scroll + app.proc_visible {
                                     app.proc_sel = clicked;
                                 }
                             }

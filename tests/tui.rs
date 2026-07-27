@@ -321,18 +321,22 @@ fn highlighted_row(t: &mut Tui) -> Option<String> {
     None
 }
 
+/// The mock backend's pids are fabricated, so the dialog must never open —
+/// row 0 is gpur's own pid and the rest name nothing on this host.
 #[test]
-fn kill_dialog_opens_and_cancels() {
+fn kill_is_refused_under_the_mock_backend() {
     let mut t = Tui::spawn(&[]);
     t.wait_for("process rows", |s| s.contains("COMMAND"));
     t.send("p");
     t.send("x");
-    t.wait_for("confirm popup", |s| s.contains("send SIGTERM to"));
-    t.send("n"); // cancel — nothing must die
-    t.wait_for("popup gone", |s| !s.contains("send SIGTERM to"));
+    t.wait_for("refusal status", |s| s.contains("kill disabled"));
+    assert!(
+        !t.screen_text().contains("send SIGTERM to"),
+        "mock backend opened a kill dialog"
+    );
     assert!(
         !matches!(t.child.try_wait(), Ok(Some(_))),
-        "app died after cancelled kill"
+        "app died after a refused kill"
     );
     t.send("q");
     assert!(t.wait_exit().success());

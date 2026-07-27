@@ -124,11 +124,12 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Centered y/N dialog for a pending kill.
 fn draw_confirm_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let Some((pid, force, cmd)) = &app.pending_kill else {
+    let Some(k) = &app.pending_kill else {
         return;
     };
+    let (pid, cmd) = (k.pid, &k.command);
     let t = &app.theme;
-    let sig = if *force { "SIGKILL" } else { "SIGTERM" };
+    let sig = if k.force { "SIGKILL" } else { "SIGTERM" };
     let text = format!("send {sig} to {pid}?");
     let popup = centered(area, text.len().max(cmd.len()) as u16 + 6, 5);
     frame.render_widget(ratatui::widgets::Clear, popup);
@@ -787,10 +788,13 @@ fn draw_waveform_cells(
 
 fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
     if area.height < 3 {
+        app.proc_visible = 0;
         return;
     }
     let total = app.procs.len();
     let visible = (area.height.saturating_sub(3) as usize).min(total);
+    // Click hit-tests bound against this rather than procs.len().
+    app.proc_visible = visible;
     let max_scroll = total - visible;
     // Viewport follows the cursor row.
     app.proc_sel = app.proc_sel.min(total.saturating_sub(1));

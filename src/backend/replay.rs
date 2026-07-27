@@ -66,4 +66,9 @@ impl GpuBackend for ReplayBackend {
     fn processes(&mut self) -> Vec<GpuProcess> {
         self.last.processes.clone()
     }
+
+    /// Recorded pids belong to the machine that produced the log.
+    fn can_signal(&self) -> bool {
+        false
+    }
 }

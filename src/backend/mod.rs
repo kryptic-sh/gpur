@@ -136,6 +136,13 @@ pub trait GpuBackend {
     fn driver_info(&self) -> Option<String> {
         None
     }
+    /// Whether the pids from `processes` name processes on THIS machine.
+    /// Fabricated (mock) and foreign (replay) pids do not, so the kill path
+    /// must refuse them — a recording from a stranger is otherwise a
+    /// one-keystroke signal primitive against whoever opens it.
+    fn can_signal(&self) -> bool {
+        true
+    }
 }
 
 /// Pick the first backend that reports usable devices on this machine.

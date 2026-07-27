@@ -197,6 +197,19 @@ pub struct ProcRow {
     pub container: Option<String>,
 }
 
+/// A signal awaiting y/N confirmation. `start_time` pins the identity of the
+/// target: a pid alone is not one, since the process can exit between the
+/// prompt and the keystroke and the number be handed to something else.
+pub struct PendingKill {
+    pub pid: u32,
+    /// `sysinfo` start time as read when the dialog opened.
+    pub start_time: u64,
+    /// SIGKILL rather than SIGTERM.
+    pub force: bool,
+    /// Truncated command line, for the dialog and the result message.
+    pub command: String,
+}
+
 /// UI state persisted across runs (folded cards, sort, poll rate) — the
 /// tikr session.json pattern: auto-saved on clean quit into the cache dir,
 /// never a config file.
@@ -253,6 +266,9 @@ pub struct App {
     pub proc_scroll: usize,
     /// Cursor row in the process table (index into procs).
     pub proc_sel: usize,
+    /// Data rows the process pane showed last draw. Click hit-tests bound
+    /// against this so a stray click can never select an off-screen row.
+    pub proc_visible: usize,
     /// Pane rectangles from the last draw, for routing mouse wheel events.
     pub gpus_rect: ratatui::layout::Rect,
     pub proc_rect: ratatui::layout::Rect,
@@ -267,8 +283,8 @@ pub struct App {
     pub filter_input: String,
     pub sort_by: SortBy,
     pub sort_desc: bool,
-    /// (pid, force, command) awaiting y/N confirmation.
-    pub pending_kill: Option<(u32, bool, String)>,
+    /// Signal awaiting y/N confirmation.
+    pub pending_kill: Option<PendingKill>,
     /// Transient header status (kill results), with expiry.
     pub status: Option<(String, Instant)>,
     /// Help overlay visible; any key dismisses.
@@ -324,6 +340,7 @@ impl App {
             gpu_scroll: 0,
             proc_scroll: 0,
             proc_sel: 0,
+            proc_visible: 0,
             gpus_rect: ratatui::layout::Rect::default(),
             proc_rect: ratatui::layout::Rect::default(),
             focus: Focus::Gpus,
@@ -573,17 +590,104 @@ impl App {
         self.rebuild_proc_view();
     }
 
-    /// Send the pending signal (y in confirm mode).
+    /// Whether the current backend's pids name processes on this machine.
+    pub fn can_signal(&self) -> bool {
+        self.backend.can_signal()
+    }
+
+    /// Open the kill dialog for the cursor row, after the checks that don't
+    /// need the process table: backend provenance and pane focus.
+    fn request_kill(&mut self, force: bool) {
+        if !self.can_signal() {
+            self.set_status(format!(
+                "kill disabled: {} pids don't name processes on this machine",
+                self.backend.name()
+            ));
+            return;
+        }
+        // The cursor row is invisible from the GPU pane; signalling a row the
+        // user isn't looking at is never right. Refuse instead of stealing
+        // focus, so the keystroke can't become a kill by accident.
+        if self.focus != Focus::Procs {
+            self.set_status("kill: focus the process pane first (p)".into());
+            return;
+        }
+        let Some(row) = self.procs.get(self.proc_sel) else {
+            return;
+        };
+        let pid = row.pid;
+        let command: String = row.command.chars().take(40).collect();
+        let Some(start_time) = self.sys.process(Pid::from_u32(pid)).map(|p| p.start_time()) else {
+            self.set_status(format!("kill: pid {pid} is not a live local process"));
+            return;
+        };
+        self.pending_kill = Some(PendingKill {
+            pid,
+            start_time,
+            force,
+            command,
+        });
+        self.input_mode = InputMode::Confirm;
+    }
+
+    /// Send the pending signal (y in confirm mode). Every guard lives here
+    /// too, not just in `request_kill` — this is the one place that signals.
     pub fn confirm_kill(&mut self) {
-        let Some((pid, force, cmd)) = self.pending_kill.take() else {
+        let Some(k) = self.pending_kill.take() else {
             return;
         };
         self.input_mode = InputMode::Normal;
+        let PendingKill {
+            pid,
+            start_time,
+            force,
+            command,
+        } = k;
         let sig_name = if force { "SIGKILL" } else { "SIGTERM" };
-        let Some(p) = self.sys.process(Pid::from_u32(pid)) else {
+        // A failed poll can swap the backend under a pending dialog.
+        if !self.can_signal() {
+            self.set_status(format!(
+                "kill: {} pids are not signalable",
+                self.backend.name()
+            ));
+            return;
+        }
+        if pid == 1 {
+            self.set_status("kill: refusing to signal pid 1 (init)".into());
+            return;
+        }
+        if pid == std::process::id() {
+            self.set_status("kill: refusing to signal gpur itself".into());
+            return;
+        }
+        // `refresh_processes` only ever refreshes the pids the backend still
+        // lists, and sysinfo never evicts a pid outside the update set — so a
+        // process that exited after the dialog opened is still cached here.
+        // Refresh this one pid (remove_dead evicts it if gone) and demand the
+        // same start time, or we'd signal whoever inherited the number.
+        let target = Pid::from_u32(pid);
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[target]),
+            true,
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+        );
+        let Some(p) = self.sys.process(target) else {
             self.set_status(format!("kill: pid {pid} no longer exists"));
             return;
         };
+        if p.start_time() != start_time {
+            self.set_status(format!("kill: pid {pid} was reused by another process"));
+            return;
+        }
+        // Kernel threads have no executable. They can't be killed anyway, and
+        // an unreadable exe (another user's process, no ptrace access) means
+        // the signal would only earn an EPERM — refuse either way.
+        if p.exe().is_none() {
+            self.set_status(format!(
+                "kill: pid {pid} has no executable (kernel thread?) — refusing"
+            ));
+            return;
+        }
         // kill_with returns None when the signal isn't supported on this
         // platform (e.g. Term on Windows) — fall back to plain kill().
         let sig = if force {
@@ -593,7 +697,7 @@ impl App {
         };
         let ok = p.kill_with(sig).unwrap_or_else(|| p.kill());
         if ok {
-            self.set_status(format!("sent {sig_name} to {pid} ({cmd})"));
+            self.set_status(format!("sent {sig_name} to {pid} ({command})"));
         } else {
             self.set_status(format!(
                 "{sig_name} to {pid} failed (permission? try as root)"
@@ -649,14 +753,7 @@ impl App {
                 self.input_mode = InputMode::Filter;
             }
             Action::KillTerm | Action::KillForce => {
-                if let Some(row) = self.procs.get(self.proc_sel) {
-                    self.pending_kill = Some((
-                        row.pid,
-                        matches!(action, Action::KillForce),
-                        row.command.chars().take(40).collect(),
-                    ));
-                    self.input_mode = InputMode::Confirm;
-                }
+                self.request_kill(matches!(action, Action::KillForce))
             }
         }
         false
@@ -682,7 +779,184 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::container_of_cgroup;
+    use super::*;
+    use crate::backend::GpuBackend;
+
+    /// Stand-in for a live backend: the only one whose pids may be signalled.
+    struct LocalBackend;
+
+    impl GpuBackend for LocalBackend {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+        fn poll(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn app_with(backend: Box<dyn GpuBackend>) -> App {
+        App::new(
+            backend,
+            crate::theme::load(None, crate::theme::detect_color_mode()).unwrap(),
+            AppOptions {
+                tick_ms: 1000,
+                history_len: 60,
+                no_splash: true,
+                graph_style: GraphStyle::Ascii,
+                mock: None,
+                log: None,
+            },
+        )
+    }
+
+    /// Arm the dialog directly — `request_kill` needs a populated table.
+    fn arm(app: &mut App, pid: u32, start_time: u64) {
+        app.pending_kill = Some(PendingKill {
+            pid,
+            start_time,
+            force: false,
+            command: "victim".into(),
+        });
+        app.input_mode = InputMode::Confirm;
+    }
+
+    fn status_of(app: &App) -> String {
+        app.status_line().unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn fabricated_backends_refuse_to_signal() {
+        assert!(!crate::backend::MockBackend::new(2).can_signal());
+        assert!(LocalBackend.can_signal());
+        // Replay is private; drive it through detect() on a one-line log.
+        let dir = std::env::temp_dir().join(format!("gpur-can-signal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("rec.jsonl");
+        std::fs::write(&log, "{\"gpus\":[],\"processes\":[]}\n").unwrap();
+        let replay = crate::backend::detect(None, Some(&log)).unwrap();
+        assert_eq!(replay.name(), "replay");
+        assert!(!replay.can_signal());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kill_refuses_init_and_self() {
+        let mut app = app_with(Box::new(LocalBackend));
+
+        arm(&mut app, 1, 0);
+        app.confirm_kill();
+        assert!(status_of(&app).contains("pid 1"), "{}", status_of(&app));
+        assert!(app.pending_kill.is_none());
+        assert!(app.input_mode == InputMode::Normal);
+
+        arm(&mut app, std::process::id(), 0);
+        app.confirm_kill();
+        assert!(
+            status_of(&app).contains("gpur itself"),
+            "{}",
+            status_of(&app)
+        );
+    }
+
+    #[test]
+    fn kill_refuses_when_the_backend_is_not_local() {
+        let mut app = app_with(Box::new(crate::backend::MockBackend::new(1)));
+        arm(&mut app, 424242, 0);
+        app.confirm_kill();
+        assert!(
+            status_of(&app).contains("not signalable"),
+            "{}",
+            status_of(&app)
+        );
+    }
+
+    #[test]
+    fn kill_refuses_a_pid_that_no_longer_exists() {
+        let mut app = app_with(Box::new(LocalBackend));
+        // Above any plausible live pid on a test host.
+        arm(&mut app, 4_194_300, 0);
+        app.confirm_kill();
+        assert!(
+            status_of(&app).contains("no longer exists"),
+            "{}",
+            status_of(&app)
+        );
+    }
+
+    /// The core of finding 33: a pid whose recorded start time no longer
+    /// matches is a different process wearing the same number.
+    #[test]
+    #[cfg(unix)]
+    fn kill_refuses_a_recycled_pid() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = Pid::from_u32(child.id());
+        let mut app = app_with(Box::new(LocalBackend));
+        app.sys
+            .refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        let real = app.sys.process(pid).expect("child visible").start_time();
+
+        arm(&mut app, child.id(), real + 1);
+        app.confirm_kill();
+        assert!(
+            status_of(&app).contains("reused by another process"),
+            "{}",
+            status_of(&app)
+        );
+        assert!(
+            matches!(child.try_wait(), Ok(None)),
+            "child was signalled despite the start-time mismatch"
+        );
+
+        // Same pid, matching start time: the guards must not block a real kill.
+        arm(&mut app, child.id(), real);
+        app.confirm_kill();
+        assert!(
+            status_of(&app).contains("sent SIGTERM"),
+            "{}",
+            status_of(&app)
+        );
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn kill_needs_the_process_pane_focused() {
+        let mut app = app_with(Box::new(LocalBackend));
+        app.all_procs = vec![ProcRow {
+            pid: std::process::id(),
+            gpu_index: 0,
+            kind: ProcKind::Compute,
+            gpu_util_pct: None,
+            gpu_mem_bytes: 0,
+            user: "me".into(),
+            cpu_pct: 0.0,
+            host_mem_bytes: 0,
+            command: "gpur".into(),
+            container: None,
+        }];
+        app.rebuild_proc_view();
+
+        app.focus = Focus::Gpus;
+        app.apply(Action::KillTerm);
+        assert!(app.pending_kill.is_none());
+        assert!(
+            status_of(&app).contains("focus the process pane"),
+            "{}",
+            status_of(&app)
+        );
+
+        // With the pane focused the dialog opens (and pins the start time).
+        app.focus = Focus::Procs;
+        app.sys.refresh_processes(
+            ProcessesToUpdate::Some(&[Pid::from_u32(std::process::id())]),
+            true,
+        );
+        app.apply(Action::KillTerm);
+        assert!(app.pending_kill.is_some());
+        assert!(app.input_mode == InputMode::Confirm);
+    }
 
     #[test]
     fn cgroup_container_detection() {
