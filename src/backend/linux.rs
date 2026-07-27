@@ -4,7 +4,7 @@
 #![cfg(target_os = "linux")]
 
 use super::{GpuProcess, ProcKind, clamp_pct};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -102,6 +102,96 @@ pub fn build_proc(pid: u32, gpu_index: usize, util: f64, mem: u64, graphics: boo
         gpu_mem_bytes: mem,
         ..Default::default()
     }
+}
+
+/// What the shared fdinfo sweep needs to know about one device.
+pub struct SweepDevice {
+    /// PCI address as fdinfo reports it in `drm-pdev`.
+    pub pdev: Option<String>,
+    /// DRM driver name a client must report to belong to this device.
+    pub driver: String,
+}
+
+/// One client's contribution, as computed by the backend's per-client closure.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ClientSample {
+    pub util_pct: f64,
+    pub video_pct: f64,
+    /// Bytes to charge the owning process's table row.
+    pub mem_bytes: u64,
+    /// Client touched a graphics (rather than compute-only) engine.
+    pub graphics: bool,
+}
+
+/// Aggregate of one /proc fdinfo sweep.
+#[derive(Debug, Default)]
+pub struct Sweep {
+    /// gpu index -> summed client utilization %.
+    pub util: HashMap<usize, f64>,
+    /// gpu index -> summed client video-engine utilization %.
+    pub video_util: HashMap<usize, f64>,
+    pub procs: Vec<GpuProcess>,
+    /// (pid, drm-client-id) seen this pass. Callers `retain` their delta-state
+    /// maps against it so vanished clients don't leak.
+    pub seen: HashSet<(u32, u64)>,
+}
+
+/// Walk every process's DRM clients once, attribute each to a device by
+/// `drm-pdev`, and aggregate. Backends differ only in how one client's
+/// utilization and memory are derived, which is what `per_client(pid, gpu,
+/// client)` supplies — it gets the pid because both backends key their
+/// counter-delta state on (pid, drm-client-id).
+///
+/// A client with several duplicated fds appears once per fd; it is counted
+/// once, keyed on (pid, drm-client-id).
+pub fn sweep_clients<F>(devices: &[SweepDevice], mut per_client: F) -> Sweep
+where
+    F: FnMut(u32, usize, &FdClient) -> ClientSample,
+{
+    let pdev_to_gpu: HashMap<&str, usize> = devices
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| d.pdev.as_deref().map(|p| (p, i)))
+        .collect();
+    // One fdinfo pass per distinct driver, not per device.
+    let mut drivers: Vec<&str> = devices.iter().map(|d| d.driver.as_str()).collect();
+    drivers.sort_unstable();
+    drivers.dedup();
+
+    let mut sweep = Sweep::default();
+    // (pid, gpu) -> aggregated stats across that process's DRM clients.
+    let mut agg: HashMap<(u32, usize), (f64, u64, bool)> = HashMap::new();
+
+    for pid in proc_pids() {
+        for driver in &drivers {
+            for client in drm_clients(pid, driver) {
+                let Some(&gpu) = client.pdev.as_deref().and_then(|p| pdev_to_gpu.get(p)) else {
+                    continue;
+                };
+                if devices[gpu].driver != *driver {
+                    continue;
+                }
+                if !sweep.seen.insert((pid, client.id)) {
+                    continue;
+                }
+                let s = per_client(pid, gpu, &client);
+                *sweep.util.entry(gpu).or_default() += s.util_pct;
+                *sweep.video_util.entry(gpu).or_default() += s.video_pct;
+                let e = agg.entry((pid, gpu)).or_insert((0.0, 0, false));
+                e.0 += s.util_pct;
+                e.1 += s.mem_bytes;
+                e.2 |= s.graphics;
+            }
+        }
+    }
+
+    sweep.procs = agg
+        .into_iter()
+        .map(|((pid, gpu_index), (util, mem, graphics))| {
+            build_proc(pid, gpu_index, util, mem, graphics)
+        })
+        .collect();
+    sweep
 }
 
 pub fn proc_pids() -> Vec<u32> {
@@ -249,6 +339,51 @@ pub fn cards_with_vendor(drm: &str, vendor: &str) -> Vec<(u32, PathBuf)> {
         .collect();
     cards.sort_by_key(|(idx, _)| *idx);
     cards
+}
+
+/// "16.0 GT/s PCIe" -> Some(4). Gen1 = 2.5 GT/s, doubling from Gen2 on.
+/// Reads "Unknown" on links the bridge won't report, which parses to None.
+pub fn gts_to_gen(speed: &str) -> Option<u8> {
+    let gts: f64 = speed.split_whitespace().next()?.parse().ok()?;
+    Some(match gts {
+        s if s >= 128.0 => 7,
+        s if s >= 64.0 => 6,
+        s if s >= 32.0 => 5,
+        s if s >= 16.0 => 4,
+        s if s >= 8.0 => 3,
+        s if s >= 5.0 => 2,
+        _ => 1,
+    })
+}
+
+/// Current and maximum PCIe link as (gen, width, max gen, max width). These
+/// are PCI-core attributes (`drivers/pci/pci-sysfs.c`), identical for every
+/// vendor's endpoint, so one reader serves all sysfs backends. Each element is
+/// None when its file is missing or unparseable — e.g. on integrated devices,
+/// which are not PCIe endpoints in any meaningful sense.
+pub fn pcie_link(dev: &Path) -> (Option<u8>, Option<u32>, Option<u8>, Option<u32>) {
+    let speed = |f: &str| read_trim(&dev.join(f)).as_deref().and_then(gts_to_gen);
+    let width = |f: &str| read_trim(&dev.join(f)).and_then(|w| w.parse().ok());
+    (
+        speed("current_link_speed"),
+        width("current_link_width"),
+        speed("max_link_speed"),
+        width("max_link_width"),
+    )
+}
+
+/// Total system RAM in bytes. i915 and xe size their system memory region at
+/// `totalram_pages()`, so this is the real ceiling on system-backed (GTT-style)
+/// graphics memory for devices that publish no total of their own.
+pub fn sys_mem_total_bytes() -> Option<u64> {
+    parse_meminfo_total(&fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// "MemTotal:       32770396 kB" -> bytes. The unit is always kB here.
+fn parse_meminfo_total(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kb.checked_mul(1024)
 }
 
 /// The PCI address ("0000:75:00.0") a card's device dir resolves to; this is
@@ -414,6 +549,56 @@ drm-resident-vram0:\t4096 KiB
 8086  Intel Corporation
 \t56a0  DG2 [Arc A770]
 ";
+
+    /// Fresh scratch dir under the system temp dir, one per test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gpur-linux-test-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn pcie_gen_from_gts_string() {
+        assert_eq!(gts_to_gen("2.5 GT/s PCIe"), Some(1));
+        assert_eq!(gts_to_gen("8.0 GT/s PCIe"), Some(3));
+        assert_eq!(gts_to_gen("16.0 GT/s PCIe"), Some(4));
+        assert_eq!(gts_to_gen("32.0 GT/s PCIe"), Some(5));
+        assert_eq!(gts_to_gen("64.0 GT/s PCIe"), Some(6));
+        assert_eq!(gts_to_gen("Unknown"), None);
+        assert_eq!(gts_to_gen("garbage"), None);
+    }
+
+    #[test]
+    fn pcie_link_reads_current_and_max() {
+        let dev = scratch("pcie");
+        fs::write(dev.join("current_link_speed"), "8.0 GT/s PCIe\n").unwrap();
+        fs::write(dev.join("current_link_width"), "8\n").unwrap();
+        fs::write(dev.join("max_link_speed"), "16.0 GT/s PCIe\n").unwrap();
+        fs::write(dev.join("max_link_width"), "16\n").unwrap();
+        // A card in a x8 Gen3 slot: the downgrade the UI flags.
+        assert_eq!(pcie_link(&dev), (Some(3), Some(8), Some(4), Some(16)));
+    }
+
+    #[test]
+    fn pcie_link_absent_files_are_none() {
+        let dev = scratch("pcie-missing");
+        assert_eq!(pcie_link(&dev), (None, None, None, None));
+        // A partially populated endpoint keeps the fields it does have.
+        fs::write(dev.join("current_link_width"), "4\n").unwrap();
+        fs::write(dev.join("max_link_speed"), "Unknown\n").unwrap();
+        assert_eq!(pcie_link(&dev), (None, Some(4), None, None));
+    }
+
+    #[test]
+    fn meminfo_total_parses_kb() {
+        assert_eq!(
+            parse_meminfo_total("MemTotal:       32770396 kB\nMemFree:  100 kB\n"),
+            Some(32_770_396 * 1024)
+        );
+        assert_eq!(parse_meminfo_total("MemFree:  100 kB\n"), None);
+        assert_eq!(parse_meminfo_total("MemTotal:\n"), None);
+    }
 
     #[test]
     fn pci_lookup_finds_device_in_vendor_section() {
