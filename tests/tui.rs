@@ -405,11 +405,16 @@ fn process_rows_show_real_content() {
     // sysinfo fills the host columns. Anchor on that one row: "gpur" alone
     // also matches the header on every frame.
     let pid = t.child.process_id().expect("child pid").to_string();
+    // Anchor on USER, not COMMAND: the command column holds the binary's full
+    // path and is truncated to the terminal width, so whether the basename
+    // survives depends on where the repo happens to live.
+    let user = std::env::var("USER").expect("USER");
     t.wait_for("own process row", move |s| {
         s.lines().any(|l| {
             let l = l.trim_start_matches('│').trim_start();
-            l.split_whitespace().next() == Some(pid.as_str())
-                && l.contains("gpur") // the resolved command, not the header
+            let mut cols = l.split_whitespace();
+            cols.next() == Some(pid.as_str())
+                && cols.next() == Some(user.as_str()) // sysinfo resolved it
                 && l.contains("MiB")
         })
     });
