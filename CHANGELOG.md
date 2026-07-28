@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-28
+
 ### Added
 
 - **NVIDIA cards on the nouveau driver are listed.** NVML exists only with the
@@ -471,7 +473,8 @@ and this project adheres to
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.10.0
 [0.9.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.9.0
 [0.8.1]: https://github.com/kryptic-sh/gpur/releases/tag/v0.8.1
 [0.8.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.8.0
