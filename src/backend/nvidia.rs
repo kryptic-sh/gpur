@@ -1,5 +1,7 @@
 //! NVIDIA backend via NVML (Linux + Windows). Loads libnvidia-ml dynamically;
-//! probe fails soft on machines without the driver.
+//! probe fails soft on machines without the driver, and on Linux falls back to
+//! a sysfs read of any nouveau-driven card so an open-driver GPU is still
+//! listed rather than dropped off the rig.
 
 use super::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind};
 use anyhow::Result;
@@ -15,6 +17,29 @@ use nvml_wrapper::{Device, Nvml};
 use std::collections::HashMap;
 
 pub fn probe() -> Option<Box<dyn GpuBackend>> {
+    if let Some(b) = nvml_probe() {
+        return Some(b);
+    }
+    // NVML is the only source of NVIDIA telemetry, and it exists only with the
+    // proprietary driver. Without it the card is still sitting in
+    // /sys/class/drm, and no other backend will claim it — the AMD and Intel
+    // scans filter on their own PCI vendor — so leaving it there drops a card
+    // off a mixed rig entirely rather than showing it with fewer gauges.
+    #[cfg(target_os = "linux")]
+    if let Some(b) = nouveau::probe() {
+        return Some(b);
+    }
+    None
+}
+
+/// Device ids the sysfs fallback claims from a fake `/sys/class/drm`, for the
+/// shared test that proves the Linux scans partition that one directory.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn claimed_ids(drm: &str) -> Vec<String> {
+    nouveau::claimed_ids(drm)
+}
+
+fn nvml_probe() -> Option<Box<dyn GpuBackend>> {
     let nvml = Nvml::init().ok()?;
     match nvml.device_count() {
         Ok(n) if n > 0 => {
@@ -180,6 +205,155 @@ impl GpuBackend for NvmlBackend {
             }));
         }
         out
+    }
+}
+
+/// NVIDIA cards on the open `nouveau` driver, read from sysfs.
+///
+/// nouveau publishes no busy counter and no VRAM total anywhere in sysfs, and
+/// its fdinfo carries no engine accounting, so this reports what hwmon and the
+/// PCI core do have — a name, an identity, temperature, power, fans, link state
+/// — and leaves the rest `None` rather than fabricating an idle-looking 0%. A
+/// card listed with half its gauges empty is still a listed card; the
+/// alternative here is that it does not appear at all.
+///
+/// Reached only when NVML did not initialise, so it can never list a card NVML
+/// already reported.
+#[cfg(target_os = "linux")]
+mod nouveau {
+    use crate::backend::linux::{
+        card_name, cards_with_driver, driver_line, first_dir, hwmon_u64, pci_device_id, pcie_link,
+        pdev_of,
+    };
+    use crate::backend::{GpuBackend, GpuSnapshot};
+    use anyhow::Result;
+    use std::path::PathBuf;
+
+    const NVIDIA_VENDOR: &str = "0x10de";
+
+    struct NouveauDevice {
+        name: String,
+        dev: PathBuf,
+        hwmon: Option<PathBuf>,
+        pdev: Option<String>,
+    }
+
+    struct NouveauBackend {
+        devices: Vec<NouveauDevice>,
+    }
+
+    pub fn probe() -> Option<Box<dyn GpuBackend>> {
+        let devices = scan("/sys/class/drm");
+        (!devices.is_empty()).then(|| Box::new(NouveauBackend { devices }) as Box<dyn GpuBackend>)
+    }
+
+    fn scan(drm: &str) -> Vec<NouveauDevice> {
+        cards_with_driver(drm, NVIDIA_VENDOR, |d| d == "nouveau")
+            .into_iter()
+            .map(|(idx, dev, _)| NouveauDevice {
+                name: card_name(&dev, idx, "10de", "NVIDIA"),
+                hwmon: first_dir(&dev.join("hwmon")),
+                pdev: pdev_of(&dev),
+                dev,
+            })
+            .collect()
+    }
+
+    impl GpuBackend for NouveauBackend {
+        fn name(&self) -> &'static str {
+            "nouveau"
+        }
+
+        fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
+            Ok(self.devices.iter().map(sample).collect())
+        }
+
+        fn driver_info(&self) -> Option<String> {
+            driver_line("nouveau")
+        }
+    }
+
+    fn sample(d: &NouveauDevice) -> GpuSnapshot {
+        let h = d.hwmon.as_deref();
+        let (pcie_gen, pcie_width, pcie_max_gen, pcie_max_width) = pcie_link(&d.dev);
+        GpuSnapshot {
+            name: d.name.clone(),
+            device_id: pci_device_id(d.pdev.as_deref()),
+            // Every nouveau-supported part on a PCI bus is discrete; the Tegra
+            // ones are not enumerated here at all.
+            integrated: false,
+            // nouveau_hwmon: millidegrees, microwatts, pwm 0..pwm1_max.
+            temperature_c: hwmon_u64(h, "temp1_input").map(|v| v as f64 / 1000.0),
+            power_w: hwmon_u64(h, "power1_input").map(|v| v as f64 / 1e6),
+            power_limit_w: hwmon_u64(h, "power1_max")
+                .filter(|v| *v > 0)
+                .map(|v| v as f64 / 1e6),
+            fan_pct: fan_pct(d),
+            fan_rpm: hwmon_u64(h, "fan1_input"),
+            volt_mv: hwmon_u64(h, "in0_input"),
+            pcie_gen,
+            pcie_width,
+            pcie_max_gen,
+            pcie_max_width,
+            // Everything else — utilization, VRAM, clocks — has no sysfs source
+            // under nouveau. None keeps "unknown" distinct from "idle"/"empty".
+            ..Default::default()
+        }
+    }
+
+    /// pwm duty as a percentage of this card's own scale. `pwm1_max` defaults
+    /// to hwmon's 255 when absent, as it does for amdgpu.
+    fn fan_pct(d: &NouveauDevice) -> Option<f64> {
+        let h = d.hwmon.as_deref();
+        let pwm = hwmon_u64(h, "pwm1")?;
+        let max = hwmon_u64(h, "pwm1_max").filter(|v| *v > 0).unwrap_or(255);
+        Some(pwm as f64 / max as f64 * 100.0)
+    }
+
+    /// Cards this backend claims from a fake `/sys/class/drm`, for the shared
+    /// test that proves the Linux scans partition that directory.
+    #[cfg(test)]
+    pub fn claimed_ids(drm: &str) -> Vec<String> {
+        scan(drm)
+            .iter()
+            .filter_map(|d| pci_device_id(d.pdev.as_deref()))
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::backend::linux::testing;
+
+        /// The gap this backend exists to close: with nouveau bound, NVML never
+        /// initialises and nothing else claims vendor 0x10de.
+        #[test]
+        fn scan_claims_nouveau_cards_only() {
+            let root = testing::tri_vendor("nouveau-scan");
+            let devices = scan(&testing::drm(&root));
+            assert_eq!(
+                devices
+                    .iter()
+                    .map(|d| d.pdev.as_deref())
+                    .collect::<Vec<_>>(),
+                [Some("0000:04:00.0")],
+                "card2 is on the proprietary driver — NVML's, not ours"
+            );
+        }
+
+        /// Absent hwmon files must read as unknown, never as a cold, idle card.
+        #[test]
+        fn missing_sysfs_reads_as_unknown_not_zero() {
+            let root = testing::tri_vendor("nouveau-sample");
+            let d = &scan(&testing::drm(&root))[0];
+            let s = sample(d);
+            assert_eq!(s.device_id.as_deref(), Some("pci:0000:04:00.0"));
+            assert!(!s.integrated);
+            for v in [s.utilization_pct, s.temperature_c, s.power_w, s.fan_pct] {
+                assert!(v.is_none());
+            }
+            assert!(s.vram_total_bytes.is_none() && s.clock_mhz.is_none());
+        }
     }
 }
 

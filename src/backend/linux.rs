@@ -1,6 +1,7 @@
-//! Shared Linux DRM plumbing: sysfs readers, pci.ids lookup, and the
-//! /proc fdinfo scan that powers per-process GPU attribution for both the
-//! amdgpu and Intel (i915/xe) backends.
+//! Shared Linux DRM plumbing: sysfs readers, pci.ids lookup, the
+//! `/sys/class/drm` card scan every vendor backend partitions, and the /proc
+//! fdinfo scan that powers per-process GPU attribution for the amdgpu and
+//! Intel (i915/xe) backends.
 //!
 //! Gated once, by `#[cfg(target_os = "linux")] mod linux;` in the parent.
 
@@ -149,12 +150,6 @@ pub fn sweep_clients<F>(devices: &[SweepDevice], mut per_client: F) -> Sweep
 where
     F: FnMut(u32, usize, &FdClient) -> ClientSample,
 {
-    let pdev_to_gpu: HashMap<&str, usize> = devices
-        .iter()
-        .enumerate()
-        .filter_map(|(i, d)| d.pdev.as_deref().map(|p| (p, i)))
-        .collect();
-
     let mut sweep = Sweep::default();
     // (pid, gpu) -> aggregated stats across that process's DRM clients.
     let mut agg: HashMap<(u32, usize), (f64, u64, bool)> = HashMap::new();
@@ -164,12 +159,9 @@ where
         // readdir+stat+read cost is per fd, so a pass per driver name paid it
         // again for every fd the process holds.
         for client in drm_clients(pid) {
-            let Some(&gpu) = client.pdev.as_deref().and_then(|p| pdev_to_gpu.get(p)) else {
+            let Some(gpu) = client_device(devices, &client) else {
                 continue;
             };
-            if devices[gpu].driver != client.driver {
-                continue;
-            }
             if !sweep.seen.insert((pid, client.id)) {
                 continue;
             }
@@ -190,6 +182,24 @@ where
         })
         .collect();
     sweep
+}
+
+/// Which of `devices` a DRM client belongs to — an index into the *calling
+/// backend's own* device list, which the composite then re-bases onto that
+/// child's offset.
+///
+/// Both halves of the match are load-bearing on a mixed-vendor box. The PCI
+/// address is what actually names the card; the driver check is what stops a
+/// client of a card this backend does not own from landing on whichever of its
+/// devices happened to share the address — the backends are disjoint, so a
+/// mismatch here means the client belongs to a sibling backend and this one
+/// must not claim it. A client with no `drm-pdev` line is unattributable and
+/// belongs to nobody.
+pub fn client_device(devices: &[SweepDevice], client: &FdClient) -> Option<usize> {
+    let pdev = client.pdev.as_deref()?;
+    devices
+        .iter()
+        .position(|d| d.pdev.as_deref() == Some(pdev) && d.driver == client.driver)
 }
 
 pub fn proc_pids() -> Vec<u32> {
@@ -322,20 +332,54 @@ pub fn card_index(file_name: &str) -> Option<u32> {
     file_name.strip_prefix("card")?.parse().ok()
 }
 
-/// Sorted (card index, device dir) pairs whose vendor file matches.
-pub fn cards_with_vendor(drm: &str, vendor: &str) -> Vec<(u32, PathBuf)> {
+/// The kernel driver bound to a card's PCI device, from the `device/driver`
+/// symlink ("amdgpu", "radeon", "i915", "xe", "nouveau", "nvidia"). None when
+/// the device is unbound or the link is unreadable, which is the honest answer:
+/// an unbound device publishes no telemetry for anyone to read.
+pub fn driver_of(dev: &Path) -> Option<String> {
+    Some(
+        fs::read_link(dev.join("driver"))
+            .ok()?
+            .file_name()?
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+/// Sorted (card index, device dir, bound driver) for every DRM card under `drm`
+/// whose PCI vendor is `vendor` and whose driver `accept`s.
+///
+/// Every Linux backend readdirs this one directory, so both filters are what
+/// keeps them from stepping on each other:
+///
+/// - The `cardN` name filter drops the render nodes and connectors that share
+///   the directory. `renderD128/device` resolves to the very same PCI device as
+///   its card and its `vendor` reads the same id, so a vendor-only scan lists
+///   every card twice.
+/// - The driver filter is what makes the vendor backends provably disjoint and
+///   keeps each one to devices it can actually read. Vendor id alone would hand
+///   amdgpu's sysfs reader a pre-GCN card on `radeon`, whose layout it does not
+///   speak, as a row of empty gauges.
+pub fn cards_with_driver(
+    drm: &str,
+    vendor: &str,
+    accept: impl Fn(&str) -> bool,
+) -> Vec<(u32, PathBuf, String)> {
     let Ok(entries) = fs::read_dir(drm) else {
         return Vec::new();
     };
-    let mut cards: Vec<(u32, PathBuf)> = entries
+    let mut cards: Vec<(u32, PathBuf, String)> = entries
         .flatten()
         .filter_map(|e| {
             let idx = card_index(&e.file_name().to_string_lossy())?;
-            Some((idx, e.path().join("device")))
+            let dev = e.path().join("device");
+            if read_trim(&dev.join("vendor")).as_deref() != Some(vendor) {
+                return None;
+            }
+            let driver = driver_of(&dev).filter(|d| accept(d))?;
+            Some((idx, dev, driver))
         })
-        .filter(|(_, dev)| read_trim(&dev.join("vendor")).as_deref() == Some(vendor))
         .collect();
-    cards.sort_by_key(|(idx, _)| *idx);
+    cards.sort_by_key(|(idx, _, _)| *idx);
     cards
 }
 
@@ -444,6 +488,90 @@ pub fn card_name(dev: &Path, idx: u32, vendor_hex: &str, fallback_brand: &str) -
         .as_deref()
         .and_then(|ids| pci_device_name(ids, vendor_hex, device_id.trim_start_matches("0x")))
         .unwrap_or_else(|| format!("{fallback_brand} GPU {device_id} (card{idx})"))
+}
+
+/// Fake `/sys/class/drm` trees, shared by every Linux backend's tests. All of
+/// them readdir the same real directory, so they are only provably disjoint
+/// when each is tested against one tree that holds every other vendor's cards
+/// too.
+#[cfg(test)]
+pub mod testing {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// One DRM card, laid out the way sysfs lays it out: a PCI device dir named
+    /// by its BDF, with the `cardN` entry pointing at it through a `device`
+    /// symlink. Going through the symlink is what makes `pdev_of` — which
+    /// canonicalizes — return a real address, and the BDF is what the fdinfo
+    /// sweep matches on.
+    ///
+    /// Alongside the card it plants the entries that share `/sys/class/drm`: a
+    /// render node and a connector, both reaching the same PCI device, so a
+    /// scan that filters on vendor alone claims this card three times.
+    pub fn card(root: &Path, idx: u32, bdf: &str, vendor: &str, device: &str, driver: &str) {
+        let pci = root.join("pci").join(bdf);
+        fs::create_dir_all(&pci).unwrap();
+        fs::write(pci.join("vendor"), format!("{vendor}\n")).unwrap();
+        fs::write(pci.join("device"), format!("{device}\n")).unwrap();
+        if !driver.is_empty() {
+            let target = root.join("pci/drivers").join(driver);
+            fs::create_dir_all(&target).unwrap();
+            std::os::unix::fs::symlink(&target, pci.join("driver")).unwrap();
+        }
+        let drm = root.join("drm");
+        // The card itself, plus the neighbours only the `cardN` name filter
+        // keeps out: a render node and a connector on the same device.
+        for entry in [
+            format!("card{idx}"),
+            format!("renderD{}", 128 + idx),
+            format!("card{idx}-DP-1"),
+        ] {
+            let d = drm.join(entry);
+            fs::create_dir_all(&d).unwrap();
+            std::os::unix::fs::symlink(&pci, d.join("device")).unwrap();
+        }
+    }
+
+    /// A DRM card on something that is not a PCI device — `simpledrm` on the
+    /// EFI framebuffer, `vkms`. Its `device` dir has no `vendor` file at all,
+    /// which every vendor scan has to read as "not mine" rather than trip over.
+    pub fn platform_card(root: &Path, idx: u32) {
+        let plat = root.join("platform/simple-framebuffer.0");
+        fs::create_dir_all(&plat).unwrap();
+        let d = root.join("drm").join(format!("card{idx}"));
+        fs::create_dir_all(&d).unwrap();
+        std::os::unix::fs::symlink(&plat, d.join("device")).unwrap();
+    }
+
+    /// A tri-vendor rig, plus the awkward cards a real one carries: an NVIDIA
+    /// card on the proprietary driver *and* one on nouveau, a pre-GCN AMD card
+    /// on `radeon`, one device per vendor whose `device/driver` symlink does not
+    /// resolve, and a non-PCI DRM device with no vendor at all.
+    ///
+    /// Card indices deliberately do not follow vendor order — the kernel
+    /// numbers them in probe order — so a scan leaning on the index to tell
+    /// vendors apart trips here.
+    pub fn tri_vendor(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("gpur-drm-{name}"));
+        let _ = fs::remove_dir_all(&root);
+        card(&root, 0, "0000:00:02.0", "0x8086", "0x7d55", "i915");
+        card(&root, 1, "0000:03:00.0", "0x1002", "0x744c", "amdgpu");
+        card(&root, 2, "0000:01:00.0", "0x10de", "0x2684", "nvidia");
+        card(&root, 3, "0000:04:00.0", "0x10de", "0x1c03", "nouveau");
+        card(&root, 4, "0000:05:00.0", "0x1002", "0x6779", "radeon");
+        card(&root, 5, "0000:06:00.0", "0x8086", "0xe20b", "xe");
+        // No driver symlink: unbound, or one this process cannot read.
+        card(&root, 6, "0000:07:00.0", "0x1002", "0x1636", "");
+        card(&root, 7, "0000:08:00.0", "0x8086", "0x9a49", "");
+        card(&root, 8, "0000:09:00.0", "0x10de", "0x2504", "");
+        platform_card(&root, 9);
+        root
+    }
+
+    /// The `drm` root to hand a `scan`, as the `&str` the scans take.
+    pub fn drm(root: &Path) -> String {
+        root.join("drm").to_string_lossy().into_owned()
+    }
 }
 
 #[cfg(test)]
@@ -622,6 +750,153 @@ drm-resident-vram0:\t4096 KiB
         );
         assert_eq!(parse_meminfo_total("MemFree:  100 kB\n"), None);
         assert_eq!(parse_meminfo_total("MemTotal:\n"), None);
+    }
+
+    /// The scan claims cards, not the render nodes and connectors sharing the
+    /// directory, and not a card whose driver it does not speak. Both filters
+    /// are what keeps two backends off one device.
+    #[test]
+    fn card_scan_filters_by_name_and_by_driver() {
+        let root = testing::tri_vendor("scan-filters");
+        let drm = testing::drm(&root);
+
+        let amd = cards_with_driver(&drm, "0x1002", |d| d == "amdgpu");
+        assert_eq!(
+            amd.iter()
+                .map(|(i, _, d)| (*i, d.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "amdgpu")],
+            "renderD129/device and card1-DP-1/device read vendor 0x1002 too"
+        );
+        // Widening the predicate is the only thing that adds the radeon card:
+        // nothing else about the tree changed.
+        let both = cards_with_driver(&drm, "0x1002", |d| d == "amdgpu" || d == "radeon");
+        assert_eq!(
+            both.iter()
+                .map(|(i, _, d)| (*i, d.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "amdgpu"), (4, "radeon")]
+        );
+        // The device whose driver symlink does not resolve (card6) is in
+        // neither: nothing bound means nothing to read, from anyone.
+        assert!(!both.iter().any(|(i, _, _)| *i == 6));
+        // A non-PCI DRM device (simpledrm, card9) has no vendor file; reading
+        // one must be a miss, not a panic.
+        assert!(
+            cards_with_driver(&drm, "0x1002", |_| true)
+                .iter()
+                .all(|(i, _, _)| *i != 9)
+        );
+
+        assert_eq!(
+            cards_with_driver(&drm, "0x8086", |d| d == "i915" || d == "xe")
+                .iter()
+                .map(|(i, _, d)| (*i, d.as_str()))
+                .collect::<Vec<_>>(),
+            [(0, "i915"), (5, "xe")]
+        );
+        assert_eq!(
+            cards_with_driver(&drm, "0x10de", |d| d == "nouveau")
+                .iter()
+                .map(|(i, _, d)| (*i, d.as_str()))
+                .collect::<Vec<_>>(),
+            [(3, "nouveau")]
+        );
+        // Sorted by card index regardless of readdir order, so the device
+        // order is the same on every poll and every restart.
+        assert!(
+            cards_with_driver(&drm, "0x1002", |_| true)
+                .windows(2)
+                .all(|w| w[0].0 < w[1].0)
+        );
+    }
+
+    /// The tri-vendor verdict: every Linux backend readdirs one directory, so
+    /// this is the test that they partition it — each card claimed exactly
+    /// once, no id claimed twice, and the NVIDIA card on nouveau not silently
+    /// dropped just because NVML could not initialise.
+    #[test]
+    fn the_linux_backends_partition_one_drm_directory() {
+        let root = testing::tri_vendor("partition");
+        let drm = testing::drm(&root);
+        let amd = crate::backend::amd::claimed_ids(&drm);
+        let intel = crate::backend::intel::claimed_ids(&drm);
+        let nvidia = crate::backend::nvidia::claimed_ids(&drm);
+
+        assert_eq!(amd, ["pci:0000:03:00.0", "pci:0000:05:00.0"]);
+        assert_eq!(intel, ["pci:0000:00:02.0", "pci:0000:06:00.0"]);
+        assert_eq!(nvidia, ["pci:0000:04:00.0"]);
+
+        // Five of the ten entries, once each: card2 is NVML's, cards 6-8 have
+        // no driver bound, and card9 is not a PCI device.
+        let all: Vec<&String> = amd.iter().chain(&intel).chain(&nvidia).collect();
+        let unique: HashSet<&&String> = all.iter().collect();
+        assert_eq!(all.len(), 5);
+        assert_eq!(unique.len(), all.len(), "a device claimed by two backends");
+        // The proprietary-driver card belongs to NVML, which is not scanned
+        // here — nothing else may pick it up.
+        assert!(!all.iter().any(|id| id.ends_with("0000:01:00.0")));
+    }
+
+    /// The BDF the card resolves to is what fdinfo reports as `drm-pdev`, and
+    /// it is the whole of the device identity — so it has to survive the walk
+    /// through `cardN/device`.
+    #[test]
+    fn card_scan_resolves_the_pci_address() {
+        let root = testing::tri_vendor("scan-pdev");
+        let cards = cards_with_driver(&testing::drm(&root), "0x1002", |d| d == "amdgpu");
+        let (_, dev, _) = &cards[0];
+        assert_eq!(pdev_of(dev).as_deref(), Some("0000:03:00.0"));
+        assert_eq!(
+            pci_device_id(pdev_of(dev).as_deref()).as_deref(),
+            Some("pci:0000:03:00.0")
+        );
+    }
+
+    /// Attribution is by PCI address *and* driver. A backend must never claim a
+    /// client of a card it does not own just because the address collides with
+    /// one of its own slots — on a mixed rig that draws an Intel process's row
+    /// against an AMD card.
+    #[test]
+    fn clients_attribute_by_address_and_driver() {
+        let dev = |pdev: &str, driver: &str| SweepDevice {
+            pdev: Some(pdev.to_string()),
+            driver: driver.to_string(),
+        };
+        let amd = [dev("0000:03:00.0", "amdgpu")];
+        let intel = [dev("0000:00:02.0", "i915"), dev("0000:06:00.0", "xe")];
+
+        let i915_client = parse_fdinfo(I915_FDINFO).unwrap();
+        assert_eq!(client_device(&intel, &i915_client), Some(0));
+        assert_eq!(
+            client_device(&amd, &i915_client),
+            None,
+            "an Intel client must not land on the AMD backend's only card"
+        );
+
+        let amd_client = parse_fdinfo(AMD_FDINFO).unwrap();
+        // Same address as the AMD card, wrong driver: a sibling backend's.
+        let impostor = [dev("0000:75:00.0", "i915")];
+        assert_eq!(client_device(&impostor, &amd_client), None);
+        assert_eq!(
+            client_device(&[dev("0000:75:00.0", "amdgpu")], &amd_client),
+            Some(0)
+        );
+
+        // The second device of a backend is index 1 *within that backend* — the
+        // composite re-bases it; an off-by-one here would be silent.
+        let xe_client = parse_fdinfo(XE_FDINFO).unwrap();
+        assert_eq!(
+            client_device(
+                &[dev("0000:00:02.0", "xe"), dev("0000:03:00.0", "xe")],
+                &xe_client
+            ),
+            Some(1)
+        );
+        // No address at all is unattributable, not device 0.
+        let mut anon = parse_fdinfo(AMD_FDINFO).unwrap();
+        anon.pdev = None;
+        assert_eq!(client_device(&[dev("0000:75:00.0", "amdgpu")], &anon), None);
     }
 
     #[test]

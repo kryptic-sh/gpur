@@ -16,10 +16,17 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
     None
 }
 
+/// Device ids this backend claims from a fake `/sys/class/drm`, for the shared
+/// test that proves the Linux scans partition that one directory.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn claimed_ids(drm: &str) -> Vec<String> {
+    linux_impl::claimed_ids(drm)
+}
+
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use crate::backend::linux::{
-        self, ClientSample, FdClient, SweepDevice, card_name, cards_with_vendor, first_dir,
+        self, ClientSample, FdClient, SweepDevice, card_name, cards_with_driver, first_dir,
         hwmon_u64, pdev_of, read_u64,
     };
     use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, clamp_pct};
@@ -324,19 +331,16 @@ mod linux_impl {
             .or_else(|| read_u64(&card.join("lmem_total_bytes")))
     }
 
+    /// Intel's two DRM drivers. Anything else on vendor 8086 in `/sys/class/drm`
+    /// — a future non-GPU DRM device, an unbound card — is not ours to read.
+    fn is_intel_driver(driver: &str) -> bool {
+        driver == "i915" || driver == "xe"
+    }
+
     fn scan(drm: &str) -> Vec<IntelDevice> {
-        cards_with_vendor(drm, INTEL_VENDOR)
+        cards_with_driver(drm, INTEL_VENDOR, is_intel_driver)
             .into_iter()
-            .filter_map(|(idx, dev)| {
-                // Only real GPU drivers; skips e.g. future non-GPU 8086 DRM devs.
-                let driver = std::fs::read_link(dev.join("driver"))
-                    .ok()?
-                    .file_name()?
-                    .to_string_lossy()
-                    .into_owned();
-                if driver != "i915" && driver != "xe" {
-                    return None;
-                }
+            .filter_map(|(idx, dev, driver)| {
                 let card = dev.parent()?.to_path_buf();
                 let name = card_name(&dev, idx, "8086", "Intel");
                 // A published local-memory total means discrete. Mainline i915
@@ -365,10 +369,39 @@ mod linux_impl {
     }
 
     #[cfg(test)]
+    pub fn claimed_ids(drm: &str) -> Vec<String> {
+        scan(drm)
+            .iter()
+            .filter_map(|d| linux::pci_device_id(d.pdev.as_deref()))
+            .collect()
+    }
+
+    #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::backend::linux::parse_fdinfo;
+        use crate::backend::linux::{parse_fdinfo, testing};
         use std::fs;
+
+        /// Exactly the i915/xe cards, on a tree that also holds AMD and NVIDIA
+        /// cards plus the render nodes and connectors that reach the same PCI
+        /// devices — including an 8086 render node whose `vendor` reads 0x8086.
+        #[test]
+        fn scan_claims_intel_driven_cards_only() {
+            let root = testing::tri_vendor("intel-scan");
+            let devices = scan(&testing::drm(&root));
+            assert_eq!(
+                devices
+                    .iter()
+                    .map(|d| (d.pdev.as_deref(), d.driver.as_str()))
+                    .collect::<Vec<_>>(),
+                [(Some("0000:00:02.0"), "i915"), (Some("0000:06:00.0"), "xe"),],
+                "card index order; nothing from another vendor, and not card7, \
+                 whose driver symlink does not resolve"
+            );
+            // `dev.parent()` has to stay the DRM minor dir: i915's clock and
+            // lmem files live there, not on the PCI device.
+            assert!(devices[0].card.ends_with("card0"));
+        }
 
         /// Fake `/sys/class/drm/cardN` + `cardN/device` pair in a scratch dir.
         fn fake_card(name: &str) -> (PathBuf, PathBuf) {

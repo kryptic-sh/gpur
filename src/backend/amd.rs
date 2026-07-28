@@ -1,4 +1,5 @@
-//! AMD backend. Linux: sysfs/amdgpu. Windows: ADLX (not yet implemented).
+//! AMD backend. Linux: sysfs, amdgpu and (name and hwmon only) radeon.
+//! Windows: ADLX (not yet implemented).
 
 use super::GpuBackend;
 
@@ -11,10 +12,17 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
     None
 }
 
+/// Device ids this backend claims from a fake `/sys/class/drm`, for the shared
+/// test that proves the Linux scans partition that one directory.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn claimed_ids(drm: &str) -> Vec<String> {
+    linux_impl::claimed_ids(drm)
+}
+
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use crate::backend::linux::{
-        self, ClientSample, FdClient, SweepDevice, card_name, cards_with_vendor, first_dir,
+        self, ClientSample, FdClient, SweepDevice, card_name, cards_with_driver, first_dir,
         hwmon_u64, pdev_of, read_trim, read_u64,
     };
     use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, clamp_pct};
@@ -25,6 +33,15 @@ mod linux_impl {
     use std::time::Instant;
 
     const AMD_VENDOR: &str = "0x1002";
+
+    /// AMD's two in-tree DRM drivers. `radeon` drives pre-GCN parts and shares
+    /// almost none of amdgpu's sysfs — no `gpu_busy_percent`, no
+    /// `mem_info_vram_*`, no fdinfo engine accounting — so it arrives with most
+    /// gauges empty. It is still listed: an old card in a box is a card, and
+    /// hwmon still gives it a temperature, a fan and a name.
+    fn is_amd_driver(driver: &str) -> bool {
+        driver == "amdgpu" || driver == "radeon"
+    }
 
     pub fn probe() -> Option<Box<dyn GpuBackend>> {
         let devices = scan("/sys/class/drm");
@@ -45,6 +62,9 @@ mod linux_impl {
         hwmon: Option<PathBuf>,
         /// PCI address ("0000:75:00.0"), matched against fdinfo drm-pdev.
         pdev: Option<String>,
+        /// Bound DRM driver, "amdgpu" or "radeon". A client's fdinfo has to
+        /// name the same one before it counts against this device.
+        driver: String,
         /// APU rather than discrete card. Fixed per device, so resolved once:
         /// the per-process memory rule depends on it every sweep.
         integrated: bool,
@@ -132,8 +152,13 @@ mod linux_impl {
             self.last_procs.clone()
         }
 
+        /// Names the drivers actually in use, not the backend: a box with a
+        /// pre-GCN card beside a modern one is running both, and a header
+        /// reading "amdgpu" would misattribute the gauges the old card lacks.
         fn driver_info(&self) -> Option<String> {
-            linux::driver_line("amdgpu")
+            let drivers: std::collections::BTreeSet<&str> =
+                self.devices.iter().map(|d| d.driver.as_str()).collect();
+            linux::driver_line(&drivers.into_iter().collect::<Vec<_>>().join("+"))
         }
     }
 
@@ -145,7 +170,7 @@ mod linux_impl {
                 .iter()
                 .map(|d| SweepDevice {
                     pdev: d.pdev.clone(),
-                    driver: "amdgpu".into(),
+                    driver: d.driver.clone(),
                 })
                 .collect();
             let integrated: Vec<bool> = self.devices.iter().map(|d| d.integrated).collect();
@@ -232,9 +257,9 @@ mod linux_impl {
     }
 
     fn scan(drm: &str) -> Vec<AmdDevice> {
-        cards_with_vendor(drm, AMD_VENDOR)
+        cards_with_driver(drm, AMD_VENDOR, is_amd_driver)
             .into_iter()
-            .map(|(idx, dev)| {
+            .map(|(idx, dev, driver)| {
                 let name = card_name(&dev, idx, "1002", "AMD");
                 let hwmon = first_dir(&dev.join("hwmon"));
                 let pdev = pdev_of(&dev);
@@ -260,6 +285,7 @@ mod linux_impl {
                     dev,
                     hwmon,
                     pdev,
+                    driver,
                     temp_crit_c,
                     temp_junction_ch,
                     temp_mem_ch,
@@ -440,8 +466,67 @@ mod linux_impl {
     }
 
     #[cfg(test)]
+    pub fn claimed_ids(drm: &str) -> Vec<String> {
+        scan(drm)
+            .iter()
+            .filter_map(|d| linux::pci_device_id(d.pdev.as_deref()))
+            .collect()
+    }
+
+    #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::backend::linux::testing;
+
+        /// Exactly the AMD-driven cards, on a tree that also holds Intel and
+        /// NVIDIA cards, an unbound 0x1002 device, and the render nodes and
+        /// connectors whose `device/vendor` reads 0x1002 as well.
+        #[test]
+        fn scan_claims_amd_driven_cards_only() {
+            let root = testing::tri_vendor("amd-scan");
+            let devices = scan(&testing::drm(&root));
+            assert_eq!(
+                devices
+                    .iter()
+                    .map(|d| (d.pdev.as_deref(), d.driver.as_str()))
+                    .collect::<Vec<_>>(),
+                [
+                    (Some("0000:03:00.0"), "amdgpu"),
+                    // Pre-GCN, listed rather than dropped: hwmon still names a
+                    // temperature and pci.ids still names the card.
+                    (Some("0000:05:00.0"), "radeon"),
+                ],
+                "card6 is unbound, and the 0x10de/0x8086 cards are not ours"
+            );
+            // Ordered by card index (1 then 4), so the digit keys address the
+            // same card on every poll and every restart. Names stay distinct
+            // whether or not this host has a pci.ids to resolve them against.
+            assert_ne!(devices[0].name, devices[1].name);
+        }
+
+        /// A radeon card must not be handed to the amdgpu fdinfo sweep: the
+        /// driver a client names has to be the one the device is bound to.
+        #[test]
+        fn sweep_devices_carry_each_card_own_driver() {
+            let root = testing::tri_vendor("amd-sweep");
+            let devices = scan(&testing::drm(&root));
+            let sweep: Vec<linux::SweepDevice> = devices
+                .iter()
+                .map(|d| linux::SweepDevice {
+                    pdev: d.pdev.clone(),
+                    driver: d.driver.clone(),
+                })
+                .collect();
+            let client = linux::parse_fdinfo(
+                "drm-driver:\tamdgpu\ndrm-client-id:\t1\ndrm-pdev:\t0000:05:00.0\n",
+            )
+            .unwrap();
+            assert_eq!(
+                linux::client_device(&sweep, &client),
+                None,
+                "the card at 05:00.0 runs radeon; an amdgpu client is not its"
+            );
+        }
 
         /// Fake sysfs root for one test, wiped so a rerun can't see stale files.
         fn fake_sysfs(name: &str) -> PathBuf {
