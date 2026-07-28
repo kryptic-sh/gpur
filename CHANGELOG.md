@@ -8,6 +8,39 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **NVIDIA cards on the nouveau driver are listed.** NVML exists only with the
+  proprietary driver, and the AMD and Intel scans correctly filter on their own
+  PCI vendor, so a nouveau-bound card was claimed by no backend at all — on a
+  mixed-vendor machine gpur showed the other cards and gave no hint one was
+  missing. A sysfs backend now runs behind the NVML probe, so it can never
+  double-list a card NVML already reported. It carries name, PCI id, hwmon
+  temperature/power/fan/voltage and PCIe link state; utilization, VRAM and
+  clocks stay absent, because nouveau publishes none of them and a fabricated
+  `0%` would read as an idle GPU.
+- Pre-GCN AMD cards on the `radeon` driver are listed, with the gauges that
+  driver actually supports.
+
+### Fixed
+
+- **The AMD scan claimed cards by PCI vendor alone**, so it took `radeon` cards
+  and cards with no driver bound, then read them through amdgpu's sysfs layout.
+  Both Linux scans now claim by vendor _and_ driver, and each device carries its
+  own driver rather than the hardcoded `"amdgpu"` that made the fdinfo sweep's
+  driver check a lie for any `radeon` card.
+- **A vacated slot in the composite backend could inherit a live device's
+  identity.** When a child shrank and the survivor landed on a lower slot, one
+  poll emitted two rows with the same `device_id`. The TUI was unaffected —
+  `App` degrades a repeated id to a positional key — but `--json` and `--log`
+  recorded the duplicate and `--replay` read it back.
+- `poll()` returned an empty device list with the error swallowed when one child
+  errored and another reported no devices; it now surfaces the failure, while a
+  genuine partial failure still keeps the surviving vendors' cards on screen.
+- On an Intel Mac the iGPU was filed as discrete while being handed all of
+  system RAM as its VRAM total, and the header driver line was fixed at probe so
+  an eGPU's kext never joined it.
+
 ## [0.9.0] - 2026-07-27
 
 ### Fixed

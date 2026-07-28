@@ -1,6 +1,6 @@
 # gpur backlog
 
-Known gaps, carried over from the review passes on `v0.8.1` (`fad7fe9`).
+Known gaps from the review passes and the multi-vendor detection audit.
 Everything already fixed lives in `CHANGELOG.md`; only open work is listed here.
 
 Roughly ordered by what is worth doing first. Nothing here is a correctness bug
@@ -47,10 +47,31 @@ synchronous, so `event::poll` cannot run during it and keypresses queue. Fine at
 ordinary scale; on a 10k-process node at `--tick-ms 100` the sweep can exceed
 the tick.
 
-**Fix:** move the sweep to a worker thread handing snapshots to the UI over a
-channel. Deliberately deferred — a structural change, not a bug fix.
+**And it multiplies per vendor.** Each Linux backend runs its own full `/proc`
+walk, so an AMD + Intel + nouveau box stats every fd of every process three
+times per tick, discarding the clients that belong to the other backends each
+time. Deduplicating means one sweep shared across children, which is a `mod.rs`
+design change rather than a per-backend fix.
 
-## 3. Remaining test gaps
+**Fix:** one shared sweep per poll, on a worker thread handing snapshots to the
+UI over a channel. Deliberately deferred — structural, not a bug fix.
+
+## 3. An NVIDIA card is still invisible when NVML is broken rather than absent
+
+**Severity: low.** `src/backend/nvidia.rs`.
+
+The nouveau case is covered: a card on the open driver is picked up from sysfs
+behind the NVML probe. What remains is a card bound to the _proprietary_ driver
+on a host where NVML cannot initialise — a container without `/dev/nvidiactl`, a
+mismatched driver/userspace pair. The card is in `/sys/class/drm` and no backend
+claims it.
+
+The reason it is not simply fixed the same way: an `nvidia`-bound card exposes
+essentially nothing in sysfs — no busy counter, no VRAM, no hwmon in the usual
+place — so listing it would add a name and a PCI address and nothing else.
+Whether a row of `n/a` beats an absent card is a product call, not a bug.
+
+## 4. Remaining test gaps
 
 - **The kill path's signal branch.** Unit tests in `app.rs` cover every refusal
   and one successful signal against a spawned `sleep`, but no PTY test reaches
@@ -73,7 +94,7 @@ channel. Deliberately deferred — a structural change, not a bug fix.
   `windows.rs` and `apple.rs` now have unit tests that run on any host. Closing
   it properly needs a self-hosted runner.
 
-## 4. NVIDIA temperature threshold unread
+## 5. NVIDIA temperature threshold unread
 
 **Severity: low.** `Device::temperature_threshold()` is available in
 `nvml-wrapper 0.12.1` (`device.rs:4048`) and would give the temperature meter a
@@ -85,14 +106,14 @@ the only temperature field ids in `nvml-wrapper-sys 0.9.1` are
 `NVML_FI_DEV_MEMORY_TEMP` (wired up) and the four `*_TLIMIT` margins, which are
 thresholds, not a hotspot reading.
 
-## 5. Waveform history cannot represent "unknown"
+## 6. Waveform history cannot represent "unknown"
 
 **Severity: low.** `src/app.rs`. `utilization_pct` is `Option`, but an
 unreadable sample is recorded as `0` in the history ring because a sparkline has
 no glyph for absent. The meter above the graph carries the distinction; the
 graph does not. Commented at the site.
 
-## 6. Device naming differs per backend
+## 7. Device naming differs per backend
 
 **Severity: low, cosmetic.** `nvidia.rs` gives the marketing name
 (`NVIDIA GeForce RTX 4090`), the Linux backends the pci.ids codename
@@ -103,7 +124,7 @@ brand. Fallbacks differ too: `NVIDIA GPU 0` (index) against
 **Fix:** settle on a convention — prefer the marketing name, fall back to the
 codename, always suffix the card or index — and apply it uniformly.
 
-## 7. `splash::build_path` truncates coordinates to `u8`
+## 8. `splash::build_path` truncates coordinates to `u8`
 
 **Severity: low.** `src/splash.rs:24` — `path.push((r as u8, c as u8, ch))`.
 `art.txt` is 5×33 so this is safe today, and the `u8` is imposed by
@@ -111,7 +132,7 @@ codename, always suffix the card or index — and apply it uniformly.
 scatter the cursor trail. Assert the art's dimensions rather than relying on it
 staying small.
 
-## 8. Residual YAGNI
+## 9. Residual YAGNI
 
 - `src/ui.rs:603` `draw_meter` takes 8 arguments behind
   `#[allow(clippy::too_many_arguments)]` with two production call sites.
