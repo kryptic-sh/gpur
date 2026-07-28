@@ -61,16 +61,22 @@ mod parse {
         };
 
         // Discrete cards report VRAM,totalMB; unified memory uses system RAM.
-        let total = a
-            .vram_total_mb
-            .filter(|mb| *mb > 0)
+        let own_vram = a.vram_total_mb.filter(|mb| *mb > 0);
+        let total = own_vram
             .map(|mb| (mb as u64).saturating_mul(1024 * 1024))
             .or(system_mem);
 
         GpuSnapshot {
             name,
             device_id: a.entry_id.map(|id| format!("ioreg:{id}")),
-            integrated: agx,
+            // No pool of its own means it is carving from system RAM: Apple
+            // Silicon's unified memory, or the Intel iGPU sitting beside an
+            // AMD dGPU on an Intel Mac. Keying this off AGX alone filed that
+            // iGPU as discrete while still handing it the whole of system RAM
+            // as its "VRAM" — the flag has to agree with where the total came
+            // from, or one card on a two-GPU Mac claims 32 GB of dedicated
+            // memory it does not have.
+            integrated: agx || own_vram.is_none(),
             // An accelerator that publishes no PerformanceStatistics (the
             // paravirt one on CI, some Intel-Mac drivers) must read "unknown",
             // not "idle" — `RawAccel` keeps the distinction and it survives
@@ -173,19 +179,25 @@ mod macos {
         if accels.is_empty() {
             return None;
         }
+        let os_product = sysctl_string("kern.osproductversion");
+        let os_build = sysctl_string("kern.osversion");
         Some(Box::new(AppleBackend {
-            driver: driver_line(
-                &accels,
-                sysctl_string("kern.osproductversion").as_deref(),
-                sysctl_string("kern.osversion").as_deref(),
-            ),
+            driver: driver_line(&accels, os_product.as_deref(), os_build.as_deref()),
+            os_product,
+            os_build,
             cpu_brand: sysctl_string("machdep.cpu.brand_string"),
             total_mem: sysctl_u64("hw.memsize").filter(|m| *m > 0),
         }))
     }
 
     struct AppleBackend {
+        /// Recomputed every poll, because the kext half of it lists the
+        /// accelerators present: an eGPU plugged in mid-session shows up as a
+        /// card immediately, and a header fixed at probe would never name its
+        /// driver. The OS half is a sysctl, so it is read once.
         driver: Option<String>,
+        os_product: Option<String>,
+        os_build: Option<String>,
         cpu_brand: Option<String>,
         /// `hw.memsize`, the unified-memory pool. None if the sysctl fails —
         /// an Apple Silicon card then reports no VRAM total rather than 0.
@@ -200,7 +212,13 @@ mod macos {
         fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
             // Re-enumerate per poll: cheap, and picks up eGPU hotplug. Index
             // order stays stable because enumerate_accelerators sorts.
-            Ok(enumerate_accelerators()
+            let accels = enumerate_accelerators();
+            self.driver = driver_line(
+                &accels,
+                self.os_product.as_deref(),
+                self.os_build.as_deref(),
+            );
+            Ok(accels
                 .iter()
                 .map(|a| snapshot(a, self.cpu_brand.as_deref(), self.total_mem))
                 .collect())
@@ -428,6 +446,33 @@ mod tests {
             snapshot(&zero, None, Some(16 << 30)).vram_total_bytes,
             Some(16 << 30)
         );
+    }
+
+    /// The two-GPU Intel Mac (and the eGPU beside it): every accelerator is
+    /// shaped independently, the dGPU keeps its own pool, and the iGPU is
+    /// marked integrated rather than claiming all of system RAM as dedicated
+    /// VRAM. Ids stay distinct, which is what keeps their graphs apart.
+    #[test]
+    fn an_intel_mac_separates_its_igpu_from_its_dgpu() {
+        let igpu = RawAccel {
+            entry_id: Some(4097),
+            io_class: Some("AppleIntelKBLGraphics".to_string()),
+            ..Default::default()
+        };
+        let dgpu = RawAccel {
+            entry_id: Some(4098),
+            io_class: Some("AMDRadeonX6000".to_string()),
+            vram_total_mb: Some(8192),
+            ..Default::default()
+        };
+        let mem = Some(32 << 30);
+        let (i, d) = (snapshot(&igpu, None, mem), snapshot(&dgpu, None, mem));
+        assert_eq!(i.name, "AppleIntelKBLGraphics");
+        assert_eq!(d.name, "AMDRadeonX6000");
+        assert!(i.integrated, "an iGPU with no VRAM,totalMB is integrated");
+        assert!(!d.integrated);
+        assert_eq!(d.vram_total_bytes, Some(8 << 30));
+        assert_ne!(i.device_id, d.device_id);
     }
 
     #[test]

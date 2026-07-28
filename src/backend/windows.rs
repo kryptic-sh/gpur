@@ -561,6 +561,32 @@ mod tests {
         assert_eq!(kept(&[NVIDIA, NVIDIA]), kept(&[NVIDIA]));
     }
 
+    /// The filter is per vendor id, not one-per-vendor: the tri-vendor box
+    /// with a second card from an unclaimed vendor — an Intel Arc beside the
+    /// Intel iGPU, two AMD cards — must contribute every one of them, and a
+    /// claimed vendor must lose every one of its own.
+    #[test]
+    fn several_adapters_of_one_vendor_are_all_kept_or_all_dropped() {
+        let rig = || {
+            vec![
+                ("RTX 4090", 0x10de_u32),
+                ("RTX 3060", 0x10de),
+                ("Intel UHD 770", 0x8086),
+                ("Intel Arc A770", 0x8086),
+            ]
+        };
+        let kept = |claimed: &[u16]| -> Vec<&'static str> {
+            retain_unclaimed(rig(), claimed, |a| a.1)
+                .into_iter()
+                .map(|a| a.0)
+                .collect()
+        };
+        // NVML covers both its cards; both Intel adapters are PDH's.
+        assert_eq!(kept(&[NVIDIA]), ["Intel UHD 770", "Intel Arc A770"]);
+        assert_eq!(kept(&[INTEL]), ["RTX 4090", "RTX 3060"]);
+        assert!(kept(&[NVIDIA, INTEL]).is_empty());
+    }
+
     /// Every adapter claimed leaves nothing to report, which is what makes
     /// `probe` return None and an NVIDIA-only rig keep NVML alone.
     #[test]

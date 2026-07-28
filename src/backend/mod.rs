@@ -253,6 +253,15 @@ impl GpuBackend for CompositeBackend {
                 c.ids[i].clone_from(&snap.device_id);
             }
             for i in snaps.len()..c.slots {
+                // A device that came back at a lower slot is already live at
+                // its new index, so the slot it vacated must stop claiming it.
+                // Two rows in one poll carrying one `device_id` share one set
+                // of graphs and one session peak, and `--json` would name the
+                // same GPU twice — which `--replay` then reads back.
+                if c.ids[i].is_some() && c.ids[..snaps.len()].contains(&c.ids[i]) {
+                    c.ids[i] = None;
+                    c.names[i].clear();
+                }
                 let label = match c.names.get(i) {
                     Some(n) if !n.is_empty() => n.clone(),
                     _ => format!("{} GPU {i}", c.backend.name()),
@@ -265,7 +274,11 @@ impl GpuBackend for CompositeBackend {
             }
             out.append(&mut snaps);
         }
-        if !errors.is_empty() && errors.len() == self.children.len() {
+        // A partial failure keeps the surviving vendors' cards on screen. An
+        // empty result must not: every child failing, or the one child that
+        // answered having nothing yet to hold slots open, would otherwise
+        // render as a blank device list with no error to explain it.
+        if !errors.is_empty() && (out.is_empty() || errors.len() == self.children.len()) {
             anyhow::bail!("{}", errors.join("; "));
         }
         Ok(out)
@@ -603,6 +616,116 @@ mod tests {
         assert_eq!(procs, [(1, 0), (3, 1)]);
     }
 
+    /// The tri-vendor rig, which is the whole reason this type exists: three
+    /// children of three different sizes, every card listed once, and a
+    /// process on the LAST child's SECOND device landing on the global index
+    /// its card actually occupies. Offsets that used the poll's device count
+    /// instead of the slot count, or that forgot to accumulate, both survive
+    /// two children and fall over here.
+    #[test]
+    fn three_children_concatenate_and_rebase_processes() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new("nvml", vec![Some(vec!["4090", "4080"])]).procs(&[(1, 0), (2, 1)])),
+            Box::new(Stub::new("amdgpu", vec![Some(vec!["780M"])]).procs(&[(3, 0)])),
+            Box::new(Stub::new("intel", vec![Some(vec!["UHD", "Arc"])]).procs(&[(4, 0), (5, 1)])),
+        ]);
+        assert_eq!(
+            names(&b.poll().unwrap()),
+            ["4090", "4080", "780M", "UHD", "Arc"]
+        );
+        assert_eq!(
+            ids(&b.poll().unwrap()),
+            [
+                Some("nvml#0:4090"),
+                Some("nvml#0:4080"),
+                Some("amdgpu#1:780M"),
+                Some("intel#2:UHD"),
+                Some("intel#2:Arc"),
+            ]
+        );
+        let procs: Vec<(u32, usize)> = b.processes().iter().map(|p| (p.pid, p.gpu_index)).collect();
+        assert_eq!(procs, [(1, 0), (2, 1), (3, 2), (4, 3), (5, 4)]);
+    }
+
+    /// A genuine hotplug in the middle child. Slots are a high-water mark, so
+    /// shrinking holds the later children still and growing pushes them down
+    /// by exactly one — and the process rebasing has to track that on the same
+    /// poll, or the last child's rows land on the vanished card.
+    #[test]
+    fn a_middle_child_changing_size_moves_the_children_after_it() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new("nvml", vec![Some(vec!["4090"])]).procs(&[(1, 0)])),
+            Box::new(Stub::new(
+                "amdgpu",
+                vec![
+                    Some(vec!["W7900", "W7800"]),
+                    Some(vec!["W7900"]),
+                    Some(vec!["W7900", "W7800", "W7700"]),
+                ],
+            )),
+            Box::new(Stub::new("intel", vec![Some(vec!["Arc"])]).procs(&[(9, 0)])),
+        ]);
+        let last = |b: &mut CompositeBackend| {
+            b.processes()
+                .iter()
+                .map(|p| (p.pid, p.gpu_index))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(names(&b.poll().unwrap()), ["4090", "W7900", "W7800", "Arc"]);
+        assert_eq!(last(&mut b), [(1, 0), (9, 3)]);
+
+        // Shrunk: the placeholder holds slot 2, so Arc does not move and keeps
+        // both its id and its process row.
+        let snaps = b.poll().unwrap();
+        assert_eq!(
+            names(&snaps),
+            ["4090", "W7900", "W7800 (unavailable)", "Arc"]
+        );
+        assert_eq!(ids(&snaps)[2], Some("amdgpu#1:W7800"));
+        assert_eq!(last(&mut b), [(1, 0), (9, 3)]);
+
+        // Grown past its high-water mark: Arc moves down one, and its process
+        // row moves with it rather than staying on the new AMD card.
+        let snaps = b.poll().unwrap();
+        assert_eq!(names(&snaps), ["4090", "W7900", "W7800", "W7700", "Arc"]);
+        assert_eq!(ids(&snaps)[4], Some("intel#2:Arc"));
+        assert_eq!(last(&mut b), [(1, 0), (9, 4)]);
+    }
+
+    /// A child that reports nothing at all owns no slots, so it must not
+    /// consume an index — the children after it would each be off by one —
+    /// and its own process rows have nowhere to go.
+    #[test]
+    fn a_child_with_no_devices_takes_no_slots() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new("nvml", vec![Some(vec!["4090"])]).procs(&[(1, 0)])),
+            Box::new(Stub::new("empty", vec![Some(Vec::new())]).procs(&[(7, 0)])),
+            Box::new(Stub::new("amdgpu", vec![Some(vec!["780M"])]).procs(&[(3, 0)])),
+        ]);
+        assert_eq!(names(&b.poll().unwrap()), ["4090", "780M"]);
+        let procs: Vec<(u32, usize)> = b.processes().iter().map(|p| (p.pid, p.gpu_index)).collect();
+        assert_eq!(procs, [(1, 0), (3, 1)]);
+    }
+
+    /// A device that reappears at a lower slot within its child is live at its
+    /// new index; the slot it vacated must stop claiming it. Inheriting it
+    /// blind put the same `device_id` on two rows of one poll — one set of
+    /// graphs for two cards, and a `--json` record naming the same GPU twice.
+    #[test]
+    fn a_vacated_slot_does_not_duplicate_a_live_device_id() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new("nv", vec![Some(vec!["A", "B"]), Some(vec!["B"])])),
+            Box::new(Stub::new("amd", vec![Some(vec!["APU"])])),
+        ]);
+        b.poll().unwrap();
+        let snaps = b.poll().unwrap();
+        assert_eq!(ids(&snaps), [Some("nv#0:B"), None, Some("amd#1:APU")]);
+        // And the placeholder stops printing the name of a card that is on
+        // screen one row above it.
+        assert_eq!(names(&snaps), ["B", "nv GPU 1 (unavailable)", "APU"]);
+    }
+
     #[test]
     fn every_child_failing_is_a_poll_error() {
         let mut b = CompositeBackend::new(vec![
@@ -616,6 +739,18 @@ mod tests {
         );
     }
 
+    /// Nothing came back and something failed: the error has to surface, or
+    /// the header reads "no error" over an empty device list.
+    #[test]
+    fn an_empty_result_surfaces_a_partial_failure() {
+        let mut b = CompositeBackend::new(vec![
+            Box::new(Stub::new("nv", vec![None])),
+            Box::new(Stub::new("amd", vec![Some(Vec::new())])),
+        ]);
+        let err = format!("{:#}", b.poll().unwrap_err());
+        assert!(err.contains("nv is down"), "{err}");
+    }
+
     #[test]
     fn can_signal_is_the_and_of_the_children() {
         let live = || Box::new(Stub::new("nv", vec![Some(vec!["4090"])]));
@@ -624,6 +759,17 @@ mod tests {
             !CompositeBackend::new(vec![
                 live(),
                 Box::new(Stub::new("mock", vec![Some(vec!["fake"])]).no_signal()),
+            ])
+            .can_signal()
+        );
+        // Three children: one un-signalable in the middle still disables the
+        // kill path, since the process table is one list.
+        assert!(CompositeBackend::new(vec![live(), live(), live()]).can_signal());
+        assert!(
+            !CompositeBackend::new(vec![
+                live(),
+                Box::new(Stub::new("replay", vec![Some(vec!["rec"])]).no_signal()),
+                live(),
             ])
             .can_signal()
         );
@@ -724,6 +870,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(b.name(), "nvml");
+    }
+
+    /// The Windows tri-vendor box, end to end. Only NVML probes there — the
+    /// AMD and Intel backends are inner-gated to Linux and return `None` — so
+    /// only NVIDIA is claimed and PDH must contribute BOTH the AMD and the
+    /// Intel adapter. A claim keyed off the platform rather than off the probe
+    /// actually returning a backend would silence one or both of them.
+    #[test]
+    fn a_vendor_that_did_not_probe_claims_nothing() {
+        let mut b = compose_with_generic(
+            vec![vendor("nvml", &[PCI_VENDOR_NVIDIA])],
+            generic(&[
+                ("4090", PCI_VENDOR_NVIDIA),
+                ("780M", PCI_VENDOR_AMD),
+                ("UHD", PCI_VENDOR_INTEL),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(b.name(), "multi");
+        // NVML's card once, from NVML; the other two vendors from PDH.
+        assert_eq!(names(&b.poll().unwrap()), ["card", "780M", "UHD"]);
+        assert_eq!(
+            b.driver_info().as_deref(),
+            Some("nvml · pdh"),
+            "a child must not drop out of the header"
+        );
     }
 
     #[test]
