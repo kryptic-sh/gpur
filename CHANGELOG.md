@@ -8,6 +8,19 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-07-28
+
+### Changed
+
+- Dependencies refreshed to their latest compatible versions across ~45 crates —
+  clap, serde, regex, sysinfo, libc, toml, and the pest and futures trees, with
+  hjkl moving 0.33.3 to 0.33.6. No manifest ranges and no code changed.
+
+  The hjkl crates have 0.39 available, which is semver-incompatible with the
+  0.33 range pinned here and spans config, keymap, theme and splash — config and
+  cache paths, keybindings, theming. That is a behavioural change rather than a
+  refresh, so it is deliberately left for its own release.
+
 ## [0.10.0] - 2026-07-28
 
 ### Added
@@ -473,7 +486,8 @@ and this project adheres to
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/kryptic-sh/gpur/releases/tag/v0.10.1
 [0.10.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.10.0
 [0.9.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.9.0
 [0.8.1]: https://github.com/kryptic-sh/gpur/releases/tag/v0.8.1
