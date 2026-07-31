@@ -86,6 +86,22 @@ mod linux_impl {
         last_procs: Vec<GpuProcess>,
     }
 
+    /// One fdinfo sweep, with the per-device buckets only Intel keeps: memory
+    /// split by where it lives, and the evidence that the sweep saw the device
+    /// at all.
+    struct IntelSweep {
+        sweep: linux::Sweep,
+        /// gpu index -> summed client-resident device-local (VRAM) bytes.
+        local_mem: HashMap<usize, u64>,
+        /// gpu index -> summed system-backed (GTT-equivalent) bytes.
+        system_mem: HashMap<usize, u64>,
+        /// gpu indices at least one DRM client was attributed to this pass.
+        /// `Sweep::seen` is keyed by (pid, client-id) and so cannot answer
+        /// this. Without it an unattributed device is indistinguishable from
+        /// an idle one, because both leave every bucket above empty.
+        attributed: HashSet<usize>,
+    }
+
     impl GpuBackend for IntelBackend {
         fn name(&self) -> &'static str {
             "intel"
@@ -93,8 +109,8 @@ mod linux_impl {
 
         fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
             // One fdinfo sweep feeds device utilization AND the process table.
-            let (mut sweep, mut local_mem, mut system_mem) = self.sweep_clients();
-            self.last_procs = std::mem::take(&mut sweep.procs);
+            let mut s = self.sweep_clients();
+            self.last_procs = std::mem::take(&mut s.sweep.procs);
 
             let now = Instant::now();
             let powers: Vec<Option<f64>> = (0..self.devices.len())
@@ -110,15 +126,19 @@ mod linux_impl {
                     let power_w = powers[i];
                     let (pcie_gen, pcie_width, pcie_max_gen, pcie_max_width) =
                         linux::pcie_link(&d.dev);
+                    // Whether the sweep could see this device's clients at all;
+                    // every sum below is meaningless without it.
+                    let attributed = s.attributed.contains(&i);
                     GpuSnapshot {
                         name: d.name.clone(),
                         device_id: linux::pci_device_id(d.pdev.as_deref()),
                         integrated: !d.discrete,
-                        // Summed over this device's DRM clients: no clients is
-                        // a measured 0%, not an unreadable counter.
-                        utilization_pct: Some(clamp_pct(sweep.util.remove(&i).unwrap_or(0.0))),
+                        // Summed over this device's DRM clients — the only
+                        // busy figure Intel offers.
+                        utilization_pct: attributed_sum(attributed, s.sweep.util.remove(&i))
+                            .map(clamp_pct),
                         mem_util_pct: None,
-                        video_util_pct: sweep.video_util.remove(&i).map(clamp_pct),
+                        video_util_pct: s.sweep.video_util.remove(&i).map(clamp_pct),
                         enc_util_pct: None,
                         dec_util_pct: None,
                         throttle: None,
@@ -126,7 +146,9 @@ mod linux_impl {
                         // meaningful where a local pool exists at all: an iGPU
                         // has none, and reporting 0 there would claim an empty
                         // VRAM pool that the device does not have.
-                        vram_used_bytes: d.vram_total.map(|_| local_mem.remove(&i).unwrap_or(0)),
+                        vram_used_bytes: d
+                            .vram_total
+                            .and_then(|_| attributed_sum(attributed, s.local_mem.remove(&i))),
                         // None, never 0: mainline i915 publishes no total.
                         vram_total_bytes: d.vram_total,
                         temperature_c: hwmon_u64(h, "temp1_input").map(|v| v as f64 / 1000.0),
@@ -144,7 +166,7 @@ mod linux_impl {
                         // System-RAM-backed graphics memory. This is the only
                         // memory an iGPU has, and the UI renders it exactly
                         // like amdgpu's GTT pool.
-                        gtt_used_bytes: Some(system_mem.remove(&i).unwrap_or(0)),
+                        gtt_used_bytes: attributed_sum(attributed, s.system_mem.remove(&i)),
                         gtt_total_bytes: sys_mem_total,
                         ..Default::default()
                     }
@@ -167,9 +189,7 @@ mod linux_impl {
 
     impl IntelBackend {
         /// Scan all processes' Intel DRM clients once, via the shared sweep.
-        /// Returns the sweep plus the two per-device memory buckets Intel
-        /// needs: device-local (VRAM) and system-backed (GTT) bytes.
-        fn sweep_clients(&mut self) -> (linux::Sweep, HashMap<usize, u64>, HashMap<usize, u64>) {
+        fn sweep_clients(&mut self) -> IntelSweep {
             let devices: Vec<SweepDevice> = self
                 .devices
                 .iter()
@@ -183,6 +203,7 @@ mod linux_impl {
             let mut local_mem: HashMap<usize, u64> = HashMap::new();
             let mut system_mem: HashMap<usize, u64> = HashMap::new();
             let mut has_local: HashSet<usize> = HashSet::new();
+            let mut attributed: HashSet<usize> = HashSet::new();
             let now = Instant::now();
             let i915_state = &mut self.i915_state;
             let xe_state = &mut self.xe_state;
@@ -213,6 +234,7 @@ mod linux_impl {
                 if mem.saw_local {
                     has_local.insert(gpu);
                 }
+                attributed.insert(gpu);
 
                 ClientSample {
                     // xe_ratio can exceed 1.0 on odd counters; clamp both
@@ -236,7 +258,12 @@ mod linux_impl {
                 self.devices[gpu].discrete = true;
             }
 
-            (sweep, local_mem, system_mem)
+            IntelSweep {
+                sweep,
+                local_mem,
+                system_mem,
+                attributed,
+            }
         }
 
         /// Watts from the hwmon cumulative energy counter (µJ) delta, with a
@@ -255,6 +282,19 @@ mod linux_impl {
             }
             read_u64(&h.join("power1_input")).map(|v| v as f64 / 1e6)
         }
+    }
+
+    /// A per-device sum from the fdinfo sweep, but only where the sweep was in
+    /// a position to measure anything: `attributed` says at least one client
+    /// of that device was read. Everything Intel reports is a sum over other
+    /// processes' fdinfo, and `/proc/<pid>/fd` is unreadable for every process
+    /// another user owns — so an unprivileged gpur watching someone else's
+    /// saturated iGPU attributes nothing to it and every bucket comes back
+    /// empty. Reporting the empty sum there paints a confident 0% meter over a
+    /// pegged GPU, so an unattributed device is None. A device whose clients
+    /// were read and summed to zero really is idle, and keeps its Some.
+    fn attributed_sum<T: Default>(attributed: bool, sum: Option<T>) -> Option<T> {
+        attributed.then(|| sum.unwrap_or_default())
     }
 
     /// i915 names media engines "video"/"video-enhance"; xe "vcs"/"vecs".
@@ -456,6 +496,32 @@ drm-resident-vram0:\t1024 MiB
 drm-resident-stolen:\t8 MiB
 drm-resident-gtt:\t1024 KiB
 ";
+
+        /// An attributed client that happens to be doing nothing is a real
+        /// measurement of an idle device, and has to survive as `Some(0.0)` —
+        /// the meter is supposed to be drawn, empty.
+        #[test]
+        fn idle_attributed_clients_still_measure_zero() {
+            assert_eq!(attributed_sum(true, Some(0.0)), Some(0.0));
+            assert_eq!(attributed_sum(true, Some(0u64)), Some(0));
+            // Clients were seen, so the device's bucket exists even when no
+            // client of it contributed to this particular sum.
+            assert_eq!(attributed_sum(true, None::<f64>), Some(0.0));
+            assert_eq!(attributed_sum(true, Some(37.5)), Some(37.5));
+        }
+
+        /// The unprivileged case: every DRM client on the box belongs to
+        /// another user, `/proc/<pid>/fd` is unreadable, and the sweep charges
+        /// this device nothing. That is "cannot read", not "idle" — reporting
+        /// 0 renders another user's fully loaded iGPU as a measured 0%.
+        #[test]
+        fn a_device_with_no_attributed_clients_is_unknown() {
+            assert_eq!(attributed_sum(false, None::<f64>), None);
+            assert_eq!(attributed_sum(false, None::<u64>), None);
+            // Even a stale bucket cannot promote it: no client, no measurement.
+            assert_eq!(attributed_sum(false, Some(0u64)), None);
+            assert_eq!(attributed_sum(false, Some(90.0)), None);
+        }
 
         #[test]
         fn xe_reports_physical_vram_per_tile() {
