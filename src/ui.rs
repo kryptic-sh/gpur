@@ -59,11 +59,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     app.gpus_rect = gpus_area;
     app.proc_rect = proc_area;
-    // Braille packs 2 samples per column; retain enough history for the
-    // full frame width so wide terminals can fill their graphs. Assigned,
-    // not accumulated — a high-water mark would pin every GPU's four
-    // history vectors to the widest size the terminal ever had.
-    app.history_need = area.width as usize * 2;
+    // Retain enough history for the full frame width so wide terminals can
+    // fill their graphs, scaled by what the active glyph set can actually
+    // draw — braille packs 2 samples per column, block and ascii draw one
+    // (`draw_waveform_cells`), so a flat doubling would make every device
+    // under `--graphs ascii` hold twice the samples any graph can ever show.
+    // Assigned, not accumulated — a high-water mark would pin every GPU's
+    // four history vectors to the widest size the terminal ever had.
+    app.history_need = area.width as usize * samples_per_column(app.graph_style);
     draw_gpus(frame, gpus_area, app);
     draw_processes(frame, proc_area, app);
 
@@ -93,6 +96,15 @@ fn proc_pane_height(body_height: u16, procs: usize) -> u16 {
     let want = (procs as u64).saturating_add(3).min(u16::MAX as u64) as u16;
     let cap = ((body_height as u32 * 3) / 10).max(4).min(u16::MAX as u32) as u16;
     want.min(cap).min(body_height.saturating_sub(1))
+}
+
+/// Samples one terminal column of graph can display. Braille encodes two
+/// dot columns per cell (`draw_waveform` widens its window to `cols * 2`);
+/// block and ascii spend a whole cell on one sample. Sizing history retention
+/// by anything else either starves wide braille graphs or hoards samples the
+/// other styles can never draw.
+fn samples_per_column(style: GraphStyle) -> usize {
+    if style == GraphStyle::Braille { 2 } else { 1 }
 }
 
 /// `?` overlay listing every binding; any key closes it.
@@ -166,6 +178,36 @@ fn draw_confirm_popup(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Rows a stack of cards occupies.
+///
+/// Summed in `u32` for the same reason `proc_pane_height` computes there:
+/// `CARD_MIN` rows per unfolded card wraps `u16` past 8191 cards, and the
+/// wrapped total reads as "everything fits" — the pane would then hand every
+/// card a `Fill` constraint in an area far too small for them.
+fn stacked_height(heights: impl IntoIterator<Item = u16>) -> u32 {
+    heights.into_iter().map(u32::from).sum()
+}
+
+/// How many whole cards fit in `height`, walking the stack from the top of
+/// the scroll window.
+///
+/// The running total is a `u32` because `used + h` overflows `u16` once
+/// `height` is within `CARD_MIN` of `u16::MAX`, which a programmatic PTY
+/// resize can reach (`PtySize::rows` is a `u16`); the wrapped sum compares
+/// small and the loop keeps admitting cards past the bottom of the pane.
+fn cards_that_fit(heights: impl IntoIterator<Item = u16>, height: u16) -> usize {
+    let mut shown = 0usize;
+    let mut used = 0u32;
+    for h in heights {
+        if used + u32::from(h) > height as u32 {
+            break;
+        }
+        used += u32::from(h);
+        shown += 1;
+    }
+    shown
+}
+
 /// GPU card region. When every card fits it behaves like a plain vertical
 /// split; when it overflows (many GPUs / small terminal) it becomes a
 /// scrolled list of fixed-height cards with a scrollbar, keeping the
@@ -182,9 +224,9 @@ fn draw_gpus(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let height_of = |app: &App, i: usize| -> u16 { if app.is_folded(i) { 1 } else { CARD_MIN } };
     let n = app.gpus.len();
-    let needed: u16 = (0..n).map(|i| height_of(app, i)).sum();
+    let needed = stacked_height((0..n).map(|i| height_of(app, i)));
 
-    if needed <= area.height {
+    if needed <= area.height as u32 {
         // Everything fits: unfolded cards stretch to share the space.
         app.gpu_scroll = 0;
         let rows = Layout::vertical((0..n).map(|i| {
@@ -205,26 +247,16 @@ fn draw_gpus(frame: &mut Frame, area: Rect, app: &mut App) {
     // Overflow: scroll whole cards so the selection stays visible.
     app.gpu_scroll = app.gpu_scroll.min(n - 1).min(app.selected);
     loop {
-        let visible_span: u16 = (app.gpu_scroll..=app.selected)
-            .map(|i| height_of(app, i))
-            .sum();
-        if visible_span <= area.height || app.gpu_scroll >= app.selected {
+        let visible_span =
+            stacked_height((app.gpu_scroll..=app.selected).map(|i| height_of(app, i)));
+        if visible_span <= area.height as u32 || app.gpu_scroll >= app.selected {
             break;
         }
         app.gpu_scroll += 1;
     }
 
     // How many whole cards fit at their minimum height...
-    let mut shown = 0usize;
-    let mut used = 0u16;
-    for i in app.gpu_scroll..n {
-        let h = height_of(app, i);
-        if used + h > area.height {
-            break;
-        }
-        used += h;
-        shown += 1;
-    }
+    let shown = cards_that_fit((app.gpu_scroll..n).map(|i| height_of(app, i)), area.height);
     let shown = shown.max(1);
 
     // ...then let that window stretch to fill the area — no dead gap.
@@ -1186,6 +1218,44 @@ mod tests {
         assert_eq!(proc_pane_height(100, 50), 30);
         // Wants less than the cap: takes only what it needs.
         assert_eq!(proc_pane_height(100, 5), 8);
+    }
+
+    #[test]
+    fn card_stack_height_never_overflows() {
+        // CARD_MIN per card wraps u16 above 8191 cards; a wrapped total reads
+        // as "everything fits" and stretches every card into a pane that is
+        // nowhere near big enough.
+        let cards = 8192;
+        let needed = stacked_height((0..cards).map(|_| CARD_MIN));
+        assert_eq!(needed, cards as u32 * CARD_MIN as u32);
+        assert!(needed > u16::MAX as u32, "no longer the overflow case");
+        // Folded cards are a row each, and a mixed stack still totals exactly.
+        assert_eq!(stacked_height([1, CARD_MIN, 1]), CARD_MIN as u32 + 2);
+        assert_eq!(stacked_height([]), 0);
+    }
+
+    #[test]
+    fn cards_that_fit_stops_at_the_pane_edge() {
+        // The running total used to be a u16, so a pane within CARD_MIN rows
+        // of u16::MAX wrapped it and kept admitting cards forever.
+        assert_eq!(cards_that_fit([CARD_MIN; 4], u16::MAX), 4);
+        assert_eq!(
+            cards_that_fit((0..20_000).map(|_| CARD_MIN), u16::MAX),
+            8191
+        );
+        // ...and the ordinary cases still stop where the rows run out.
+        assert_eq!(cards_that_fit([CARD_MIN; 4], 20), 2);
+        assert_eq!(cards_that_fit([1, 1, CARD_MIN], 8), 2);
+        assert_eq!(cards_that_fit([CARD_MIN; 4], 0), 0);
+    }
+
+    #[test]
+    fn history_retention_matches_what_the_glyph_set_can_draw() {
+        // Only braille packs two samples into a column; retaining 2x under
+        // block or ascii keeps samples no graph will ever read back.
+        assert_eq!(samples_per_column(GraphStyle::Braille), 2);
+        assert_eq!(samples_per_column(GraphStyle::Block), 1);
+        assert_eq!(samples_per_column(GraphStyle::Ascii), 1);
     }
 
     #[test]
