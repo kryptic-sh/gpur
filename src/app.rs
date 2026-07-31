@@ -341,7 +341,8 @@ pub struct AppOptions {
     pub history_len: usize,
     pub no_splash: bool,
     pub graph_style: GraphStyle,
-    pub mock: Option<usize>,
+    /// How this session's backend was produced, for re-detection.
+    pub source: crate::backend::BackendSource,
     pub log: Option<std::io::BufWriter<std::fs::File>>,
 }
 
@@ -406,8 +407,9 @@ pub struct App {
     /// a "stuck" pad boundary. Set by the renderer each frame.
     pub history_need: usize,
     pub graph_style: GraphStyle,
-    /// The --mock argument, kept for backend re-detection.
-    mock: Option<usize>,
+    /// The `--mock`/`--replay` choice this session's backend came from, kept
+    /// so a re-detect repeats that same detection rather than a bare one.
+    source: crate::backend::BackendSource,
     /// Consecutive poll failures; triggers a re-detect (driver reload).
     poll_failures: u32,
     /// JSONL sink: one line per successful poll when --log is given.
@@ -430,13 +432,13 @@ impl App {
             history_len,
             no_splash,
             graph_style,
-            mock,
+            source,
             log,
         } = opts;
         Self {
             tick_explicit,
             graph_style,
-            mock,
+            source,
             poll_failures: 0,
             log,
             backend,
@@ -627,9 +629,21 @@ impl App {
                 self.poll_failures += 1;
                 // A driver reload can permanently kill the old backend
                 // handle (NVML especially). Try a fresh detect every 5th
-                // consecutive failure.
+                // consecutive failure — through the source this session was
+                // started from, never a bare detect(). That is the whole
+                // guarantee, and it is structural rather than a check anyone
+                // has to remember: a bare detect() answers with the LIVE
+                // backend whatever the session was, so a replay whose polls
+                // began failing would trade a stranger's recording for this
+                // machine's hardware, flipping the `can_signal()` the kill
+                // path reads from false to true and leaving a table of
+                // recorded, foreign pids aimed at local processes. Re-detecting
+                // through the source can only ever produce the same kind of
+                // backend it produced at startup — a recording re-opens that
+                // recording, a mock builds another mock — so nothing here can
+                // promote a fabricated backend to a live one.
                 if self.poll_failures.is_multiple_of(5)
-                    && let Ok(fresh) = crate::backend::detect(self.mock, None)
+                    && let Ok(fresh) = self.source.detect()
                 {
                     self.backend = fresh;
                     self.set_status(format!(
@@ -963,13 +977,32 @@ impl App {
             return;
         }
         // kill_with returns None when the signal isn't supported on this
-        // platform (e.g. Term on Windows) — fall back to plain kill().
+        // platform (Term on Windows). Falling back to plain kill() there sent
+        // Signal::Kill while the dialog had asked about SIGTERM and the status
+        // line went on to report SIGTERM: the user consented to a signal the
+        // process could catch, clean up after and ignore, and silently got one
+        // it could not. Refuse instead — every other guard on this path errs
+        // towards not signalling, and an escalation to SIGKILL has to be the
+        // user's own keystroke.
         let sig = if force {
             sysinfo::Signal::Kill
         } else {
             sysinfo::Signal::Term
         };
-        let ok = p.kill_with(sig).unwrap_or_else(|| p.kill());
+        let Some(ok) = p.kill_with(sig) else {
+            // Kill is the one signal sysinfo supports everywhere, so in
+            // practice this is the SIGTERM arm; p.kill() is exactly the
+            // Signal::Kill we are declining to send behind the user's back.
+            let hint = if force {
+                ""
+            } else {
+                " — use K to send SIGKILL explicitly"
+            };
+            self.set_status(format!(
+                "kill: {sig_name} is unsupported on this platform{hint}"
+            ));
+            return;
+        };
         if ok {
             self.set_status(format!("sent {sig_name} to {pid} ({command})"));
         } else {
@@ -1144,7 +1177,47 @@ mod tests {
         app.history_at(idx).expect("history for card").util.clone()
     }
 
+    /// A scratch dir holding one replay log, wiped when the guard drops.
+    /// Mirrors `backend::linux::testing::Sandbox` — that one is Linux-only and
+    /// lives behind a private module, so this shares the pattern rather than
+    /// the type. The pid and the counter are the point: a fixed name under the
+    /// world-writable temp dir makes two concurrent `cargo test` runs fight
+    /// over one directory, and lets anyone else on the host pre-create that
+    /// name as a symlink the test would write through.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn replay_log(tag: &str, body: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "gpur-app-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("rec.jsonl"), body).unwrap();
+            Scratch(dir)
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            self.0.join("rec.jsonl")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn app_with(backend: Box<dyn GpuBackend>) -> App {
+        app_from(backend, crate::backend::BackendSource::Live)
+    }
+
+    /// Same, for the tests that care where the session's backend came from —
+    /// the failure re-detect is the only path that reads it.
+    fn app_from(backend: Box<dyn GpuBackend>, source: crate::backend::BackendSource) -> App {
         App::new(
             backend,
             crate::theme::load(None, crate::theme::detect_color_mode()).unwrap(),
@@ -1154,7 +1227,7 @@ mod tests {
                 history_len: 60,
                 no_splash: true,
                 graph_style: GraphStyle::Ascii,
-                mock: None,
+                source,
                 log: None,
             },
         )
@@ -1180,14 +1253,60 @@ mod tests {
         assert!(!crate::backend::detect(Some(2), None).unwrap().can_signal());
         assert!(LocalBackend.can_signal());
         // Replay is private; drive it through detect() on a one-line log.
-        let dir = std::env::temp_dir().join(format!("gpur-can-signal-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let log = dir.join("rec.jsonl");
-        std::fs::write(&log, "{\"gpus\":[],\"processes\":[]}\n").unwrap();
-        let replay = crate::backend::detect(None, Some(&log)).unwrap();
+        let scratch = Scratch::replay_log("can-signal", "{\"gpus\":[],\"processes\":[]}\n");
+        let replay = crate::backend::detect(None, Some(&scratch.path())).unwrap();
         assert_eq!(replay.name(), "replay");
         assert!(!replay.can_signal());
-        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The failure re-detect must reproduce the session, not replace it. A
+    /// recording whose polls started failing has to come back as that same
+    /// recording: a bare `detect()` would answer with this machine's hardware,
+    /// and `can_signal()` — which is what the kill path asks before it will
+    /// signal anything — would flip false to true, leaving a stranger's
+    /// recorded pids aimed at local processes.
+    #[test]
+    fn a_failing_replay_re_detects_to_a_replay_not_to_live_hardware() {
+        /// A replay backend whose log has gone away mid-session — the only
+        /// way a replay reaches the re-detect at all, since `ReplayBackend`
+        /// holds its last frame instead of failing.
+        struct DeadRecording;
+        impl GpuBackend for DeadRecording {
+            fn name(&self) -> &'static str {
+                "recording"
+            }
+            fn poll(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
+                anyhow::bail!("the log went away")
+            }
+            fn can_signal(&self) -> bool {
+                false
+            }
+        }
+
+        let scratch = Scratch::replay_log("re-detect", "{\"gpus\":[],\"processes\":[]}\n");
+        let mut app = app_from(
+            Box::new(DeadRecording),
+            crate::backend::BackendSource::Replay(scratch.path()),
+        );
+        // Re-detect fires on every 5th consecutive failure; go well past it.
+        for _ in 0..12 {
+            app.poll();
+        }
+        assert_eq!(
+            app.backend.name(),
+            "replay",
+            "a re-detect swapped a recording for something else"
+        );
+        assert!(!app.can_signal(), "a re-detect made a recording signalable");
+
+        // And the kill dialog still refuses, off that same flag.
+        arm(&mut app, 424242, 0);
+        app.confirm_kill();
+        assert!(
+            status_of(&app).contains("not signalable"),
+            "{}",
+            status_of(&app)
+        );
     }
 
     #[test]
