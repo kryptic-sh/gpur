@@ -528,17 +528,14 @@ mod linux_impl {
             );
         }
 
-        /// Fake sysfs root for one test, wiped so a rerun can't see stale files.
-        fn fake_sysfs(name: &str) -> PathBuf {
-            let dir = std::env::temp_dir().join(name);
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            dir
+        /// Fake sysfs root for one test: unique per run, removed on drop.
+        fn fake_sysfs(name: &str) -> testing::Sandbox {
+            testing::Sandbox::new(name)
         }
 
         #[test]
         fn power_gated_clock_falls_through_to_the_dpm_table() {
-            let dir = fake_sysfs("gpur-clock-test");
+            let dir = fake_sysfs("clock");
             let dpm = dir.join("pp_dpm_sclk");
             std::fs::write(&dpm, "0: 500Mhz\n1: 1500Mhz *\n2: 2371Mhz\n").unwrap();
 
@@ -581,7 +578,7 @@ mod linux_impl {
 
         #[test]
         fn pcie_bw_absent_file_stays_none() {
-            let dir = fake_sysfs("gpur-pciebw-test");
+            let dir = fake_sysfs("pciebw");
             let t0 = Instant::now();
             let t1 = t0 + std::time::Duration::from_secs(1);
             let mut prev = None;
@@ -637,8 +634,7 @@ drm-engine-enc:\t9770559248 ns
 
         #[test]
         fn dpm_table_active_level_parses() {
-            let dir = std::env::temp_dir().join("gpur-dpm-test");
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = fake_sysfs("dpm");
             let f = dir.join("pp_dpm_mclk");
             std::fs::write(&f, "0: 96Mhz\n1: 3000Mhz *\n2: 1249Mhz\n").unwrap();
             assert_eq!(dpm_active_mhz(&f), Some(3000));

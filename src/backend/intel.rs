@@ -443,11 +443,12 @@ mod linux_impl {
             assert!(devices[0].card.ends_with("card0"));
         }
 
-        /// Fake `/sys/class/drm/cardN` + `cardN/device` pair in a scratch dir.
-        fn fake_card(name: &str) -> (PathBuf, PathBuf) {
-            let root = std::env::temp_dir().join(format!("gpur-intel-test-{name}"));
-            let _ = fs::remove_dir_all(&root);
-            let card = root.join("card0");
+        /// Fake `cardN` + `cardN/device` pair. The sandbox *is* the card dir —
+        /// `vram_total` only reads files sitting directly in each of the two,
+        /// never the names above them — so the returned `dev` is cleaned up
+        /// with the card when the guard drops.
+        fn fake_card(name: &str) -> (testing::Sandbox, PathBuf) {
+            let card = testing::Sandbox::new(name);
             let dev = card.join("device");
             fs::create_dir_all(&dev).unwrap();
             (card, dev)

@@ -498,6 +498,50 @@ pub fn card_name(dev: &Path, idx: u32, vendor_hex: &str, fallback_brand: &str) -
 pub mod testing {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A scratch directory for one test, wiped when the guard drops.
+    ///
+    /// Mirrors the `Sandbox` in `tests/smoke.rs` and `tests/tui.rs` — those are
+    /// integration tests in another crate, so the type cannot be shared, only
+    /// the pattern. The pid and the counter are the point: a fixed name under
+    /// the world-writable temp dir makes two concurrent `cargo test` runs (two
+    /// checkouts, two users on one box, a CI matrix on one runner) fight over
+    /// one directory, and lets anyone else on the host pre-create that name as
+    /// a symlink the test would then write through.
+    ///
+    /// Every fixture helper in the crate's unit tests builds on this one, so
+    /// there is a single place for that guarantee to live.
+    pub struct Sandbox(PathBuf);
+
+    impl Sandbox {
+        /// `tag` only names the fixture for a human reading a failure; the pid
+        /// and counter are what make the path unique.
+        pub fn new(tag: &str) -> Self {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "gpur-unit-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            Sandbox(dir)
+        }
+    }
+
+    impl std::ops::Deref for Sandbox {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// One DRM card, laid out the way sysfs lays it out: a PCI device dir named
     /// by its BDF, with the `cardN` entry pointing at it through a `device`
@@ -551,9 +595,8 @@ pub mod testing {
     /// Card indices deliberately do not follow vendor order — the kernel
     /// numbers them in probe order — so a scan leaning on the index to tell
     /// vendors apart trips here.
-    pub fn tri_vendor(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("gpur-drm-{name}"));
-        let _ = fs::remove_dir_all(&root);
+    pub fn tri_vendor(name: &str) -> Sandbox {
+        let root = Sandbox::new(name);
         card(&root, 0, "0000:00:02.0", "0x8086", "0x7d55", "i915");
         card(&root, 1, "0000:03:00.0", "0x1002", "0x744c", "amdgpu");
         card(&root, 2, "0000:01:00.0", "0x10de", "0x2684", "nvidia");
@@ -703,11 +746,8 @@ drm-resident-vram0:\t4096 KiB
 ";
 
     /// Fresh scratch dir under the system temp dir, one per test.
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("gpur-linux-test-{name}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> testing::Sandbox {
+        testing::Sandbox::new(name)
     }
 
     #[test]
