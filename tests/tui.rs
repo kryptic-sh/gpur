@@ -733,6 +733,12 @@ fn poll_failure_degrades_gracefully() {
 
 /// Every poll fails: the banner stays up, the GPU pane degrades to its
 /// empty state, and the 5th consecutive failure triggers a re-detect.
+///
+/// The re-detect repeats the detection this session started from, so under
+/// `--mock` it hands back another mock and the status names it: what a
+/// re-detect can never do is turn a fabricated or recorded session into a
+/// live one. That half is pinned by
+/// `app::tests::a_failing_replay_re_detects_to_a_replay_not_to_live_hardware`.
 #[test]
 fn persistent_poll_failure_redetects_the_backend() {
     let mut t = Tui::spawn_with_env(&[], &[("GPUR_MOCK_FAIL", "1")]);
@@ -743,6 +749,11 @@ fn persistent_poll_failure_redetects_the_backend() {
         s.contains("no GPUs reported by backend")
     });
     t.wait_for("re-detect status", |s| s.contains("backend re-detected"));
+    assert!(
+        t.screen_text().contains("backend re-detected (mock)"),
+        "re-detect produced something other than a mock:\n{}",
+        t.screen_text()
+    );
     t.send("q");
     assert!(t.wait_exit().success());
 }

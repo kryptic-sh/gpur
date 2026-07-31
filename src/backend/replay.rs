@@ -80,7 +80,20 @@ impl GpuBackend for ReplayBackend {
     }
 
     fn processes(&mut self) -> Vec<GpuProcess> {
-        self.last.processes.clone()
+        // Nothing vets a recording: a truncated write, a hand-edited log or a
+        // third-party writer can carry a gpu_index past the end of the frame
+        // it belongs to, which renders as a "DEV 7" row against a two-card
+        // machine. `CompositeBackend::processes` drops exactly this case for
+        // its live children; a replay is never composed, so it has to apply
+        // the rule itself. Dropping the row loses one row; keeping it
+        // misattributes it, or invents a device that was never recorded.
+        let frame = self.last.gpus.len();
+        self.last
+            .processes
+            .iter()
+            .filter(|p| p.gpu_index < frame)
+            .cloned()
+            .collect()
     }
 
     /// Show what produced the recording, not what is running here. `name()`
@@ -117,7 +130,7 @@ mod tests {
         let path = write_log(
             "attr",
             concat!(
-                r#"{"ts_ms":1,"backend":"nvml","driver":"550.1","gpus":[],"#,
+                r#"{"ts_ms":1,"backend":"nvml","driver":"550.1","gpus":[{"name":"card0"}],"#,
                 r#""processes":[{"pid":7,"container":"docker:abcdef123456"}]}"#,
                 "\n"
             ),
@@ -128,6 +141,26 @@ mod tests {
             b.processes()[0].container.as_deref(),
             Some("docker:abcdef123456")
         );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A recorded row can name a card the frame doesn't contain — a truncated
+    /// or hand-edited log. It has no card to be drawn against, so it goes.
+    #[test]
+    fn rows_naming_a_card_outside_the_recorded_frame_are_dropped() {
+        let path = write_log(
+            "stray",
+            concat!(
+                r#"{"gpus":[{"name":"card0"},{"name":"card1"}],"processes":["#,
+                r#"{"pid":1,"gpu_index":0},{"pid":2,"gpu_index":1},"#,
+                r#"{"pid":3,"gpu_index":7}]}"#,
+                "\n"
+            ),
+        );
+        let mut b = load(&path).unwrap();
+        assert_eq!(b.poll().unwrap().len(), 2);
+        let pids: Vec<u32> = b.processes().iter().map(|p| p.pid).collect();
+        assert_eq!(pids, vec![1, 2]);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
