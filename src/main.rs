@@ -56,7 +56,10 @@ fn main() -> Result<()> {
     let theme_path = cli.theme.clone().or(cfg.theme.clone());
 
     let theme = theme::load(theme_path.as_deref(), theme::detect_color_mode())?;
-    let backend = backend::detect(cli.mock, cli.replay.as_deref())?;
+    // The session carries this along so a re-detect after repeated poll
+    // failures re-runs exactly this detection — see `App::poll_inner`.
+    let source = backend::BackendSource::from_cli(cli.mock, cli.replay.clone());
+    let backend = source.detect()?;
     let graph_style = match cli.graphs {
         Some(s) => s,
         None => app::GraphStyle::from_config(&cfg.graphs).ok_or_else(|| {
@@ -88,7 +91,7 @@ fn main() -> Result<()> {
             history_len: cfg.history_len,
             no_splash: cli.no_splash,
             graph_style,
-            mock: cli.mock,
+            source,
             log,
         },
     );

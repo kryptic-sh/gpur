@@ -339,6 +339,50 @@ fn compose(mut found: Vec<Box<dyn GpuBackend>>) -> Result<Box<dyn GpuBackend>> {
     Ok(Box::new(CompositeBackend::new(found)))
 }
 
+/// Where a session's telemetry comes from: this machine, fabricated cards, or
+/// a recording. One value rather than a `--mock` and a `--replay` field side by
+/// side, because the two flags are alternatives — clap already rejects them
+/// together — and two parallel `Option`s can spell a fourth state that
+/// [`detect`] has to pick a winner for.
+///
+/// [`crate::app::App`] keeps one of these for the life of the session and
+/// re-detects through it, which is what makes a re-detect a repeat of the
+/// detection that started the session rather than a partial reconstruction of
+/// it. See the failure path in `App::poll_inner` for why that matters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackendSource {
+    /// Whatever hardware this machine has.
+    Live,
+    /// `--mock N`: N fabricated cards, no hardware involved.
+    Mock(usize),
+    /// `--replay FILE`: frames recorded on some other machine.
+    Replay(std::path::PathBuf),
+}
+
+impl BackendSource {
+    /// Read the choice off the parsed CLI.
+    pub fn from_cli(mock: Option<usize>, replay: Option<std::path::PathBuf>) -> Self {
+        match (mock, replay) {
+            // Both at once is unreachable through the CLI. If it ever became
+            // reachable, replay is the right winner: it is the source whose
+            // pids must never be signalable.
+            (_, Some(path)) => Self::Replay(path),
+            (Some(n), None) => Self::Mock(n),
+            (None, None) => Self::Live,
+        }
+    }
+
+    /// Build the backend this source describes. Startup and the failure
+    /// re-detect both come through here, so they cannot drift apart.
+    pub fn detect(&self) -> Result<Box<dyn GpuBackend>> {
+        match self {
+            Self::Live => detect(None, None),
+            Self::Mock(n) => detect(Some(*n), None),
+            Self::Replay(path) => detect(None, Some(path)),
+        }
+    }
+}
+
 /// Every backend that reports usable devices on this machine, as one backend.
 pub fn detect(
     mock: Option<usize>,
