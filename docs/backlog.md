@@ -1,11 +1,12 @@
 # gpur backlog
 
 Open work from the review passes, the multi-vendor detection audit and the
-full-codebase review in `docs/code-review.md`. Closed items are removed rather
-than struck through — what was fixed, and why, lives in `CHANGELOG.md`, and the
-review document tracks each finding's fate. Anything from a closed item that is
-still a live constraint on future work has been moved down into "Decisions taken
-deliberately" instead of being kept as a task.
+full-codebase review of v0.10.1, whose separate document was folded into this
+one once every finding it raised had shipped. Closed items are removed rather
+than struck through — what was fixed, and why, lives in `CHANGELOG.md`. Anything
+from a closed item that is still a live constraint on future work is kept below,
+either as a deliberate decision or in the settled-by-review list, rather than as
+a task.
 
 Roughly ordered by what is worth doing first. Nothing open here is a correctness
 bug; the remainder is granularity, cost, coverage and polish. Every item that is
@@ -145,6 +146,47 @@ codename, always suffix the card or index — and apply it uniformly.
 
 ---
 
+## Settled by review
+
+The v0.10.1 full-codebase review raised sixteen findings across correctness,
+security, duplication and dead code. All of them shipped between 0.10.2 and
+0.11.1 except one that was declined; each is described in `CHANGELOG.md` under
+the release that carried it.
+
+Re-verified against the tree at 0.11.1 before this list replaced the review
+document — every fix is still in place, and the properties below still hold.
+They are recorded so a later pass does not spend time re-deriving them.
+
+- **Device identity is sound.** `device_keys` degrades a duplicate or absent
+  `device_id` to a positional key, positional keys are never persisted, and
+  `CompositeBackend` namespaces every child's ids by child index so two backends
+  cannot mint the same key. The vacated-slot de-duplication is correct.
+- **Process index rebasing is sound.** `CompositeBackend::processes` accumulates
+  by `slots`, the high-water mark, rather than by the current poll's device
+  count, and drops rows outside their own child's span. The three-child and
+  middle-child-resize tests cover the off-by-one variants.
+- **Mouse hit-testing cannot select an off-screen row.** `proc_visible` is
+  bounded by both the drawn row count and `procs.len()`, and `proc_scroll` is
+  clamped to `total - visible` before the table slice, so that slice is provably
+  in range.
+- **The numeric guards hold.** `gradient` handles empty and single-stop ramps,
+  `parse_size` and the Apple VRAM total saturate, `le_int` rejects non-scalars,
+  `windowed` handles short data, and `proc_pane_height` computes in `u32`. All
+  carry tests.
+- **Modal input is contained.** Control chords cannot reach the filter buffer,
+  mouse events are ignored while a modal is up, and `Ctrl-C` still quits from
+  filter mode.
+- **The kill path holds up.** Pid identity is pinned by `(pid, start_time)`
+  across the confirmation gap; pid 1 and gpur itself are refused; an absent
+  executable refuses kernel threads and processes this user cannot read;
+  `can_signal()` is re-checked inside `confirm_kill` rather than only when the
+  dialog opens; mock and replay refuse outright, so a recording from a stranger
+  is not a one-keystroke signal primitive; and `CompositeBackend::can_signal` is
+  the AND of its children.
+- **The PDH buffer handling is correct.** It allocates with the item type's
+  alignment and sizes from the `PDH_MORE_DATA` byte count, and the `Vec`
+  outlives the raw pointer derived from it.
+
 ## Decisions taken deliberately
 
 Recorded so they are not re-opened as findings.
@@ -187,6 +229,14 @@ Recorded so they are not re-opened as findings.
   and rounding ties down. Three levels instead of eight is the price of a bar
   that points the way it grows; before, the complement was drawn in the default
   foreground and the whole half rendered inverted.
+- **Sub-cell quantization stays hand-rolled.** Five sites across three functions
+  turn a value into filled sub-units — `mini_spark`'s three glyph branches,
+  `draw_waveform`'s `dots_for`, and `draw_waveform_cells` — and they quantize
+  against different unit counts (4, 8, and a per-half row count) with different
+  clamp floors (0 or 1, depending on whether the widget draws a baseline). A
+  shared helper would take both as parameters and save only the arithmetic, so
+  the review declined it. Worth revisiting only if a fourth caller appears,
+  since this is the kind of arithmetic that drifts.
 - **An unreadable graph sample is a glyph, not a colour.** The waveform marks it
   `·` in braille and block — a character in neither value ramp, and already this
   UI's mark for nothing-here, since `draw_meter` paints an empty non-ascii track

@@ -95,9 +95,10 @@ and this project adheres to
 
 ## [0.10.2] - 2026-08-01
 
-A full-codebase review pass. Findings and the reasoning behind each fix are in
-`docs/code-review.md`; the suite grew from 170 to 178 tests, each one pinning a
-finding below.
+A full-codebase review pass; the suite grew from 170 to 178 tests, each one
+pinning a finding below. The review had its own document while findings were
+still open; once they had all shipped it was folded into `docs/backlog.md`,
+whose "Settled by review" section records what was checked and still holds.
 
 ### Fixed
 
