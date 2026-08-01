@@ -1,12 +1,46 @@
 # gpur backlog
 
-Known gaps from the review passes and the multi-vendor detection audit.
-Everything already fixed lives in `CHANGELOG.md`; only open work is listed here.
+Known gaps from the review passes, the multi-vendor detection audit and the
+full-codebase review in `docs/code-review.md`. Everything already fixed lives in
+`CHANGELOG.md`; only open work is listed here, with closed entries struck
+through where the reasoning behind them is still worth keeping.
 
-Roughly ordered by what is worth doing first. Nothing here is a correctness bug
-in the current build; the remainder is granularity, cost, coverage and polish.
+Roughly ordered by what is worth doing first. Item 0 is a genuine correctness
+bug and is the only one; the remainder is granularity, cost, coverage and
+polish.
 
 ---
+
+## 0. Per-process GPU memory reads `0MiB` for every NVIDIA process on Windows
+
+**Severity: medium. Needs a decision, because the fix breaks log
+compatibility.** Finding C4 in `docs/code-review.md`, which has the full
+write-up.
+
+`GpuProcess::gpu_mem_bytes` is a bare `u64`, so NVML's
+`UsedGpuMemory::Unavailable` becomes `0` and renders as a confident `0MiB`. The
+review first attributed that to MIG and permission-limited queries; the
+nvml-wrapper docs are blunter than that:
+
+> Under WDDM, `NVML_VALUE_NOT_AVAILABLE` is always reported because Windows KMD
+> manages all the memory, not the NVIDIA driver.
+
+WDDM is the ordinary consumer Windows configuration, so this is not an edge case
+— it is every NVIDIA process row on Windows, always. The same `unwrap_or(0)`
+pattern hits `ProcRow::cpu_pct` and `ProcRow::host_mem_bytes` when sysinfo
+cannot resolve a pid, though those already carry `Option` at the backend layer.
+
+**Why it is not simply applied.** The record is written from `ProcRow` and read
+back into `GpuProcess`, two types serde-compatible only by field-name overlap.
+Emitting `null` for `gpu_mem_bytes` without widening `GpuProcess` too is not a
+cosmetic change — `#[serde(default)]` covers _missing_ keys, not explicit nulls,
+so `u64` fails to deserialize. Measured against the real binary: a log whose
+records all carry the null is rejected outright (`no valid JSONL records`, exit
+1), and a log where only some do has those frames **silently skipped** by
+`next_record`. Both types must therefore change together, and logs written by
+the new version become unreadable to older gpur binaries, which cannot be
+patched retroactively. That is the actual cost — not the `0` → `null` shape
+change — and it is why this wants a minor bump rather than a patch.
 
 ## 1. Windows vendor exclusion is per vendor, not per adapter
 
@@ -82,13 +116,22 @@ Whether a row of `n/a` beats an absent card is a product call, not a bug.
 - **Mouse kinds with no behaviour attached** — drag, middle and right button,
   and moves all fall to the `_ => None` arm. Untested because untested is what
   they are: there is nothing to assert yet.
-- **`--graphs block` / `ascii` rendering.** Only the invalid-config-value error
-  path is covered (`tests/smoke.rs:223`). Both alternate renderers — where a
-  colour-quantization bug lived — are unasserted.
-- **Colour modes.** Nothing runs with `NO_COLOR=1` or without `COLORTERM`, so
-  the quantizers are covered by their own unit tests but never by rendered
-  output.
-- `--man` and `--once`'s plain-text stdout are unasserted.
+- ~~**`--graphs block` / `ascii` rendering.**~~ Closed. `tests/tui.rs` renders
+  under each glyph set and asserts both that the style's own glyphs appear and
+  that the other two styles' do not — a style that silently fell back to braille
+  would pass a test looking only for its own output. The block case also pins
+  the fg/bg complement trick that grows partial cells downward, where the
+  colour-quantization bug lived.
+- ~~**Colour modes.**~~ Closed. `NO_COLOR=1` and `TERM=dumb` must render the
+  dashboard without emitting a single colour SGR, and a session without
+  `COLORTERM` must quantize to `38;5`/`48;5` rather than send a truecolor escape
+  to a 256-colour terminal. Needed `Tui::spawn_with_env` to be able to _unset_ a
+  variable, since unset and empty differ to `detect_color_mode`.
+- ~~`--man` and `--once`'s plain-text stdout are unasserted.~~ Closed in
+  `tests/smoke.rs`: the man page is asserted on its troff-escaped option entries
+  (a bare `.TH`/name check would pass on a header with no body), and `--once` on
+  its populated `--mock` output, including that `--once --log` writes exactly
+  one record despite the deliberate priming poll.
 - **No CI job runs against real GPU hardware.** Inherent to hosted runners; the
   mitigation was fixture-testing every backend's pure parsers, which is why
   `windows.rs` and `apple.rs` now have unit tests that run on any host. Closing
@@ -124,21 +167,23 @@ brand. Fallbacks differ too: `NVIDIA GPU 0` (index) against
 **Fix:** settle on a convention — prefer the marketing name, fall back to the
 codename, always suffix the card or index — and apply it uniformly.
 
-## 8. `splash::build_path` truncates coordinates to `u8`
+## 8. ~~`splash::build_path` truncates coordinates to `u8`~~ — CLOSED
 
-**Severity: low.** `src/splash.rs:24` — `path.push((r as u8, c as u8, ch))`.
-`art.txt` is 5×33 so this is safe today, and the `u8` is imposed by
-`hjkl_splash`'s API, but a banner wider than 255 columns would silently wrap and
-scatter the cursor trail. Assert the art's dimensions rather than relying on it
-staying small.
+`src/splash.rs` now scans `ART` in a `const fn` and asserts both dimensions
+against `u8::MAX` at compile time, so art that outgrew the cursor path fails the
+build instead of scattering the trail silently. A round-trip test proves every
+emitted coordinate, cast back, still names the glyph it came from. The `u8` is
+still imposed by `hjkl_splash`'s API and has not changed.
 
 ## 9. Residual YAGNI
 
-- `src/ui.rs:603` `draw_meter` takes 8 arguments behind
-  `#[allow(clippy::too_many_arguments)]` with two production call sites.
-  Collapsing it into a params struct is a refactor, not a deletion.
+- ~~`draw_meter` takes 8 arguments behind
+  `#[allow(clippy::too_many_arguments)]`~~ — closed. The four per-bar arguments
+  are a named `Meter` struct (`src/ui.rs:647`) and the `allow` is gone, so
+  clippy enforces the shape. Theme and glyph style stayed positional, matching
+  the neighbouring drawing functions.
 - `src/theme.rs:89` `UiTheme::temp_ok` is `pub` but used only by `temp_style` at
-  `:179` in the same file, unlike its peers `temp_warn` / `temp_crit`. Narrowing
+  `:173` in the same file, unlike its peers `temp_warn` / `temp_crit`. Narrowing
   it alone would be asymmetric.
 - `src/keys.rs:7` `enum Mode { Normal }` has one variant threaded through
   `Keymap<Action, Mode>`. Required by the `hjkl-keymap` API, so it cannot go,
@@ -150,6 +195,22 @@ staying small.
 
 Recorded so they are not re-opened as findings.
 
+- **An Intel GPU with no visible DRM clients reports `n/a`, not `0%`.** The fix
+  for review finding C1 keys utilization off whether the fdinfo sweep attributed
+  any client to the device, because "nobody is using it" and "I cannot see who
+  is using it" are indistinguishable from unprivileged userspace — the sweep
+  reads nothing for processes another user owns. On a desktop this never shows,
+  since the compositor holds a client owned by the same user; on a headless box
+  with a genuinely idle iGPU it does. A device whose clients _were_ read and
+  summed to zero still reports an honest `0%`, so an idle GPU keeps its empty
+  meter.
+- **A pid that leaves the GPU but stays alive remains in the sysinfo cache**
+  until it exits. The C5 fix sweeps departed pids with a second no-field
+  refresh, and `remove_dead` drops the ones that have exited; nothing short of a
+  `ProcessesToUpdate::All` refresh can evict a live process, and that refresh is
+  the per-tick cost the narrow update set exists to avoid. The residual set is
+  bounded by the machine's process table rather than by session length, which
+  was the finding.
 - **`--once` keeps raw MiB** (`vram 40MiB/24560MiB`) while the TUI uses
   `human_bytes` (`14G`). The review called this drift, but the TUI is
   width-constrained and a one-shot diagnostic is not; precision is worth more

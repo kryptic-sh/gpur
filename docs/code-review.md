@@ -11,9 +11,15 @@ passes. Nothing here is a crash or a memory-safety problem.
 ## Status
 
 Everything below has been fixed except **C4**, which is left open because it
-changes the `--json` / `--log` record shape (`0` → `null`) and that is a call
-for the maintainer, not a review finding to apply unilaterally. **D4** was
-judged not worth the extraction and is recorded as considered-and-declined.
+breaks log compatibility and that is a call for the maintainer, not a review
+finding to apply unilaterally — its severity has since been revised up, see the
+entry. **D4** was judged not worth the extraction and is recorded as
+considered-and-declined.
+
+Two consequences of these fixes are behaviour changes in their own right and are
+recorded under "Decisions taken deliberately" in `backlog.md`: an Intel GPU with
+no visible DRM clients now reports `n/a` rather than `0%`, and a pid that leaves
+the GPU while still running stays in the sysinfo cache until it exits.
 
 The fixes landed as `c5bf0aa`, `3581995`, `12ca248`, `fba30d1`, `a48f14f`,
 `c594203`, `c080385`, `37fe867`, `0b0cb28` and `79540ed`; the suite went from
@@ -122,22 +128,42 @@ another.
 
 ### C4. Unknown per-process figures are indistinguishable from zero
 
-**Severity: low. OPEN — needs a call on breaking the record shape.**
-`src/backend/mod.rs:126`, `src/backend/nvidia.rs:376`, `src/app.rs:770-771`.
+**Severity: medium (revised up from low). OPEN — needs a call on breaking log
+compatibility.** `src/backend/mod.rs:126`, `src/app.rs:880-881`. Tracked as item
+0 in `backlog.md`.
 
-`GpuProcess::gpu_mem_bytes` is a bare `u64`, so NVML's
-`UsedGpuMemory::Unavailable` (MIG devices, restricted-permission queries, some
-vGPU profiles) becomes `0` and prints as `0MiB`. The same pattern repeats in
-`ProcRow`: `cpu_pct` and `host_mem_bytes` are `.unwrap_or(0)` when sysinfo could
-not resolve the pid, so an unreadable process reads as idle and memory-free.
+Two corrections to this finding as first written.
 
-`gpu_util_pct` got this right — it is `Option`, and `rebuild_proc_view` sinks
-unmeasured rows in both sort directions. The other three columns did not.
+**The field list.** In `GpuProcess`, `cpu_pct` and `host_mem_bytes` are already
+`Option`; only `gpu_mem_bytes` is a bare `u64`. The `unwrap_or(0)` that destroys
+the distinction is one layer up, where `ProcRow` is built. So it is `ProcRow`'s
+three fields plus `GpuProcess::gpu_mem_bytes` — four fields across two types.
 
-**Fix:** widen the three fields to `Option` and render `-`/`N/A` as the GPU%
-column already does. Note this changes the `--json`/`--log` record shape (`0` →
-`null`), so it wants a version bump and a changelog line — flagged for a
-decision rather than applied.
+**The severity.** This first said `Unavailable` shows up on "MIG devices,
+restricted-permission queries, some vGPU profiles", which was speculation. The
+nvml-wrapper docs on `UsedGpuMemory::Unavailable` say:
+
+> Under WDDM, `NVML_VALUE_NOT_AVAILABLE` is always reported because Windows KMD
+> manages all the memory, not the NVIDIA driver.
+
+WDDM is the ordinary consumer Windows configuration. Every NVIDIA process row on
+Windows reads `0MiB`, always — a whole platform's default state, not an edge
+case.
+
+**Fix:** widen all four to `Option` and render `-`/`N/A` as the GPU% column
+does. `gpu_util_pct` is the model: it is already `Option` and
+`rebuild_proc_view` sinks unmeasured rows in both sort directions.
+
+**Why it is not simply applied.** The record is written from `ProcRow` and read
+back into `GpuProcess`, two types serde-compatible only by field-name overlap.
+`#[serde(default)]` covers missing keys, not explicit nulls, so a `null`
+`gpu_mem_bytes` fails to deserialize into `u64`. Measured against the real
+binary: a log whose records all carry the null is rejected outright
+(`no valid JSONL records`, exit 1); a log where only some do has those frames
+silently skipped by `next_record` — a three-record log with one null replayed as
+the other two, no warning. Both types must change together, and logs written by
+the new version become unreadable to older gpur binaries. That is the real cost,
+and why this wants a minor bump rather than a patch.
 
 ### C5. sysinfo's process cache grows for the life of the session
 
