@@ -8,6 +8,46 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-01
+
+### Breaking
+
+- **`--json` and `--log` emit `null` where they emitted `0`** for the four
+  per-process metrics: `gpu_util_pct`, `gpu_mem_bytes`, `cpu_pct` and
+  `host_mem_bytes`. A reading the backend could not take is now absent rather
+  than zero, matching what the GPU-level metrics have always done.
+
+  Consumers should read `null` as "not measured", not as zero. **A recording
+  written by 0.11 or later cannot be replayed by an earlier gpur** — it rejects
+  the file outright when every record carries a null, and skips the affected
+  frames silently when only some do. The useful direction is unaffected: 0.11
+  replays pre-0.11 recordings, since `0` remains a valid reading.
+
+### Fixed
+
+- **Per-process GPU memory read `0MiB` for every NVIDIA process on Windows.**
+  NVML answers `NVML_VALUE_NOT_AVAILABLE` when it cannot account for a process,
+  and nvml-wrapper documents that as _always_ reported under WDDM — the ordinary
+  consumer Windows configuration, where the Windows kernel-mode driver owns the
+  memory rather than NVIDIA's. gpur folded that to `0`, so the GPU MEM column
+  was a confident, permanent lie on that platform rather than a rare unknown.
+
+  The same `unwrap_or(0)` hid an unresolvable pid's CPU% and host memory behind
+  `0%` and `0MiB`. All of it now renders as `N/A` in the table and `-` in
+  `--once`, the spelling each already used for an unreadable utilization.
+
+  Only genuinely unreadable figures become absent. The Linux fdinfo sweeps still
+  report a real `Some(0)`: fdinfo names a memory region only when the client
+  holds something in it, so a client with no `vram` or `gtt` region really does
+  hold nothing there. On Windows, PDH reports unknown only when neither memory
+  counter carries the process at all.
+
+- Unmeasured rows sink below every measured row in the process table in **both**
+  sort directions, for GPU memory, CPU% and host memory — the rule GPU% already
+  had. Folding them in as `0` handed them the top of an ascending sort. The
+  stable order `--json` and `--log` use sinks them the same way, so the record
+  and the table agree.
+
 ## [0.10.3] - 2026-08-01
 
 ### Changed
