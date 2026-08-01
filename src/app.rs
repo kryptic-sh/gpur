@@ -3,7 +3,10 @@ use crate::keys::Action;
 use crate::theme::UiTheme;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind, Users};
+use sysinfo::{
+    MINIMUM_CPU_UPDATE_INTERVAL, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind,
+    Users,
+};
 
 const SPLASH_MS: u64 = 1500;
 const STATUS_MS: u64 = 4000;
@@ -139,6 +142,27 @@ fn command_of(p: &sysinfo::Process) -> String {
     } else {
         cmd
     }
+}
+
+/// Whether this poll should ask sysinfo for the CPU half of a process
+/// refresh, given when it last asked.
+///
+/// `cpu_usage()` is a ratio: the process's own jiffy delta over the machine's
+/// total jiffy delta read from `/proc/stat`. sysinfo refuses to re-read
+/// `/proc/stat` more often than [`MINIMUM_CPU_UPDATE_INTERVAL`], but it does
+/// re-read the process's own times on every refresh it is asked for — so
+/// below that interval the numerator covers one tick while the denominator
+/// still covers the last 200 ms, and the number that comes out is arithmetic
+/// on two mismatched windows rather than a measurement. [`MIN_TICK_MS`] is 50
+/// and `--tick-ms 50` is a capability this project kept deliberately, so at
+/// the fast end four polls in five were producing exactly that.
+///
+/// Rationing the request rather than the poll is what keeps the column: on the
+/// polls that skip it, sysinfo leaves the previously computed `cpu_usage()`
+/// alone, so CPU% refreshes more slowly than the rest of the row instead of
+/// blanking or lying.
+fn cpu_sample_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= MINIMUM_CPU_UPDATE_INTERVAL)
 }
 
 /// Running mean over the samples that actually carried a value. A sensor the
@@ -487,6 +511,10 @@ pub struct App {
     /// previous one) — see [`UiState::tick_ms_explicit`].
     tick_explicit: bool,
     sys: System,
+    /// When the CPU half of the process refresh was last asked for, so it can
+    /// be rationed to the interval sysinfo can actually measure over — see
+    /// [`cpu_sample_due`]. `None` until the first poll.
+    last_cpu_sample: Option<Instant>,
     users: Users,
 }
 
@@ -544,6 +572,7 @@ impl App {
             history_need: 0,
             all_procs: Vec::new(),
             sys: System::new(),
+            last_cpu_sample: None,
             users: Users::new_with_refreshed_list(),
         }
     }
@@ -814,17 +843,23 @@ impl App {
         let mut pids: Vec<Pid> = gpu_procs.iter().map(|p| Pid::from_u32(p.pid)).collect();
         pids.sort_unstable();
         pids.dedup();
+        // CPU is the one column that cannot be sampled at the poll rate; the
+        // rest of the row is a plain read and is asked for every time.
+        let now = Instant::now();
+        let sample_cpu = cpu_sample_due(self.last_cpu_sample, now);
+        if sample_cpu {
+            self.last_cpu_sample = Some(now);
+        }
         // The plain refresh_processes() kind omits user and cmd — ask for
         // exactly what the table shows.
-        self.sys.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&pids),
-            true,
-            ProcessRefreshKind::nothing()
-                .with_memory()
-                .with_cpu()
-                .with_user(UpdateKind::OnlyIfNotSet)
-                .with_cmd(UpdateKind::OnlyIfNotSet),
-        );
+        let kind = ProcessRefreshKind::nothing()
+            .with_memory()
+            .with_user(UpdateKind::OnlyIfNotSet)
+            .with_cmd(UpdateKind::OnlyIfNotSet);
+        let kind = if sample_cpu { kind.with_cpu() } else { kind };
+        self.sys
+            .refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, kind);
+        self.evict_departed_processes(&pids);
 
         self.all_procs = gpu_procs
             .into_iter()
@@ -868,6 +903,49 @@ impl App {
                 .then(a.gpu_index.cmp(&b.gpu_index))
         });
         self.rebuild_proc_view();
+    }
+
+    /// Drop the cached `sysinfo` entries for pids that are no longer on a GPU.
+    ///
+    /// [`Self::refresh_processes`] names only the pids the backend lists this
+    /// poll, because `ProcessesToUpdate::All` would stat every process on the
+    /// box several times a second. The cost of that choice is that sysinfo
+    /// only ever evicts pids from *inside* the set it is handed: a pid that
+    /// stops using the GPU is never in a later set, so the cache kept one
+    /// `Process` per pid ever seen and gave none of it back. A node churning
+    /// through short GPU jobs grew that map for the life of the session.
+    ///
+    /// sysinfo exposes no way to remove an entry outright, so the eviction is
+    /// a second refresh over exactly the pids that have dropped off the table,
+    /// with `remove_dead_processes` doing the work — the ones that have exited
+    /// are gone from the OS and fall out of the map. It asks for no fields at
+    /// all: this pass exists only for its removal half, and in particular must
+    /// not request CPU, which would recompute every process's usage against a
+    /// `/proc/stat` delta the caller may just have decided was too young to
+    /// use.
+    ///
+    /// A departed pid whose process is still alive stays cached — nothing
+    /// short of an `All` refresh can evict a live process — but that set is
+    /// bounded by the machine's process table rather than by session length,
+    /// and each member is swept again every poll and drops out on the first
+    /// one after it exits.
+    fn evict_departed_processes(&mut self, live: &[Pid]) {
+        let live: HashSet<Pid> = live.iter().copied().collect();
+        let departed: Vec<Pid> = self
+            .sys
+            .processes()
+            .keys()
+            .copied()
+            .filter(|pid| !live.contains(pid))
+            .collect();
+        if departed.is_empty() {
+            return;
+        }
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&departed),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
     }
 
     /// Re-apply filter + sort to the raw rows, keeping the cursor on the
@@ -1009,11 +1087,15 @@ impl App {
             self.set_status("kill: refusing to signal gpur itself".into());
             return;
         }
-        // `refresh_processes` only ever refreshes the pids the backend still
-        // lists, and sysinfo never evicts a pid outside the update set — so a
-        // process that exited after the dialog opened is still cached here.
-        // Refresh this one pid (remove_dead evicts it if gone) and demand the
-        // same start time, or we'd signal whoever inherited the number.
+        // What the cache says about this pid proves nothing on its own: a
+        // process that exited after the dialog opened may still be sitting
+        // there from the poll that listed it, may have been swept out by
+        // `evict_departed_processes` since, or may have had its number handed
+        // to something else entirely. Refresh this one pid — remove_dead
+        // evicts it if it is gone, and a live process missing from the map is
+        // re-added, so an eviction in the meantime costs nothing here — and
+        // demand the same start time, or we'd signal whoever inherited the
+        // number.
         let target = Pid::from_u32(pid);
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[target]),
@@ -1198,6 +1280,34 @@ mod tests {
                     ..Default::default()
                 },
             ]
+        }
+    }
+
+    /// Scripted GPU process table: one pid list per poll, so a pid can be on
+    /// the table for one poll and gone from the next. The last entry repeats
+    /// once the script runs out.
+    struct ChurningBackend {
+        ticks: Vec<Vec<u32>>,
+        tick: usize,
+    }
+
+    impl GpuBackend for ChurningBackend {
+        fn name(&self) -> &'static str {
+            "churning"
+        }
+        fn poll(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
+            Ok(Vec::new())
+        }
+        fn processes(&mut self) -> Vec<crate::backend::GpuProcess> {
+            let i = self.tick.min(self.ticks.len() - 1);
+            self.tick += 1;
+            self.ticks[i]
+                .iter()
+                .map(|pid| crate::backend::GpuProcess {
+                    pid: *pid,
+                    ..Default::default()
+                })
+                .collect()
         }
     }
 
@@ -1496,6 +1606,70 @@ mod tests {
         app.apply(Action::KillTerm);
         assert!(app.pending_kill.is_some());
         assert!(app.input_mode == InputMode::Confirm);
+    }
+
+    /// The process cache is refreshed with `ProcessesToUpdate::Some`, and
+    /// sysinfo evicts nothing outside the set it is handed — so without an
+    /// explicit sweep every short-lived job the node ever ran stayed in the
+    /// map until gpur exited.
+    #[test]
+    #[cfg(unix)]
+    fn a_pid_that_leaves_the_gpu_table_is_evicted_from_the_process_cache() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let mut app = app_with(Box::new(ChurningBackend {
+            ticks: vec![vec![pid], vec![]],
+            tick: 0,
+        }));
+
+        app.poll();
+        assert!(
+            app.sys.process(Pid::from_u32(pid)).is_some(),
+            "the child never reached the cache, so the eviction would prove nothing"
+        );
+
+        child.kill().expect("kill child");
+        child.wait().expect("reap child");
+
+        // Second poll: the backend has stopped listing the pid, so nothing
+        // else will ever name it again.
+        app.poll();
+        assert!(
+            app.sys.process(Pid::from_u32(pid)).is_none(),
+            "a departed pid accumulated in the sysinfo cache"
+        );
+    }
+
+    /// CPU% is a delta against a `/proc/stat` reading sysinfo refuses to
+    /// retake more often than `MINIMUM_CPU_UPDATE_INTERVAL`, and `MIN_TICK_MS`
+    /// is a quarter of that — asking for CPU on every poll at the fast end
+    /// divided one tick of process time by 200 ms of machine time.
+    #[test]
+    fn a_cpu_sample_is_due_only_once_sysinfos_minimum_interval_has_elapsed() {
+        let last = Instant::now();
+
+        assert!(
+            cpu_sample_due(None, last),
+            "the first poll has no previous sample to be too close to"
+        );
+        assert!(
+            !cpu_sample_due(Some(last), last + Duration::from_millis(MIN_TICK_MS)),
+            "a poll at the tick floor was taken as a CPU sample"
+        );
+        assert!(
+            !cpu_sample_due(
+                Some(last),
+                last + MINIMUM_CPU_UPDATE_INTERVAL - Duration::from_millis(1)
+            ),
+            "a sample one millisecond short of the interval still counted"
+        );
+        assert!(
+            cpu_sample_due(Some(last), last + MINIMUM_CPU_UPDATE_INTERVAL),
+            "the documented minimum interval must be enough"
+        );
     }
 
     /// `+` must never *raise* the interval: the key floor and the CLI floor
