@@ -1286,11 +1286,17 @@ mod tests {
     /// Scripted GPU process table: one pid list per poll, so a pid can be on
     /// the table for one poll and gone from the next. The last entry repeats
     /// once the script runs out.
+    ///
+    /// Gated with its only test, which needs a real child process to watch
+    /// leave the table — otherwise this is dead code on Windows and the
+    /// `-D warnings` build fails there rather than here.
+    #[cfg(unix)]
     struct ChurningBackend {
         ticks: Vec<Vec<u32>>,
         tick: usize,
     }
 
+    #[cfg(unix)]
     impl GpuBackend for ChurningBackend {
         fn name(&self) -> &'static str {
             "churning"
