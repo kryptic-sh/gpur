@@ -8,13 +8,41 @@ restated; this file covers what that document does not.
 Baseline: `cargo clippy --all-targets -- -D warnings` is clean, and the suite
 passes. Nothing here is a crash or a memory-safety problem.
 
+## Status
+
+Everything below has been fixed except **C4**, which is left open because it
+changes the `--json` / `--log` record shape (`0` → `null`) and that is a call
+for the maintainer, not a review finding to apply unilaterally. **D4** was
+judged not worth the extraction and is recorded as considered-and-declined.
+
+The fixes landed as `c5bf0aa`, `3581995`, `12ca248`, `fba30d1`, `a48f14f`,
+`c594203`, `c080385`, `37fe867`, `0b0cb28` and `79540ed`; the suite went from
+170 to 178 tests, every one of them pinning a finding above. Two fixes are worth
+reading in the commit rather than here, because the final shape differs from
+what this document proposed:
+
+- **C3** is fixed structurally rather than with a guard. A new
+  `backend::BackendSource` carries the whole of how a session's backend is
+  produced (`Live` / `Mock(n)` / `Replay(path)`), and startup and the failure
+  re-detect run the same call — so a re-detect can only ever reproduce the kind
+  of backend the session began with, and there is no rule left for a future edit
+  to forget. A first attempt gated the re-detect on `can_signal()`, which was
+  also correct but cost the `GPUR_MOCK_FAIL` PTY test its only route into the
+  re-detect branch.
+- **C5**'s eviction is a second no-field refresh over exactly the departed pids,
+  since sysinfo exposes no way to drop a map entry and an `All` refresh is what
+  this code exists to avoid. One residual is documented at the site: a pid that
+  left the GPU but is still alive stays cached until it exits, because nothing
+  short of `All` can evict a live process. That set is bounded by the machine's
+  process table rather than by session length, which was the actual finding.
+
 ---
 
 ## Correctness
 
 ### C1. Intel reports a confident `0%` for a GPU it cannot see into
 
-**Severity: medium.** `src/backend/intel.rs:119`, `:147`.
+**Severity: medium. Fixed in `c5bf0aa`.** `src/backend/intel.rs:119`, `:147`.
 
 ```rust
 utilization_pct: Some(clamp_pct(sweep.util.remove(&i).unwrap_or(0.0))),
@@ -50,7 +78,7 @@ An idle device with visible clients keeps its honest `Some(0.0)`.
 
 ### C2. The kill dialog can send SIGKILL while reporting SIGTERM
 
-**Severity: low (Windows-only today).** `src/app.rs:972`.
+**Severity: low (Windows-only today). Fixed in `fba30d1`.** `src/app.rs:972`.
 
 ```rust
 let ok = p.kill_with(sig).unwrap_or_else(|| p.kill());
@@ -71,7 +99,8 @@ path and tell the user to use `X`.
 
 ### C3. Re-detect discards the backend's provenance
 
-**Severity: low (currently unreachable).** `src/app.rs:632`.
+**Severity: low (currently unreachable). Fixed in `a48f14f` — see Status.**
+`src/app.rs:632`.
 
 ```rust
 if self.poll_failures.is_multiple_of(5)
@@ -93,8 +122,8 @@ another.
 
 ### C4. Unknown per-process figures are indistinguishable from zero
 
-**Severity: low.** `src/backend/mod.rs:126`, `src/backend/nvidia.rs:376`,
-`src/app.rs:770-771`.
+**Severity: low. OPEN — needs a call on breaking the record shape.**
+`src/backend/mod.rs:126`, `src/backend/nvidia.rs:376`, `src/app.rs:770-771`.
 
 `GpuProcess::gpu_mem_bytes` is a bare `u64`, so NVML's
 `UsedGpuMemory::Unavailable` (MIG devices, restricted-permission queries, some
@@ -112,7 +141,7 @@ decision rather than applied.
 
 ### C5. sysinfo's process cache grows for the life of the session
 
-**Severity: low.** `src/app.rs:744`.
+**Severity: low. Fixed in `79540ed` — see Status.** `src/app.rs:744`.
 
 ```rust
 self.sys.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, ...)
@@ -132,7 +161,8 @@ maps already; this is the one unbounded map left.
 
 ### C6. CPU% is sampled below sysinfo's documented minimum interval
 
-**Severity: low.** `src/app.rs:14` (`MIN_TICK_MS = 50`), `:744`.
+**Severity: low. Fixed in `79540ed`.** `src/app.rs:14` (`MIN_TICK_MS = 50`),
+`:744`.
 
 `cpu_usage()` is only meaningful when at least `MINIMUM_CPU_UPDATE_INTERVAL`
 (200 ms) elapsed between refreshes of that process. At `--tick-ms 50` — a
@@ -144,7 +174,7 @@ value between, or drop the column below that tick rate.
 
 ### C7. Two `u16` sums in `draw_gpus` can overflow
 
-**Severity: very low.** `src/ui.rs:185`, `:222`.
+**Severity: very low. Fixed in `3581995`.** `src/ui.rs:185`, `:222`.
 
 ```rust
 let needed: u16 = (0..n).map(|i| height_of(app, i)).sum();
@@ -162,7 +192,7 @@ programmatic PTY resize as the trigger. The treatment is inconsistent.
 
 ### C8. Replay trusts `gpu_index` from the record
 
-**Severity: very low.** `src/backend/replay.rs:82`.
+**Severity: very low. Fixed in `c594203`.** `src/backend/replay.rs:82`.
 
 `processes()` hands back recorded rows verbatim. A recording whose `gpu_index`
 exceeds the frame's GPU count — a truncated log, a hand-edited or third-party
@@ -187,7 +217,7 @@ children. No findings there.
 
 ### S1. `--log` is created with default permissions
 
-**Severity: low.** `src/main.rs:70`.
+**Severity: low. Fixed in `c080385`.** `src/main.rs:70`.
 
 ```rust
 std::fs::OpenOptions::new().create(true).append(true).open(path)?
@@ -204,8 +234,8 @@ contents are not sensitive.
 
 ### S2. Unit tests write to predictable paths in a world-writable directory
 
-**Severity: low (test-only).** `src/backend/linux.rs:555`, `:707`,
-`src/backend/amd.rs:533`, `:641`, `src/backend/intel.rs:409`.
+**Severity: low (test-only). Fixed in `12ca248`.** `src/backend/linux.rs:555`,
+`:707`, `src/backend/amd.rs:533`, `:641`, `src/backend/intel.rs:409`.
 
 ```rust
 let root = std::env::temp_dir().join(format!("gpur-drm-{name}"));
@@ -228,7 +258,7 @@ in-crate tests should use the same pattern.
 
 ### S3. `state.json` is written non-atomically
 
-**Severity: very low.** `src/app.rs:509`.
+**Severity: very low. Fixed in `37fe867`.** `src/app.rs:509`.
 
 `fs::write` truncates before writing. A crash, a signal, or a full disk
 mid-write leaves a truncated file, `load_state`'s
@@ -243,6 +273,8 @@ is silently lost. The failure mode is benign but avoidable.
 
 ### D1. `fan_pct` is duplicated verbatim
 
+**Fixed in `0b0cb28`.**
+
 `src/backend/amd.rs:462` and `src/backend/nvidia.rs:306` (the nouveau module)
 are the same six lines — `pwm1` over `pwm1_max`, defaulting the divisor to
 hwmon's 255 and filtering a zero max. Both even carry the same explanatory
@@ -253,6 +285,8 @@ comment. `linux.rs` is where every other shared hwmon reader lives (`hwmon_u64`,
 
 ### D2. The multi-driver `driver_info` join is duplicated
 
+**Fixed in `0b0cb28`.**
+
 `src/backend/amd.rs:158` and `src/backend/intel.rs:160` build the identical
 `BTreeSet` → `join("+")` → `linux::driver_line(..)` chain over their device
 lists, for the identical reason (a box can run `amdgpu`+`radeon` or
@@ -261,6 +295,8 @@ lists, for the identical reason (a box can run `amdgpu`+`radeon` or
 **Fix:** one helper taking an iterator of driver names.
 
 ### D3. `pci.ids` is read and parsed once per device
+
+**Fixed in `0b0cb28`.**
 
 `src/backend/linux.rs:483` — `card_name` reads the whole file (~1.5 MB on a
 current hwdata) and scans it linearly, and it is called once per card inside
@@ -274,6 +310,10 @@ identical across every call in a process.
 the contents to `pci_device_name`, which already takes `&str`.
 
 ### D4. Sub-cell quantization is hand-rolled three times
+
+**Declined.** The three sites quantize against different unit counts and
+different clamp floors, so a shared helper would take both as parameters and
+save nothing but the arithmetic itself.
 
 `src/ui.rs:657` (`mini_spark`, both branches) and `:845` (`draw_waveform_cells`)
 each open-code `value → filled sub-units, clamped` against different unit counts
@@ -294,6 +334,8 @@ are used by more than one backend.
 One near-miss worth naming:
 
 ### Y1. Braille-sized history retention is paid by all three graph styles
+
+**Fixed in `3581995`.**
 
 `src/ui.rs:66` — `app.history_need = area.width as usize * 2` is set
 unconditionally, but only braille packs two samples per column; block and ascii
