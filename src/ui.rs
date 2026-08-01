@@ -495,20 +495,24 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
     draw_meter(
         frame,
         util_row,
-        "GPU ",
-        gpu.utilization_pct.map(|u| u / 100.0),
-        format!(" {} ", pct_or_na(gpu.utilization_pct)),
-        &t.util_stops,
+        Meter {
+            label: "GPU ",
+            frac: gpu.utilization_pct.map(|u| u / 100.0),
+            value: format!(" {} ", pct_or_na(gpu.utilization_pct)),
+            stops: &t.util_stops,
+        },
         t,
         app.graph_style,
     );
     draw_meter(
         frame,
         vram_row,
-        "MEM ",
-        gpu.vram_pct().map(|p| p / 100.0),
-        format!(" {} ", vram_value(gpu)),
-        &t.vram_stops,
+        Meter {
+            label: "MEM ",
+            frac: gpu.vram_pct().map(|p| p / 100.0),
+            value: format!(" {} ", vram_value(gpu)),
+            stops: &t.vram_stops,
+        },
         t,
         app.graph_style,
     );
@@ -627,24 +631,47 @@ fn session_line(s: &SessionStats, t: &UiTheme) -> Option<Line<'static>> {
     Some(Line::from(spans))
 }
 
+/// The half of [`draw_meter`]'s arguments that says what one particular bar
+/// reads: its caption, its fill, its readout, its colors. The GPU and MEM
+/// meters differ in nothing but these four, and as a positional run they were
+/// four adjacent arguments a careless edit could transpose without the
+/// compiler noticing — `label` and `value` are both strings, and swapping the
+/// two `stops` slices silently paints VRAM in the utilization gradient.
+/// Naming them at the call site is the point.
+///
+/// The theme and the glyph style stay positional alongside `frame`/`area`
+/// instead of joining this struct: they are ambient context every drawing
+/// function in this file already trails (`draw_waveform(.., t, style)`), and
+/// both meters pass the identical pair, so folding them in would repeat two
+/// noise fields per call site and break the shape of the neighbours.
+struct Meter<'a> {
+    label: &'a str,
+    /// Fill level, 0.0..=1.0 — see `draw_meter` for what `None` means and why
+    /// it is not 0.0.
+    frac: Option<f64>,
+    /// Right-hand readout, pre-padded by the caller; its width is subtracted
+    /// from the track so the bar and the number do not fight over columns.
+    value: String,
+    /// Gradient stops for the filled glyphs, borrowed from the same theme that
+    /// arrives as `t`. Which of `util_stops`/`vram_stops` a meter wants is
+    /// per-meter data, so it cannot be recovered from the theme alone.
+    stops: &'a [(u8, u8, u8)],
+}
+
 /// btop-style meter: `LABEL ■■■■■■■■····  42%` with a position gradient over
 /// the filled squares. `frac` of `None` is "the backend cannot read this" and
 /// draws no track at all — a full-width track of empty glyphs is exactly the
 /// confident "0%" this is meant to stop rendering.
-#[allow(clippy::too_many_arguments)]
-fn draw_meter(
-    frame: &mut Frame,
-    area: Rect,
-    label: &str,
-    frac: Option<f64>,
-    value: String,
-    stops: &[(u8, u8, u8)],
-    t: &UiTheme,
-    style: GraphStyle,
-) {
+fn draw_meter(frame: &mut Frame, area: Rect, meter: Meter<'_>, t: &UiTheme, style: GraphStyle) {
     if area.height == 0 {
         return;
     }
+    let Meter {
+        label,
+        frac,
+        value,
+        stops,
+    } = meter;
     let Some(frac) = frac else {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -1090,10 +1117,12 @@ mod tests {
             draw_meter(
                 f,
                 f.area(),
-                "GPU ",
-                gpu.utilization_pct.map(|u| u / 100.0),
-                format!(" {} ", pct_or_na(gpu.utilization_pct)),
-                &t.util_stops,
+                Meter {
+                    label: "GPU ",
+                    frac: gpu.utilization_pct.map(|u| u / 100.0),
+                    value: format!(" {} ", pct_or_na(gpu.utilization_pct)),
+                    stops: &t.util_stops,
+                },
                 &t,
                 GraphStyle::Ascii,
             );
