@@ -8,6 +8,38 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-08-01
+
+### Fixed
+
+- **An unreadable graph sample drew as a flat `0`.** Graph history recorded an
+  absent reading as zero, because a waveform has no glyph for "unknown" — the
+  last place in the UI where a metric the backend could not read was drawn as a
+  real measurement, after the device gauges (0.10.2) and the process table
+  (0.11.0). It now draws the minimum sliver marked `·` in braille and block, or
+  `_` in ascii, dimmed: a mark rather than a gap so the trace stays continuous,
+  and one that belongs to no value ramp so it cannot be read as a magnitude.
+
+  The glyph is the signal and the dimming only reinforces it, because colour and
+  `DIM` are both lost under `NO_COLOR`, under `TERM=dumb`, on a terminal that
+  ignores `DIM`, and in any screenshot or copy-paste. A measured `0` keeps its
+  own glyph and its gradient, which is the distinction the change exists to
+  make.
+
+  The not-yet-filled left of a fresh graph is marked the same way, on the same
+  grounds — no sample was taken there either — so a wide terminal now starts
+  mostly dim and fills in with colour from the right.
+
+- **Block graphs rendered their bottom half upside down without colour.**
+  Unicode has upper partial blocks only at ⅛ and ½, so the down-growing half is
+  drawn by painting the bar in the background and the hole in the foreground.
+  That needs two distinct colours, and `NO_COLOR` / `TERM=dumb` has none — both
+  collapse to the terminal default — so the hole was drawn as if it were the bar
+  and a measured `0` filled seven eighths of its cell. That half now falls back
+  to `▔`/`▀`/`█`, rounding to the nearest and rounding ties down: three levels
+  instead of eight, but pointing the way the bar grows. Every other colour mode
+  is unchanged.
+
 ## [0.11.0] - 2026-08-01
 
 ### Breaking
