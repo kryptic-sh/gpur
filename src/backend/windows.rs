@@ -74,6 +74,35 @@ mod parse {
         dedicated_bytes < 512 * 1024 * 1024 && shared_bytes >= dedicated_bytes.saturating_mul(4)
     }
 
+    /// GPU memory to charge one `(pid, luid)` row, from that key's lookups in
+    /// the two `GPU Process Memory` counters. `None` means PDH published no
+    /// memory instance for the process at all.
+    ///
+    /// Which counter is "the relevant" one follows the adapter: an integrated
+    /// adapter's client allocations live in the shared pool, a discrete one's
+    /// in dedicated, and that is the pool the row reports.
+    ///
+    /// Three cases, and the middle one is the reason this is a function:
+    /// - the relevant counter carries the key: a real reading, `0` included.
+    /// - neither counter carries it: PDH accounted for none of this process's
+    ///   memory — the key reached here from the engine-utilization map alone —
+    ///   so the figure is unknown. `0` would assert an empty pool.
+    /// - only the other counter carries it: PDH *did* account for the process,
+    ///   and instances only exist where there is something to report, so the
+    ///   silence in the pool being asked about is a genuine nothing.
+    pub fn proc_mem_bytes(
+        integrated: bool,
+        dedicated: Option<u64>,
+        shared: Option<u64>,
+    ) -> Option<u64> {
+        let (relevant, other) = if integrated {
+            (shared, dedicated)
+        } else {
+            (dedicated, shared)
+        };
+        relevant.or_else(|| other.map(|_| 0))
+    }
+
     /// Drop the adapters a vendor-specific backend already reports, keeping
     /// DXGI's order for the rest.
     ///
@@ -113,7 +142,7 @@ mod parse {
 #[cfg(windows)]
 mod win {
     use super::parse::{
-        is_integrated, luid_and_engtype, luid_prefix, pid_prefix, retain_unclaimed,
+        is_integrated, luid_and_engtype, luid_prefix, pid_prefix, proc_mem_bytes, retain_unclaimed,
     };
     use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind, clamp_pct};
     use anyhow::Result;
@@ -280,11 +309,11 @@ mod win {
                 let Some(&(gpu_index, integrated)) = luid_to_gpu.get(key.1.as_str()) else {
                     continue;
                 };
-                let mem = if integrated {
-                    proc_shr.get(&key).copied().unwrap_or(0)
-                } else {
-                    proc_ded.get(&key).copied().unwrap_or(0)
-                };
+                let mem = proc_mem_bytes(
+                    integrated,
+                    proc_ded.get(&key).copied(),
+                    proc_shr.get(&key).copied(),
+                );
                 let kind = if proc_graphics.get(&key).copied().unwrap_or(false) {
                     ProcKind::Graphics
                 } else {
@@ -517,6 +546,37 @@ mod tests {
         assert!(!is_integrated(8 * GIB, 16 * GIB));
         // Small dedicated pool that shared does not dominate: discrete.
         assert!(!is_integrated(256 * MIB, 256 * MIB));
+    }
+
+    /// A process PDH lists under "GPU Engine" but under neither memory
+    /// counter: nothing published a figure, so there is no figure to show.
+    /// `0` would claim the process holds nothing on the card.
+    #[test]
+    fn a_process_with_no_memory_instance_reads_unknown() {
+        assert_eq!(proc_mem_bytes(false, None, None), None);
+        assert_eq!(proc_mem_bytes(true, None, None), None);
+        assert_ne!(proc_mem_bytes(false, None, None), Some(0));
+    }
+
+    /// The pool the adapter class selects is the one reported, and whatever it
+    /// says is a reading — a published zero included.
+    #[test]
+    fn the_relevant_counter_is_the_reading_zero_included() {
+        // Discrete: dedicated.
+        assert_eq!(proc_mem_bytes(false, Some(512), Some(64)), Some(512));
+        assert_eq!(proc_mem_bytes(false, Some(0), None), Some(0));
+        // Integrated: shared.
+        assert_eq!(proc_mem_bytes(true, Some(512), Some(64)), Some(64));
+        assert_eq!(proc_mem_bytes(true, None, Some(0)), Some(0));
+    }
+
+    /// PDH accounted for the process, just not in the pool being asked about.
+    /// Instances exist where there is something to report, so an empty one is
+    /// a genuine nothing rather than an unknown.
+    #[test]
+    fn the_other_counter_alone_still_proves_the_process_was_accounted_for() {
+        assert_eq!(proc_mem_bytes(false, None, Some(4096)), Some(0));
+        assert_eq!(proc_mem_bytes(true, Some(4096), None), Some(0));
     }
 
     const NVIDIA: u16 = 0x10de;

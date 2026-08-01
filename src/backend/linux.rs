@@ -102,7 +102,14 @@ pub fn build_proc(pid: u32, gpu_index: usize, util: f64, mem: u64, graphics: boo
             ProcKind::Compute
         },
         gpu_util_pct: Some(clamp_pct(util)),
-        gpu_mem_bytes: mem,
+        // Stays `Some` even at zero, unlike the NVML and PDH paths. This sum
+        // is over the fdinfo memory regions the sweep actually read for this
+        // process's clients, and fdinfo names a region only when the client
+        // holds something in it — so a client that lists no `vram`/`gtt` (amd)
+        // or `local`/`system` (intel) region is one holding nothing in that
+        // pool. That is a reading of zero, not an absence of a reading, and
+        // flattening it to `None` would hide real idle clients behind `n/a`.
+        gpu_mem_bytes: Some(mem),
         ..Default::default()
     }
 }
@@ -1066,5 +1073,18 @@ drm-resident-vram0:\t4096 KiB
             Some("DG2 [Arc A770]")
         );
         assert_eq!(pci_device_name(IDS, "1002", "0e3b"), None);
+    }
+
+    /// The fdinfo sweep sums regions it read, so its zero is a reading. Unlike
+    /// the NVML and PDH paths, this one must not degrade to `None` — a client
+    /// naming no memory region holds nothing, and `n/a` there would hide a
+    /// real idle process behind an "unknown".
+    #[test]
+    fn a_swept_row_reports_zero_memory_as_a_measurement() {
+        assert_eq!(build_proc(1, 0, 0.0, 0, false).gpu_mem_bytes, Some(0));
+        assert_eq!(
+            build_proc(2, 0, 50.0, 1 << 30, true).gpu_mem_bytes,
+            Some(1 << 30)
+        );
     }
 }

@@ -123,7 +123,14 @@ pub struct GpuProcess {
     pub kind: ProcKind,
     /// GPU utilization attributable to this process, when the backend knows.
     pub gpu_util_pct: Option<f64>,
-    pub gpu_mem_bytes: u64,
+    /// GPU memory this process holds. `None` when the backend cannot account
+    /// for it at all — NVML answers `Unavailable` for every process under
+    /// WDDM, i.e. on ordinary consumer Windows, and PDH publishes no memory
+    /// instance for some processes it does report engine time for. A `0` there
+    /// would be a claim the process holds nothing, which is exactly what is
+    /// not known; `Some(0)` stays reserved for a pool that was read and found
+    /// empty.
+    pub gpu_mem_bytes: Option<u64>,
     /// Pre-enriched host data. Live backends leave these None (sysinfo fills
     /// them in); the replay backend supplies the RECORDED values so playback
     /// doesn't resolve foreign pids against this host.

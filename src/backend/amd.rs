@@ -670,12 +670,14 @@ drm-engine-enc:\t9770559248 ns
             let procs = backend.processes();
             for p in &procs {
                 println!(
-                    "pid={} gpu={} kind={:?} util={:?}% vram={}MiB",
+                    "pid={} gpu={} kind={:?} util={:?}% vram={}",
                     p.pid,
                     p.gpu_index,
                     p.kind,
                     p.gpu_util_pct,
-                    p.gpu_mem_bytes / 1024 / 1024,
+                    p.gpu_mem_bytes
+                        .map(|b| format!("{}MiB", b / 1024 / 1024))
+                        .unwrap_or_else(|| "n/a".into()),
                 );
             }
             println!("{} gpu processes", procs.len());

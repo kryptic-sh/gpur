@@ -164,6 +164,43 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
+    /// `gpu_mem_bytes` widened to `Option<u64>`; a recording written before
+    /// that carries a plain number and must still mean what it said. `0` in
+    /// particular is a recorded measurement of zero, not the new "unknown".
+    #[test]
+    fn a_pre_option_recording_keeps_its_recorded_memory() {
+        let path = write_log(
+            "mem",
+            concat!(
+                r#"{"gpus":[{"name":"card0"}],"processes":["#,
+                r#"{"pid":1,"gpu_mem_bytes":0},"#,
+                r#"{"pid":2,"gpu_mem_bytes":2147483648}]}"#,
+                "\n"
+            ),
+        );
+        let mut b = load(&path).unwrap();
+        let procs = b.processes();
+        assert_eq!(procs[0].gpu_mem_bytes, Some(0));
+        assert_eq!(procs[1].gpu_mem_bytes, Some(2_147_483_648));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A record that names no memory at all — the `#[serde(default)]` path —
+    /// is the unknown, and must not default to a fabricated zero.
+    #[test]
+    fn a_record_omitting_memory_replays_as_unknown() {
+        let path = write_log(
+            "nomem",
+            concat!(
+                r#"{"gpus":[{"name":"card0"}],"processes":[{"pid":1}]}"#,
+                "\n"
+            ),
+        );
+        let mut b = load(&path).unwrap();
+        assert_eq!(b.processes()[0].gpu_mem_bytes, None);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
     /// Pre-attribution recordings still load; the header just stays blank.
     #[test]
     fn legacy_records_without_attribution_still_load() {

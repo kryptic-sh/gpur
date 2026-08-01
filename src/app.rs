@@ -889,7 +889,11 @@ impl App {
                     gpu_index: gp.gpu_index,
                     kind: gp.kind,
                     gpu_util_pct: gp.gpu_util_pct,
-                    gpu_mem_bytes: gp.gpu_mem_bytes,
+                    // `ProcRow::gpu_mem_bytes` is still a bare u64, so an
+                    // unaccountable figure flattens to 0 here and renders as
+                    // it always has; widened in the ProcRow pass, which is
+                    // where the display and the log record change together.
+                    gpu_mem_bytes: gp.gpu_mem_bytes.unwrap_or(0),
                 }
             })
             .collect();
@@ -1266,14 +1270,14 @@ mod tests {
             vec![
                 crate::backend::GpuProcess {
                     pid: 1,
-                    gpu_mem_bytes: 1,
+                    gpu_mem_bytes: Some(1),
                     command: Some("idle".into()),
                     user: Some("root".into()),
                     ..Default::default()
                 },
                 crate::backend::GpuProcess {
                     pid: 4242,
-                    gpu_mem_bytes: 2 << 30,
+                    gpu_mem_bytes: Some(2 << 30),
                     command: Some("train.py".into()),
                     user: Some("bob".into()),
                     container: Some("docker:abcdef123456".into()),

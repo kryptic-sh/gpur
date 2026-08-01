@@ -176,7 +176,7 @@ impl GpuBackend for NvmlBackend {
                 continue;
             };
             // pid -> (mem, kind); graphics wins when a pid appears in both.
-            let mut procs: HashMap<u32, (u64, ProcKind)> = HashMap::new();
+            let mut procs: HashMap<u32, (Option<u64>, ProcKind)> = HashMap::new();
             for p in dev.running_compute_processes().unwrap_or_default() {
                 procs.insert(p.pid, (used_bytes(&p), ProcKind::Compute));
             }
@@ -364,10 +364,25 @@ fn throttle_label(r: ThrottleReasons) -> Option<String> {
     super::join_throttle(&parts)
 }
 
-fn used_bytes(p: &ProcessInfo) -> u64 {
-    match p.used_gpu_memory {
-        UsedGpuMemory::Used(b) => b,
-        UsedGpuMemory::Unavailable => 0,
+fn used_bytes(p: &ProcessInfo) -> Option<u64> {
+    mem_bytes(&p.used_gpu_memory)
+}
+
+/// NVML's per-process memory, or `None` when it declines to say.
+///
+/// `Unavailable` is `NVML_VALUE_NOT_AVAILABLE`, and nvml-wrapper is blunt
+/// about when that shows up: "Under WDDM, `NVML_VALUE_NOT_AVAILABLE` is always
+/// reported because Windows KMD manages all the memory, not the NVIDIA
+/// driver." WDDM is the ordinary consumer Windows configuration, so folding it
+/// to `0` did not mean a rare unknown rendered as zero — it meant every NVIDIA
+/// process row on Windows read a confident `0MiB`, always.
+///
+/// Split out from [`used_bytes`] because `ProcessInfo` is awkward to build in a
+/// test and this mapping is the whole unit worth testing.
+fn mem_bytes(m: &UsedGpuMemory) -> Option<u64> {
+    match m {
+        UsedGpuMemory::Used(b) => Some(*b),
+        UsedGpuMemory::Unavailable => None,
     }
 }
 
@@ -547,5 +562,25 @@ mod tests {
             assert_eq!(pstate_label(state), Some(format!("P{n}")));
         }
         assert_eq!(pstate_label(Unknown), None);
+    }
+
+    /// The WDDM case. NVML reports `Unavailable` for every process on ordinary
+    /// consumer Windows, and folding that to 0 made every NVIDIA process row
+    /// there read a confident `0MiB`. It must be absent instead.
+    #[test]
+    fn unavailable_process_memory_is_unknown_not_zero() {
+        assert_eq!(mem_bytes(&UsedGpuMemory::Unavailable), None);
+        assert_ne!(mem_bytes(&UsedGpuMemory::Unavailable), Some(0));
+    }
+
+    /// A real reading passes through untouched, including a real zero — a
+    /// process holding a context but no memory is a measurement.
+    #[test]
+    fn reported_process_memory_passes_through() {
+        assert_eq!(mem_bytes(&UsedGpuMemory::Used(0)), Some(0));
+        assert_eq!(
+            mem_bytes(&UsedGpuMemory::Used(2 << 30)),
+            Some(2_147_483_648)
+        );
     }
 }

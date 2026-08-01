@@ -129,7 +129,9 @@ impl GpuBackend for MockBackend {
                         ProcKind::Compute
                     },
                     gpu_util_pct: Some((util * (0.9 - 0.1 * i as f64)).max(0.0)),
-                    gpu_mem_bytes: (3000 >> i.min(8)) as u64 * 1024 * 1024 + 64 * 1024 * 1024,
+                    // Fabricated, but fabricated as a figure: the demo rig is
+                    // pretending to be a backend that can read memory.
+                    gpu_mem_bytes: Some((3000 >> i.min(8)) as u64 * 1024 * 1024 + 64 * 1024 * 1024),
                     user: (!own).then(|| user.to_string()),
                     command: (!own).then(|| command.to_string()),
                     cpu_pct: (!own).then(|| (util * (0.5 - 0.05 * i as f64)).max(0.0) as f32),
