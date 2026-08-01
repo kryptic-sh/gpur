@@ -1,6 +1,6 @@
 use crate::app::{App, GraphStyle, SessionStats};
 use crate::backend::GpuSnapshot;
-use crate::theme::UiTheme;
+use crate::theme::{ColorMode, UiTheme};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -804,6 +804,25 @@ const ASCII_RAMP: [char; 5] = ['_', '.', '-', '+', '#'];
 /// whose terminal or font may not have `·` at all, which is the same reason
 /// they are not being handed braille.
 const UNKNOWN_MARK: char = '·';
+
+/// A down-growing bar of `eighths`, using only the partial blocks that grow
+/// from the *top* of a cell — Unicode has just two, `▔` (⅛) and `▀` (½), plus
+/// the full block.
+///
+/// The waveform's down half normally sidesteps that gap with the complement
+/// trick, painting the bar in the background and the hole in the foreground.
+/// That needs two colors, so under [`ColorMode::Mono`] it collapses and draws
+/// the cell inverted. This is the fallback for that case: three levels instead
+/// of eight, rounded to the nearest available, which loses resolution but keeps
+/// the bar pointing the way it grows. Ties round down, so a bar is understated
+/// rather than overstated.
+fn upper_block(eighths: usize) -> char {
+    match eighths {
+        0..=2 => '▔',
+        3..=6 => '▀',
+        _ => '█',
+    }
+}
 const BRAILLE_BASE: u32 = 0x2800;
 /// Braille dot bit for (sub-column, dot-row counted from cell top).
 const DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
@@ -1011,6 +1030,18 @@ fn draw_waveform_cells(
                     match style {
                         GraphStyle::Block if half == 0 => {
                             (EIGHTHS[in_cell], Style::new().fg(color))
+                        }
+                        GraphStyle::Block if t.mode == ColorMode::Mono => {
+                            // The complement trick below needs two distinct
+                            // colors, and Mono has none: `paint` answers
+                            // `Color::Reset` for the bar and for the page
+                            // alike, so the "empty" complement was drawn in the
+                            // default foreground and every cell in this half
+                            // rendered as its own inverse — a measured 0 as a
+                            // nearly full block. Fall back to the upper
+                            // partials Unicode does have, which cost resolution
+                            // but at least point the right way.
+                            (upper_block(in_cell), Style::new().fg(color))
                         }
                         GraphStyle::Block => {
                             if in_cell == 8 {
@@ -1678,6 +1709,54 @@ mod tests {
     /// which a Linux console or an old terminal may render as nothing at all.
     /// The same test as above with every color removed — if the distinction
     /// ever moves back into the styling, this is where it shows.
+    /// The down half grows downward, so under Mono — where the complement
+    /// trick has no second color to work with — a small value must still draw
+    /// a small mark hanging from the top of the cell. It used to draw the
+    /// complement in the default foreground instead, so a measured 0 filled
+    /// seven eighths of its cell and the whole half read upside down.
+    #[test]
+    fn a_mono_block_graph_does_not_invert_its_bottom_half() {
+        let t = crate::theme::load(None, crate::theme::ColorMode::Mono).unwrap();
+        // One column, so every cell in a half belongs to the same sample.
+        let quiet = [Some(0u64)];
+        let busy = [Some(100u64)];
+
+        // Six rows so the halves are three deep and the `vram%` caption on the
+        // last row cannot be mistaken for graph output.
+        let grid = waveform_grid(&t, GraphStyle::Block, &quiet, &quiet, 1, 6);
+        // Row 3 is the first row below the midline: the sliver lives there.
+        assert_eq!(
+            grid[3][0].0,
+            '▔'.to_string(),
+            "a measured 0 filled the cell"
+        );
+        // ...and the row past it is untouched, not painted.
+        assert_eq!(grid[4][0].0, " ", "the bar leaked past its own value");
+
+        // A full-scale sample fills that same cell and keeps going, which is
+        // what proves the glyph tracks the value rather than being a constant.
+        let grid = waveform_grid(&t, GraphStyle::Block, &busy, &busy, 1, 6);
+        assert_eq!(grid[3][0].0, '█'.to_string());
+        assert_eq!(grid[4][0].0, '█'.to_string());
+
+        // Colour modes that can afford the complement trick still use it, so
+        // this stayed a Mono-only fallback.
+        let color = waveform_grid(&color_theme(), GraphStyle::Block, &quiet, &quiet, 1, 6);
+        assert_eq!(color[3][0].0, EIGHTHS[7].to_string());
+    }
+
+    #[test]
+    fn upper_blocks_round_to_the_nearest_available_partial() {
+        // Unicode gives us ⅛, ½ and full and nothing else that grows from the
+        // top; ties round down so a bar is never overstated.
+        assert_eq!(upper_block(1), '▔');
+        assert_eq!(upper_block(2), '▔');
+        assert_eq!(upper_block(3), '▀');
+        assert_eq!(upper_block(6), '▀');
+        assert_eq!(upper_block(7), '█');
+        assert_eq!(upper_block(8), '█');
+    }
+
     #[test]
     fn a_mono_waveform_still_separates_unknown_from_a_measured_zero() {
         let t = crate::theme::load(None, crate::theme::ColorMode::Mono).unwrap();
