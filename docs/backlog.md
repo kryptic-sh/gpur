@@ -123,7 +123,32 @@ the only temperature field ids in `nvml-wrapper-sys 0.9.1` are
 `NVML_FI_DEV_MEMORY_TEMP` (wired up) and the four `*_TLIMIT` margins, which are
 thresholds, not a hotspot reading.
 
-## 6. Device naming differs per backend
+## 6. Block graphs invert their bottom half without colour
+
+**Severity: low, cosmetic, pre-existing.** `src/ui.rs` `draw_waveform_cells`.
+
+Unicode has upper partial blocks only at one eighth (`▔`) and one half (`▀`), so
+the down-growing half of a `--graphs block` waveform is drawn with a complement
+trick: paint `EIGHTHS[8 - in_cell]` with the bar colour in the **background**
+and the page background in the foreground, which leaves the wanted fraction
+showing at the top of the cell.
+
+Under `ColorMode::Mono` — `NO_COLOR`, `TERM=dumb` — `theme::paint` answers
+`Color::Reset` for both, so the complement is drawn in the default foreground
+and the cell reads as its own inverse: a measured `0` renders as a nearly full
+`▇` instead of a thin sliver, and every bar in the bottom half is upside down.
+Confirmed by rendering, not inferred.
+
+**Fix:** in Mono, drop the complement trick and quantize the down half onto the
+upper partials that do exist — `▔` (⅛), `▀` (½), `█` (full). That trades
+resolution for direction, which is the right trade when the alternative is a
+graph that reads backwards, but it is a visible change to how block graphs look
+on those terminals, so it wants a deliberate yes.
+
+Does not affect the unknown-vs-measured distinction: `·` differs from `▇` either
+way.
+
+## 7. Device naming differs per backend
 
 **Severity: low, cosmetic.** `nvidia.rs` gives the marketing name
 (`NVIDIA GeForce RTX 4090`), the Linux backends the pci.ids codename
@@ -134,7 +159,7 @@ brand. Fallbacks differ too: `NVIDIA GPU 0` (index) against
 **Fix:** settle on a convention — prefer the marketing name, fall back to the
 codename, always suffix the card or index — and apply it uniformly.
 
-## 7. Residual YAGNI
+## 8. Residual YAGNI
 
 - `src/theme.rs:89` `UiTheme::temp_ok` is `pub` but used only by `temp_style` at
   `:173` in the same file, unlike its peers `temp_warn` / `temp_crit`. Narrowing
@@ -179,14 +204,23 @@ Recorded so they are not re-opened as findings.
   the per-tick cost the narrow update set exists to avoid. The residual set is
   bounded by the machine's process table rather than by session length, which
   was the finding.
-- **The ascii baseline `_` means opposite things in the waveform and in the
-  inline sparks.** `mini_spark` is styled whole by its caller, so it cannot dim
-  anything and spells unknown as a gap, leaving `_` to mean a measured 0. The
-  waveform must not leave gaps — the trace has to stay continuous — so there `_`
-  is the unknown sliver and a measured 0 takes the level-1 `.`. Each widget is
-  unambiguous within itself, and the alternative was giving up the distinction
-  entirely in whichever widget lost the glyph, which matters most on exactly the
-  terminals `--graphs ascii` exists for.
+- **An unreadable graph sample is a glyph, not a colour.** The waveform marks it
+  `·` in braille and block — a character in neither value ramp, and already this
+  UI's mark for nothing-here, since `draw_meter` paints an empty non-ascii track
+  with it — and the dim styling only reinforces that. Colour and `DIM` are both
+  lost under `NO_COLOR`, under `TERM=dumb`, on a terminal that ignores `DIM`,
+  and in any screenshot or copy-paste, so neither can carry the distinction on
+  its own.
+- **Ascii spells the same thing `_`, and that collides with `mini_spark`.**
+  `--graphs ascii` is chosen by people whose font may not have `·` at all, which
+  is the same reason they are not being handed braille. That leaves the baseline
+  `_` meaning opposite things in two widgets: `mini_spark` is styled whole by
+  its caller, so it cannot dim anything and spells unknown as a gap, leaving `_`
+  for a measured 0; the waveform must not leave gaps — the trace has to stay
+  continuous — so there `_` is unknown and a measured 0 takes the level-1 `.`.
+  Each widget is unambiguous within itself, and the alternative was giving up
+  the distinction in whichever widget lost the glyph, on exactly the terminals
+  that can least afford to lose it.
 - **`--once` keeps raw MiB** (`vram 40MiB/24560MiB`) while the TUI uses
   `human_bytes` (`14G`). The review called this drift, but the TUI is
   width-constrained and a one-shot diagnostic is not; precision is worth more
