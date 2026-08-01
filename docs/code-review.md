@@ -350,12 +350,13 @@ it is the kind of arithmetic that drifts.
 
 ## YAGNI
 
-`backlog.md` §9 already tracks the three live items (`draw_meter`'s 8 arguments,
-`UiTheme::temp_ok`'s asymmetric visibility, the single-variant `keys::Mode`
-required by the `hjkl-keymap` API). No new dead code was found: every
-`GpuSnapshot` field is rendered, every `Action` variant is bound, every helper
-in `linux.rs` has at least two callers, and both `clamp_pct` and `join_throttle`
-are used by more than one backend.
+`backlog.md` §8 tracks what remains — `UiTheme::temp_ok`'s asymmetric visibility
+and the single-variant `keys::Mode` the `hjkl-keymap` API requires.
+`draw_meter`'s 8 arguments were the third item and are now a named `Meter`
+struct with the `allow` deleted. No new dead code was found: every `GpuSnapshot`
+field is rendered, every `Action` variant is bound, every helper in `linux.rs`
+has at least two callers, and both `clamp_pct` and `join_throttle` are used by
+more than one backend.
 
 One near-miss worth naming:
 

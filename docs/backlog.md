@@ -1,36 +1,18 @@
 # gpur backlog
 
-Known gaps from the review passes, the multi-vendor detection audit and the
-full-codebase review in `docs/code-review.md`. Everything already fixed lives in
-`CHANGELOG.md`; only open work is listed here, with closed entries struck
-through where the reasoning behind them is still worth keeping.
+Open work from the review passes, the multi-vendor detection audit and the
+full-codebase review in `docs/code-review.md`. Closed items are removed rather
+than struck through — what was fixed, and why, lives in `CHANGELOG.md`, and the
+review document tracks each finding's fate. Anything from a closed item that is
+still a live constraint on future work has been moved down into "Decisions taken
+deliberately" instead of being kept as a task.
 
 Roughly ordered by what is worth doing first. Nothing open here is a correctness
-bug — item 0 was the only one and it is closed; the remainder is granularity,
-cost, coverage and polish.
+bug; the remainder is granularity, cost, coverage and polish. Every item that is
+still open is open because it turns on a product or architecture call rather
+than on effort.
 
 ---
-
-## 0. ~~Per-process GPU memory reads `0MiB` for every NVIDIA process on Windows~~ — CLOSED in 0.11.0
-
-Review finding C4. `GpuProcess::gpu_mem_bytes` and `ProcRow`'s `gpu_mem_bytes` /
-`cpu_pct` / `host_mem_bytes` are `Option` now, so a figure the backend could not
-read renders as `N/A` (`-` in `--once`) and serializes as `null` rather than a
-confident zero. NVML reports no per-process memory at all under WDDM — the
-ordinary consumer Windows configuration — so that was every NVIDIA process row
-on Windows, not a rare unknown.
-
-The cost was taken deliberately: `--json` and `--log` emit `null` where they
-emitted `0`, so a log written by 0.11 or later cannot be read by an older gpur,
-which is why it went out as a minor release. The useful direction still works —
-0.11 replays pre-0.11 recordings, since `0` remains a valid reading.
-
-Kept here rather than deleted because the asymmetry is worth remembering: the
-record is written from `ProcRow` and read back into `GpuProcess`, two types that
-line up only by field name, and `#[serde(default)]` covers missing keys but not
-explicit nulls. Any future field that gains a `null` has to be widened on both
-sides in the same release, or replay rejects whole records — silently, in the
-mixed case.
 
 ## 1. Windows vendor exclusion is per vendor, not per adapter
 
@@ -102,37 +84,35 @@ Whether a row of `n/a` beats an absent card is a product call, not a bug.
   it, because mock and replay now correctly refuse to signal. End-to-end
   coverage needs a backend stub the test binary can inject — which would also
   close the one mouse case left untested, the kill dialog as a modal. The filter
-  prompt covers the identical `input_mode != Normal` condition meanwhile.
+  prompt covers the identical `input_mode != Normal` condition meanwhile. Note
+  the obvious shortcut, making the mock signalable, would weaken the guard that
+  exists to stop exactly that.
 - **Mouse kinds with no behaviour attached** — drag, middle and right button,
   and moves all fall to the `_ => None` arm. Untested because untested is what
   they are: there is nothing to assert yet.
-- ~~**`--graphs block` / `ascii` rendering.**~~ Closed. `tests/tui.rs` renders
-  under each glyph set and asserts both that the style's own glyphs appear and
-  that the other two styles' do not — a style that silently fell back to braille
-  would pass a test looking only for its own output. The block case also pins
-  the fg/bg complement trick that grows partial cells downward, where the
-  colour-quantization bug lived.
-- ~~**Colour modes.**~~ Closed. `NO_COLOR=1` and `TERM=dumb` must render the
-  dashboard without emitting a single colour SGR, and a session without
-  `COLORTERM` must quantize to `38;5`/`48;5` rather than send a truecolor escape
-  to a 256-colour terminal. Needed `Tui::spawn_with_env` to be able to _unset_ a
-  variable, since unset and empty differ to `detect_color_mode`.
-- ~~`--man` and `--once`'s plain-text stdout are unasserted.~~ Closed in
-  `tests/smoke.rs`: the man page is asserted on its troff-escaped option entries
-  (a bare `.TH`/name check would pass on a header with no body), and `--once` on
-  its populated `--mock` output, including that `--once --log` writes exactly
-  one record despite the deliberate priming poll.
 - **No CI job runs against real GPU hardware.** Inherent to hosted runners; the
   mitigation was fixture-testing every backend's pure parsers, which is why
-  `windows.rs` and `apple.rs` now have unit tests that run on any host. Closing
-  it properly needs a self-hosted runner.
+  `windows.rs` and `apple.rs` have unit tests that run on any host. Closing it
+  properly needs a self-hosted runner.
+
+  This is the gap behind every "unverifiable without hardware" note in this
+  file, and it is load-bearing: the WDDM per-process-memory bug fixed in 0.11.0
+  was diagnosed from NVIDIA's documentation, not from an observation, and
+  nothing in CI could have caught it or can confirm the fix.
 
 ## 5. NVIDIA temperature threshold unread
 
 **Severity: low.** `Device::temperature_threshold()` is available in
-`nvml-wrapper 0.12.1` (`device.rs:4048`) and would give the temperature meter a
-per-card scale instead of a fixed one. Needs a new `GpuSnapshot` field and a
-`draw_meter` scale change.
+`nvml-wrapper 0.12.1` (`device.rs:4048`) and would let each card carry its own
+thermal limits.
+
+Note this is not a meter rescale: temperature has no meter. `src/ui.rs`
+`temp_span` colours the reading through `UiTheme::temp_style`, which thresholds
+at a fixed 75 °C and 90 °C for every device. So wiring this up changes **when a
+card reads as hot**, which differs by part — a laptop GPU throttling at 87 °C
+and a workstation card rated to 100 °C currently share one scale. Needs a new
+`GpuSnapshot` field and a `temp_style` that takes the card's own limits, and it
+is a product call rather than a mechanical change.
 
 Junction temperature is genuinely unavailable rather than merely unimplemented:
 the only temperature field ids in `nvml-wrapper-sys 0.9.1` are
@@ -146,6 +126,12 @@ unreadable sample is recorded as `0` in the history ring because a sparkline has
 no glyph for absent. The meter above the graph carries the distinction; the
 graph does not. Commented at the site.
 
+This is the last place a fabricated `0` survives, now that the device gauges
+(0.10.2) and the process table (0.11.0) both distinguish absent from zero. What
+stops it being mechanical is that fixing it needs a decision about what a gap
+looks like — a break in the trace, a dimmed column, a baseline — rather than a
+type change.
+
 ## 7. Device naming differs per backend
 
 **Severity: low, cosmetic.** `nvidia.rs` gives the marketing name
@@ -157,21 +143,8 @@ brand. Fallbacks differ too: `NVIDIA GPU 0` (index) against
 **Fix:** settle on a convention — prefer the marketing name, fall back to the
 codename, always suffix the card or index — and apply it uniformly.
 
-## 8. ~~`splash::build_path` truncates coordinates to `u8`~~ — CLOSED
+## 8. Residual YAGNI
 
-`src/splash.rs` now scans `ART` in a `const fn` and asserts both dimensions
-against `u8::MAX` at compile time, so art that outgrew the cursor path fails the
-build instead of scattering the trail silently. A round-trip test proves every
-emitted coordinate, cast back, still names the glyph it came from. The `u8` is
-still imposed by `hjkl_splash`'s API and has not changed.
-
-## 9. Residual YAGNI
-
-- ~~`draw_meter` takes 8 arguments behind
-  `#[allow(clippy::too_many_arguments)]`~~ — closed. The four per-bar arguments
-  are a named `Meter` struct (`src/ui.rs:647`) and the `allow` is gone, so
-  clippy enforces the shape. Theme and glyph style stayed positional, matching
-  the neighbouring drawing functions.
 - `src/theme.rs:89` `UiTheme::temp_ok` is `pub` but used only by `temp_style` at
   `:173` in the same file, unlike its peers `temp_warn` / `temp_crit`. Narrowing
   it alone would be asymmetric.
@@ -185,6 +158,15 @@ still imposed by `hjkl_splash`'s API and has not changed.
 
 Recorded so they are not re-opened as findings.
 
+- **A record field cannot gain a `null` on one side only.** `--json` and `--log`
+  are written from `ProcRow` and read back into `GpuProcess`, two types that
+  line up only by field name, and `#[serde(default)]` covers a missing key but
+  not an explicit null. So widening a field to `Option` on the writing side
+  without widening it on the reading side makes `--replay` reject whole records
+  — silently skipping frames when only some carry the null, and refusing the
+  file outright when all of them do. Both sides must move in the same release.
+  This is what made the 0.11.0 process-metric change a minor rather than a
+  patch.
 - **An Intel GPU with no visible DRM clients reports `n/a`, not `0%`.** The fix
   for review finding C1 keys utilization off whether the fdinfo sweep attributed
   any client to the device, because "nobody is using it" and "I cannot see who
@@ -194,6 +176,11 @@ Recorded so they are not re-opened as findings.
   with a genuinely idle iGPU it does. A device whose clients _were_ read and
   summed to zero still reports an honest `0%`, so an idle GPU keeps its empty
   meter.
+- **The Linux fdinfo sweeps report `Some(0)` per process, never unknown.**
+  fdinfo names a memory region only when the client holds something in it, so a
+  client with no `vram` or `gtt` region genuinely holds nothing there. That is a
+  measurement; degrading it to `n/a` alongside the 0.11.0 change would have
+  hidden real idle clients.
 - **A pid that leaves the GPU but stays alive remains in the sysinfo cache**
   until it exits. The C5 fix sweeps departed pids with a second no-field
   refresh, and `remove_dead` drops the ones that have exited; nothing short of a
@@ -204,7 +191,10 @@ Recorded so they are not re-opened as findings.
 - **`--once` keeps raw MiB** (`vram 40MiB/24560MiB`) while the TUI uses
   `human_bytes` (`14G`). The review called this drift, but the TUI is
   width-constrained and a one-shot diagnostic is not; precision is worth more
-  there, and MiB matches what `nvidia-smi` and `nvtop` print.
+  there, and MiB matches what `nvidia-smi` and `nvtop` print. For the same
+  reason `--once` spells an unreadable per-process figure `-` while the TUI
+  spells it `N/A`: the columns on one whitespace-splittable line agree with each
+  other, which matters more there than agreeing with the table.
 - **NVIDIA `integrated` is derived from `BusType::Fpci`.** Tegra's on-SoC host
   interface is the only NVML signal available, and it could not be verified
   without a Jetson. Fail-safe: any error or older driver yields `false`, exactly
