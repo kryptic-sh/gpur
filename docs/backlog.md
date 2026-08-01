@@ -12,6 +12,10 @@ bug; the remainder is granularity, cost, coverage and polish. Every item that is
 still open is open because it turns on a product or architecture call rather
 than on effort.
 
+No fabricated readings remain anywhere in the UI: the device gauges stopped
+inventing a `0` in 0.10.2, the process table in 0.11.0, and the graph history —
+the last holdout, because a waveform has no glyph for absent — in 0.11.1.
+
 ---
 
 ## 1. Windows vendor exclusion is per vendor, not per adapter
@@ -119,20 +123,7 @@ the only temperature field ids in `nvml-wrapper-sys 0.9.1` are
 `NVML_FI_DEV_MEMORY_TEMP` (wired up) and the four `*_TLIMIT` margins, which are
 thresholds, not a hotspot reading.
 
-## 6. Waveform history cannot represent "unknown"
-
-**Severity: low.** `src/app.rs`. `utilization_pct` is `Option`, but an
-unreadable sample is recorded as `0` in the history ring because a sparkline has
-no glyph for absent. The meter above the graph carries the distinction; the
-graph does not. Commented at the site.
-
-This is the last place a fabricated `0` survives, now that the device gauges
-(0.10.2) and the process table (0.11.0) both distinguish absent from zero. What
-stops it being mechanical is that fixing it needs a decision about what a gap
-looks like — a break in the trace, a dimmed column, a baseline — rather than a
-type change.
-
-## 7. Device naming differs per backend
+## 6. Device naming differs per backend
 
 **Severity: low, cosmetic.** `nvidia.rs` gives the marketing name
 (`NVIDIA GeForce RTX 4090`), the Linux backends the pci.ids codename
@@ -143,7 +134,7 @@ brand. Fallbacks differ too: `NVIDIA GPU 0` (index) against
 **Fix:** settle on a convention — prefer the marketing name, fall back to the
 codename, always suffix the card or index — and apply it uniformly.
 
-## 8. Residual YAGNI
+## 7. Residual YAGNI
 
 - `src/theme.rs:89` `UiTheme::temp_ok` is `pub` but used only by `temp_style` at
   `:173` in the same file, unlike its peers `temp_warn` / `temp_crit`. Narrowing
@@ -188,6 +179,14 @@ Recorded so they are not re-opened as findings.
   the per-tick cost the narrow update set exists to avoid. The residual set is
   bounded by the machine's process table rather than by session length, which
   was the finding.
+- **The ascii baseline `_` means opposite things in the waveform and in the
+  inline sparks.** `mini_spark` is styled whole by its caller, so it cannot dim
+  anything and spells unknown as a gap, leaving `_` to mean a measured 0. The
+  waveform must not leave gaps — the trace has to stay continuous — so there `_`
+  is the unknown sliver and a measured 0 takes the level-1 `.`. Each widget is
+  unambiguous within itself, and the alternative was giving up the distinction
+  entirely in whichever widget lost the glyph, which matters most on exactly the
+  terminals `--graphs ascii` exists for.
 - **`--once` keeps raw MiB** (`vram 40MiB/24560MiB`) while the TUI uses
   `human_bytes` (`14G`). The review called this drift, but the TUI is
   width-constrained and a one-shot diagnostic is not; precision is worth more
