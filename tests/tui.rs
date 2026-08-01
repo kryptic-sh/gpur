@@ -416,6 +416,51 @@ fn renders_dashboard_and_process_table() {
     assert!(t.wait_exit().success());
 }
 
+/// The MEM row names the pool each card actually spends. Mock GPU 0 is the
+/// unified-memory part — no local pool, so its meter is the system one and
+/// has to say `shared`; the discrete cards meter their own VRAM and carry the
+/// spill pool beside it as `gtt`. Rendering host RAM as a card's dedicated
+/// VRAM is the failure this pins, and it is invisible in every other test
+/// because both readouts are the same shape.
+#[test]
+fn the_mem_row_marks_shared_memory_and_carries_the_second_pool() {
+    let mut t = Tui::spawn(&["--mock", "2"]);
+    t.wait_for("both cards", |s| {
+        s.contains("Mock GPU 0") && s.contains("Mock GPU 1")
+    });
+    t.wait_for("the MEM meters", |s| {
+        s.lines()
+            .filter(|l| l.contains("MEM ") && l.contains('/'))
+            .count()
+            >= 2
+    });
+    let s = t.screen_text();
+    let mem: Vec<&str> = s
+        .lines()
+        .filter(|l| l.contains("MEM ") && l.contains('/'))
+        .collect();
+
+    assert!(
+        mem[0].contains("shared") && !mem[0].contains("gtt"),
+        "unified card did not mark its pool shared: {:?}",
+        mem[0]
+    );
+    assert!(
+        mem[1].contains("· gtt ") && !mem[1].contains("shared"),
+        "discrete card lost its spill pool, or called it shared: {:?}",
+        mem[1]
+    );
+    // The footer used to carry it; printing it in both places was the
+    // alternative to moving it.
+    assert_eq!(
+        s.matches("gtt ").count(),
+        1,
+        "the system pool is printed twice:\n{s}"
+    );
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
 /// A card whose backend publishes no utilization and no VRAM figures — a
 /// mainline-i915 iGPU, a PDH adapter with no matching counter instance, an
 /// Apple accelerator with no PerformanceStatistics. It must read `n/a`, never
@@ -1201,22 +1246,22 @@ const ASCII_RAMP: &str = ".-+#";
 
 /// Screen rows of the first card's waveform, top and bottom inclusive.
 /// `waveform_halves` writes its own `gpu%` at the graph's top-left and
-/// `vram%` at its bottom-left, so the labels bracket exactly the rows the
+/// `mem%` at its bottom-left, so the labels bracket exactly the rows the
 /// graph owns — and nothing else on screen is mistakable for them, the
 /// process table's column being upper-case `GPU%`.
 fn waveform_rows(t: &mut Tui) -> (u16, u16) {
     // The graph is drawn only once a card has history and the card has rows
     // to spare, so wait for the labels rather than assume the first frame.
     t.wait_for("a drawn waveform", |s| {
-        s.contains("gpu%") && s.contains("vram%")
+        s.contains("gpu%") && s.contains("mem%")
     });
     let screen = t.parser.screen();
     let top = (0..ROWS)
         .find(|&y| row_text(screen, y).contains("gpu%"))
         .expect("a gpu% label");
     let bot = (top..ROWS)
-        .find(|&y| row_text(screen, y).contains("vram%"))
-        .expect("a vram% label below the gpu% one");
+        .find(|&y| row_text(screen, y).contains("mem%"))
+        .expect("a mem% label below the gpu% one");
     (top, bot)
 }
 

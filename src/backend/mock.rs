@@ -53,6 +53,7 @@ impl GpuBackend for MockBackend {
             anyhow::bail!("simulated driver reset (tick {})", self.tick);
         }
         let total = 16 * 1024 * 1024 * 1024u64;
+        let gtt_total = 8 * 1024 * 1024 * 1024u64;
         let gpus = (0..self.count)
             .map(|i| {
                 let util = self.wave(i as f64 * 1.3, 37.0 + 11.0 * i as f64);
@@ -69,8 +70,13 @@ impl GpuBackend for MockBackend {
                     enc_util_pct: (i % 2 == 1).then_some(util * 0.3),
                     dec_util_pct: (i % 2 == 1).then_some(util * 0.5),
                     throttle: (util > 95.0).then(|| "power-limit".to_string()),
-                    vram_used_bytes: Some((total as f64 * vram / 100.0) as u64),
-                    vram_total_bytes: Some(total),
+                    // GPU 0 is a unified-memory part: no local pool at all, so
+                    // everything it spends is the system-backed one below.
+                    // The demo has to carry that shape — it is what every
+                    // iGPU, APU and Apple Silicon card looks like, and a
+                    // fleet of identical dGPUs never exercises its rendering.
+                    vram_used_bytes: (i > 0).then(|| (total as f64 * vram / 100.0) as u64),
+                    vram_total_bytes: (i > 0).then_some(total),
                     temperature_c: Some(45.0 + util * 0.4),
                     power_w: Some(60.0 + util * 2.4),
                     power_limit_w: Some(320.0),
@@ -94,8 +100,15 @@ impl GpuBackend for MockBackend {
                     } else {
                         "P8".into()
                     }),
-                    gtt_used_bytes: Some((util * 2e7) as u64),
-                    gtt_total_bytes: Some(8 * 1024 * 1024 * 1024),
+                    // On GPU 0 this is the whole of its memory; on the others
+                    // it is the spill pool beside their VRAM, so it moves
+                    // with the fill level rather than sitting still.
+                    gtt_used_bytes: Some(if i == 0 {
+                        (gtt_total as f64 * vram / 100.0) as u64
+                    } else {
+                        (util * 2e7) as u64
+                    }),
+                    gtt_total_bytes: Some(gtt_total),
                     volt_mv: Some(700 + (util * 4.0) as u64),
                 }
             })

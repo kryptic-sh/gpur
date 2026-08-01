@@ -881,6 +881,39 @@ drm-resident-gtt:\t1024 KiB
             );
         }
 
+        /// What the MEM meter ends up showing on this machine. An iGPU has no
+        /// local pool, so the readout has to fall through to the system-backed
+        /// one and mark it shared — reporting `n/a` there described a card
+        /// that was demonstrably holding memory as holding none.
+        #[test]
+        fn a_card_with_no_local_pool_meters_its_share_of_system_ram() {
+            let Some(mut b) = intel() else { return };
+            let gpus = b.poll().unwrap();
+            for g in &gpus {
+                let m = g.mem_primary();
+                if g.vram_total_bytes.is_some() {
+                    assert!(!m.shared, "{} has a local pool of its own", g.name);
+                    continue;
+                }
+                assert_eq!(m.used, g.gtt_used_bytes, "{}", g.name);
+                assert_eq!(m.total, g.gtt_total_bytes, "{}", g.name);
+                assert!(m.shared, "{}: system RAM must be marked shared", g.name);
+                assert_eq!(
+                    g.mem_secondary(),
+                    None,
+                    "{}: one pool, so nothing sits beside it",
+                    g.name
+                );
+                if g.gtt_used_bytes.is_some() {
+                    assert!(
+                        g.mem_pct().is_some(),
+                        "{}: the memory graph would stay blank",
+                        g.name
+                    );
+                }
+            }
+        }
+
         /// The header names the drivers actually in use, because an i915 iGPU
         /// beside an xe card publishes different telemetry and a line naming
         /// one of them misattributes what the other lacks.

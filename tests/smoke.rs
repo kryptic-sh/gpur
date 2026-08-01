@@ -131,8 +131,13 @@ fn absent_metrics_are_null_not_zero() {
         "plain output fabricated a util: {s}"
     );
     assert!(
-        s.contains("vram n/a/n/a"),
-        "plain output fabricated a vram pool: {s}"
+        s.contains("mem n/a/n/a"),
+        "plain output fabricated a memory pool: {s}"
+    );
+    assert!(
+        !s.contains("shared"),
+        "a card that published no memory figure still claimed to know \
+         where its bytes live: {s}"
     );
 }
 
@@ -363,10 +368,28 @@ fn once_prints_populated_plain_rows_for_the_mock_gpus() {
             line.starts_with(&format!("{i}  Mock GPU {i}  util ")),
             "GPU line {i} malformed: {line:?}"
         );
-        assert!(
-            line.contains("MiB/16384MiB"),
-            "vram pool is not raw used/total MiB: {line:?}"
-        );
+        // GPU 0 is the mock's unified-memory part: it meters the system
+        // pool and says so, where the discrete ones meter their own VRAM and
+        // carry the spill pool beside it.
+        if i == 0 {
+            assert!(
+                line.contains("MiB/8192MiB shared"),
+                "unified card did not meter its shared pool: {line:?}"
+            );
+            assert!(
+                !line.contains("gtt "),
+                "nothing spilled anywhere on a card with one pool: {line:?}"
+            );
+        } else {
+            assert!(
+                line.contains("MiB/16384MiB"),
+                "memory pool is not raw used/total MiB: {line:?}"
+            );
+            assert!(
+                line.contains("gtt ") && line.contains("MiB/8192MiB"),
+                "the spill pool is missing from a discrete card: {line:?}"
+            );
+        }
         // The mock fills in every optional sensor, so the trailing temp and
         // power segments must both be present and neither may be `n/a`.
         assert!(line.contains("°C"), "temperature dropped: {line:?}");

@@ -8,6 +8,39 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **The MEM meter now shows the memory a card actually spends, and says when
+  those bytes are system RAM.** An Intel iGPU has no local pool, so `vram_*` is
+  `None` and the meter read `MEM n/a` beside a card demonstrably holding memory;
+  it now meters the system-backed pool as `703M/15G shared`. Apple Silicon and
+  Windows' integrated adapters, whose unified memory arrives _through_ the VRAM
+  fields, no longer read as dedicated VRAM — they gain the same `shared` marker.
+  New `GpuSnapshot::mem_primary` / `mem_secondary` / `mem_pct` pick the pool
+  once, for the meter, the graph and `--once` alike. The JSON record is
+  unchanged.
+- **The second memory pool moved from the footer onto the MEM row**, next to the
+  meter whose pool it sits beside: `· gtt 3.0G/16G` on a card with real VRAM,
+  where a rising figure means the working set spilled to host RAM across PCIe,
+  and `· shared 3.0G/16G` on an APU, where nothing spilled anywhere because both
+  pools are RAM.
+- **The memory graph plots the metered pool**, so an iGPU's graph is no longer
+  permanently blank; its caption is `mem%` rather than `vram%`.
+- **`--once` prints `mem used/total` rather than `vram used/total`**, with the
+  `shared` marker and the second pool where they apply.
+- **`--mock`'s first card is now a unified-memory part**, so the demo and the
+  test suite exercise the shape every iGPU, APU and Apple Silicon card has.
+
+### Added
+
+- **Hardware tests for the Intel backend** (`src/backend/intel.rs`), covering
+  every value it reads from i915/xe: the card scan, gauge ranges, hwmon presence
+  both ways, the PCIe attributes, pci.ids naming, VRAM and clock paths, the
+  energy-delta power reading, per-client state pruning, and that the device
+  gauges equal the sum of the process rows from the same sweep. They skip
+  themselves where no i915/xe card is present; `GPUR_REQUIRE_INTEL=1` turns that
+  skip into a failure for a runner that is supposed to have one.
+
 ## [0.11.1] - 2026-08-01
 
 ### Fixed

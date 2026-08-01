@@ -216,15 +216,28 @@ fn snapshot(app: &mut App, json: bool, tick_ms: u64) -> Result<()> {
             .unwrap_or_else(|| "n/a".to_string())
     };
     for (i, g) in app.gpus.iter().enumerate() {
+        // The pool the card actually spends, marked when those bytes are
+        // system RAM — an iGPU printing `vram n/a/n/a` reported nothing at
+        // all about the memory it was in fact using.
+        let mem = g.mem_primary();
         let mut line = format!(
-            "{i}  {}  util {}  vram {}/{}",
+            "{i}  {}  util {}  mem {}/{}{}",
             g.name,
             g.utilization_pct
                 .map(|u| format!("{u:>3.0}%"))
                 .unwrap_or_else(|| "n/a".to_string()),
-            mib(g.vram_used_bytes),
-            mib(g.vram_total_bytes),
+            mib(mem.used),
+            mib(mem.total),
+            if mem.shared { " shared" } else { "" },
         );
+        if let Some(second) = g.mem_secondary() {
+            let label = if second.shared { "shared" } else { "gtt" };
+            line.push_str(&format!(
+                "  {label} {}/{}",
+                mib(second.used),
+                mib(second.total)
+            ));
+        }
         if let Some(t) = g.temperature_c {
             line.push_str(&format!("  {t:.0}°C"));
         }

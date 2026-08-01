@@ -304,8 +304,8 @@ fn draw_gpu_folded(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, 
                 t.dim
             }
         }),
-        Span::styled(format!("MEM {}  ", vram_value(gpu)), {
-            if gpu.vram_pct().is_some() {
+        Span::styled(format!("MEM {}  ", mem_value(gpu)), {
+            if gpu.mem_pct().is_some() {
                 Style::new().fg(t.accent)
             } else {
                 t.dim
@@ -340,14 +340,38 @@ fn bytes_or_na(b: Option<u64>) -> String {
     b.map(human_bytes).unwrap_or_else(|| "n/a".to_string())
 }
 
-/// The MEM readout. A device that publishes neither figure (mainline i915, a
-/// PDH adapter with no counter instance) says so once instead of claiming an
-/// empty `0M/0M` pool.
-fn vram_value(gpu: &GpuSnapshot) -> String {
-    match (gpu.vram_used_bytes, gpu.vram_total_bytes) {
+/// The MEM readout: the pool the card actually spends, marked `shared` when
+/// those bytes are system RAM rather than memory of the device's own. A
+/// device that publishes neither figure (a PDH adapter with no counter
+/// instance, an unattributed iGPU) says so once instead of claiming an empty
+/// `0M/0M` pool.
+fn mem_value(gpu: &GpuSnapshot) -> String {
+    let m = gpu.mem_primary();
+    match (m.used, m.total) {
         (None, None) => "n/a".to_string(),
-        (used, total) => format!("{}/{}", bytes_or_na(used), bytes_or_na(total)),
+        (used, total) => format!(
+            "{}/{}{}",
+            bytes_or_na(used),
+            bytes_or_na(total),
+            if m.shared { " shared" } else { "" }
+        ),
     }
+}
+
+/// The second pool, printed beside the meter's own readout: `· gtt 3G/16G` on
+/// a card with real VRAM, `· shared 3G/16G` on an APU, whose carve-out and
+/// system pool are both RAM so nothing has spilled anywhere. Empty for the
+/// cards with a single pool, which is most of them.
+fn mem_secondary_value(gpu: &GpuSnapshot) -> String {
+    let Some(m) = gpu.mem_secondary() else {
+        return String::new();
+    };
+    let label = if m.shared { "shared" } else { "gtt" };
+    format!(
+        " · {label} {}/{}",
+        bytes_or_na(m.used),
+        bytes_or_na(m.total)
+    )
 }
 
 /// Temperature, colored by the warn/crit thresholds.
@@ -516,8 +540,11 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
         vram_row,
         Meter {
             label: "MEM ",
-            frac: gpu.vram_pct().map(|p| p / 100.0),
-            value: format!(" {} ", vram_value(gpu)),
+            frac: gpu.mem_pct().map(|p| p / 100.0),
+            // The second pool rides on this row rather than in the footer:
+            // on a unified-memory card it is the same story as the meter, and
+            // on a dGPU it is the one that says the working set spilled.
+            value: format!(" {}{} ", mem_value(gpu), mem_secondary_value(gpu)),
             stops: &t.vram_stops,
         },
         t,
@@ -527,7 +554,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
     if spark_row.height >= 2
         && let Some(hist) = hist
     {
-        draw_waveform(frame, spark_row, &hist.util, &hist.vram, t, app.graph_style);
+        draw_waveform(frame, spark_row, &hist.util, &hist.mem, t, app.graph_style);
     }
 
     let mut info: Vec<Span> = vec![Span::raw(" ")];
@@ -593,12 +620,9 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
     if let Some(mv) = gpu.volt_mv {
         info.push(Span::styled(format!("{:.2}V  ", mv as f64 / 1000.0), t.dim));
     }
-    if let (Some(u_), Some(t_)) = (gpu.gtt_used_bytes, gpu.gtt_total_bytes) {
-        info.push(Span::styled(
-            format!("gtt {}/{}  ", human_bytes(u_), human_bytes(t_)),
-            t.dim,
-        ));
-    }
+    // The system pool used to live here; it sits on the MEM row now, beside
+    // the meter whose pool it belongs next to. Printing it twice was the
+    // alternative.
     if let Some(p) = &gpu.perf_level {
         info.push(Span::styled(format!("perf {p}  "), t.temp_warn));
     }
@@ -830,7 +854,7 @@ const DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x8
 /// Walk the mirrored-waveform grid and call `cell` once per terminal row:
 /// top half from `up_data` growing up from the midline, bottom half from
 /// `down_data` growing down. Owns the shared geometry (row `y`, gradient
-/// `color`, the gpu%/vram% edge labels); the glyph-specific per-column fill
+/// `color`, the gpu%/mem% edge labels); the glyph-specific per-column fill
 /// lives in the closure. `cell` receives (buf, row data, half-height rows,
 /// distance-from-midline cy, row y, color, half).
 ///
@@ -879,11 +903,11 @@ fn waveform_halves(
         }
     }
     buf.set_string(area.x, area.y, "gpu%", t.dim);
-    buf.set_string(area.x, area.y + area.height - 1, "vram%", t.dim);
+    buf.set_string(area.x, area.y + area.height - 1, "mem%", t.dim);
 }
 
 /// btop-style mirrored waveform: `up_data` (gpu%) grows upward from the
-/// vertical midline, `down_data` (vram%) grows downward, with a color
+/// vertical midline, `down_data` (mem%) grows downward, with a color
 /// gradient from the midline toward the edges. Zero values keep a minimum
 /// sliver, so an idle GPU still draws a thin center line. The glyph set is
 /// selectable: braille (2 samples/cell, 4 rows/cell), block eighths, or
@@ -1410,10 +1434,10 @@ mod tests {
 
     /// `0M/0M` is a claim about an empty pool; absence has to say so instead.
     #[test]
-    fn vram_readout_distinguishes_absent_from_empty() {
-        assert_eq!(vram_value(&GpuSnapshot::default()), "n/a");
+    fn mem_readout_distinguishes_absent_from_empty() {
+        assert_eq!(mem_value(&GpuSnapshot::default()), "n/a");
         assert_eq!(
-            vram_value(&GpuSnapshot {
+            mem_value(&GpuSnapshot {
                 vram_used_bytes: Some(0),
                 vram_total_bytes: Some(0),
                 ..Default::default()
@@ -1422,12 +1446,64 @@ mod tests {
         );
         // One half known is still worth printing.
         assert_eq!(
-            vram_value(&GpuSnapshot {
+            mem_value(&GpuSnapshot {
                 vram_used_bytes: Some(2 << 30),
                 ..Default::default()
             }),
             "2.0G/n/a"
         );
+    }
+
+    /// The four shapes of card, as the MEM row renders them. The marker is
+    /// the load-bearing part: three of these spend system RAM, and only the
+    /// first has memory of its own.
+    #[test]
+    fn the_mem_row_names_the_pool_each_kind_of_card_actually_spends() {
+        let dgpu = GpuSnapshot {
+            vram_used_bytes: Some(8 << 30),
+            vram_total_bytes: Some(24 << 30),
+            gtt_used_bytes: Some(3 << 30),
+            gtt_total_bytes: Some(16 << 30),
+            ..Default::default()
+        };
+        assert_eq!(mem_value(&dgpu), "8.0G/24G");
+        // GTT on a card with real VRAM means the working set spilled to host
+        // RAM across PCIe — its own term, not folded into the meter.
+        assert_eq!(mem_secondary_value(&dgpu), " · gtt 3.0G/16G");
+
+        // Intel iGPU: no local pool exists, so the system pool IS the meter.
+        let igpu = GpuSnapshot {
+            integrated: true,
+            gtt_used_bytes: Some(734 << 20),
+            gtt_total_bytes: Some(15 << 30),
+            ..Default::default()
+        };
+        assert_eq!(mem_value(&igpu), "734M/15G shared");
+        assert_eq!(mem_secondary_value(&igpu), "");
+
+        // Apple Silicon / Windows integrated: unified memory arrives through
+        // the VRAM fields, and must not read as 32G of dedicated VRAM.
+        let unified = GpuSnapshot {
+            integrated: true,
+            vram_used_bytes: Some(12 << 30),
+            vram_total_bytes: Some(32 << 30),
+            ..Default::default()
+        };
+        assert_eq!(mem_value(&unified), "12G/32G shared");
+        assert_eq!(mem_secondary_value(&unified), "");
+
+        // AMD APU: a real BIOS carve-out beside the system pool. Nothing
+        // spilled anywhere here, so the second pool is not called gtt.
+        let apu = GpuSnapshot {
+            integrated: true,
+            vram_used_bytes: Some(412 << 20),
+            vram_total_bytes: Some(512 << 20),
+            gtt_used_bytes: Some(3 << 30),
+            gtt_total_bytes: Some(16 << 30),
+            ..Default::default()
+        };
+        assert_eq!(mem_value(&apu), "412M/512M");
+        assert_eq!(mem_secondary_value(&apu), " · shared 3.0G/16G");
     }
 
     /// Finding 11: a sensorless card must omit the term, not peak at 0°C/0W.
@@ -1721,7 +1797,7 @@ mod tests {
         let quiet = [Some(0u64)];
         let busy = [Some(100u64)];
 
-        // Six rows so the halves are three deep and the `vram%` caption on the
+        // Six rows so the halves are three deep and the `mem%` caption on the
         // last row cannot be mistaken for graph output.
         let grid = waveform_grid(&t, GraphStyle::Block, &quiet, &quiet, 1, 6);
         // Row 3 is the first row below the midline: the sliver lives there.

@@ -75,13 +75,100 @@ pub struct GpuSnapshot {
     pub perf_level: Option<String>,
 }
 
-impl GpuSnapshot {
+/// One memory pool as a card reports it, plus where the bytes physically
+/// live. `shared` is what the UI needs and no single field carries: an iGPU,
+/// an APU and an Apple Silicon part all spend host RAM, but they publish it
+/// through different fields of [`GpuSnapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemReadout {
+    pub used: Option<u64>,
+    pub total: Option<u64>,
+    /// System RAM the GPU maps, rather than memory of the device's own.
+    pub shared: bool,
+}
+
+impl MemReadout {
     /// Fill level, or `None` when either figure is unknown or the pool has no
     /// size. A meter drawn from a fabricated 0 here is the whole point of the
-    /// `Option`s above, so this refuses to invent one.
-    pub fn vram_pct(&self) -> Option<f64> {
-        let (used, total) = (self.vram_used_bytes?, self.vram_total_bytes?);
+    /// `Option`s in [`GpuSnapshot`], so this refuses to invent one.
+    pub fn pct(&self) -> Option<f64> {
+        let (used, total) = (self.used?, self.total?);
         (total > 0).then(|| used as f64 / total as f64 * 100.0)
+    }
+}
+
+impl GpuSnapshot {
+    /// The pool the MEM meter and the memory graph describe: the memory this
+    /// card actually spends.
+    ///
+    /// Which field carries it depends on the device, and there is no single
+    /// convention across the backends because there is none across the
+    /// platforms either:
+    ///
+    /// - A dGPU has real VRAM, and `gtt_*` is the *spill* pool beside it —
+    ///   host RAM reached over PCIe, which is a signal in its own right.
+    /// - An Intel iGPU has no local pool at all: `vram_*` is `None` and the
+    ///   only memory it has is the system-backed one in `gtt_*`.
+    /// - Apple Silicon and Windows' integrated adapters report their unified
+    ///   memory *through* `vram_*` (IOKit's "In use system memory", DXGI's
+    ///   `SharedSystemMemory`), because that is the only pool those APIs name.
+    /// - An AMD APU has both: a small BIOS carve-out in `vram_*` that the
+    ///   kernel really does account separately, and the rest in `gtt_*`.
+    ///
+    /// So the primary pool is the device-local one wherever a total for it
+    /// exists, and the system-backed one otherwise — and `shared` records
+    /// which of those it turned out to be, so nothing renders host RAM as a
+    /// card's dedicated VRAM.
+    pub fn mem_primary(&self) -> MemReadout {
+        if self.has_device_pool() {
+            return MemReadout {
+                used: self.vram_used_bytes,
+                total: self.vram_total_bytes,
+                // Integrated *and* nothing in `gtt_*` means this figure is
+                // the unified pool itself (Apple, Windows), not a carve-out
+                // sitting beside one (AMD APU).
+                shared: self.integrated && !self.has_system_pool(),
+            };
+        }
+        MemReadout {
+            used: self.gtt_used_bytes,
+            total: self.gtt_total_bytes,
+            // Whatever the device is, this pool is host RAM — but only if it
+            // reported one. A card that published no memory figure at all
+            // knows nothing about where its bytes live either, and "shared"
+            // is a claim like any other.
+            shared: self.has_system_pool(),
+        }
+    }
+
+    /// Whether `vram_*` carries anything at all. Either half is enough: a
+    /// backend that read one figure and not the other measured *something*,
+    /// and falling through to the system pool would drop it on the floor.
+    fn has_device_pool(&self) -> bool {
+        self.vram_used_bytes.is_some() || self.vram_total_bytes.is_some()
+    }
+
+    fn has_system_pool(&self) -> bool {
+        self.gtt_used_bytes.is_some() || self.gtt_total_bytes.is_some()
+    }
+
+    /// The second pool, shown beside the meter rather than buried in the
+    /// footer, for the cards that have two. `None` when the card has one pool
+    /// or none — the primary already covers it.
+    pub fn mem_secondary(&self) -> Option<MemReadout> {
+        (self.has_device_pool() && self.has_system_pool()).then_some(MemReadout {
+            used: self.gtt_used_bytes,
+            total: self.gtt_total_bytes,
+            // On a dGPU this is GTT proper: host RAM the card maps across
+            // PCIe, and a rising figure means the working set spilled off the
+            // card. On an APU nothing spilled anywhere — both pools are RAM.
+            shared: self.integrated,
+        })
+    }
+
+    /// Fill level of the pool the meter shows.
+    pub fn mem_pct(&self) -> Option<f64> {
+        self.mem_primary().pct()
     }
 }
 
@@ -444,6 +531,139 @@ fn compose_with_generic(
     let mut backends: Vec<Box<dyn GpuBackend>> = found.into_iter().map(|(b, _)| b).collect();
     backends.extend(generic(&claimed));
     compose(backends)
+}
+
+#[cfg(test)]
+mod mem_pool_tests {
+    use super::*;
+
+    /// A dGPU: VRAM is the pool it spends, and GTT is host RAM it spilled
+    /// into — a separate story, and never the meter's subject.
+    #[test]
+    fn a_discrete_card_meters_its_own_vram_and_keeps_gtt_beside_it() {
+        let g = GpuSnapshot {
+            vram_used_bytes: Some(8 << 30),
+            vram_total_bytes: Some(24 << 30),
+            gtt_used_bytes: Some(3 << 30),
+            gtt_total_bytes: Some(16 << 30),
+            ..Default::default()
+        };
+        let m = g.mem_primary();
+        assert_eq!((m.used, m.total), (Some(8 << 30), Some(24 << 30)));
+        assert!(!m.shared, "a card's own VRAM is not system RAM");
+        let s = g.mem_secondary().expect("GTT is a pool of its own here");
+        assert_eq!((s.used, s.total), (Some(3 << 30), Some(16 << 30)));
+        assert!(!s.shared, "GTT on a dGPU is mapped host RAM, not unified");
+        assert_eq!(g.mem_pct(), Some(1.0 / 3.0 * 100.0));
+    }
+
+    /// An Intel iGPU: no local pool exists at all, so the system-backed one
+    /// is the only thing there is to meter. This is the case that used to
+    /// render as `MEM n/a` beside a card that was demonstrably using memory.
+    #[test]
+    fn an_igpu_with_no_local_pool_meters_the_system_one() {
+        let g = GpuSnapshot {
+            integrated: true,
+            gtt_used_bytes: Some(734 << 20),
+            gtt_total_bytes: Some(15 << 30),
+            ..Default::default()
+        };
+        let m = g.mem_primary();
+        assert_eq!((m.used, m.total), (Some(734 << 20), Some(15 << 30)));
+        assert!(m.shared);
+        assert_eq!(g.mem_secondary(), None, "one pool, so nothing beside it");
+        assert!(
+            g.mem_pct().is_some(),
+            "the memory graph must not stay blank"
+        );
+    }
+
+    /// Apple Silicon and Windows' integrated adapters publish unified memory
+    /// through the VRAM fields, because IOKit and DXGI name no other pool.
+    /// The bytes are still system RAM and must say so.
+    #[test]
+    fn unified_memory_arriving_through_the_vram_fields_is_still_shared() {
+        let g = GpuSnapshot {
+            integrated: true,
+            vram_used_bytes: Some(12 << 30),
+            vram_total_bytes: Some(32 << 30),
+            ..Default::default()
+        };
+        let m = g.mem_primary();
+        assert_eq!((m.used, m.total), (Some(12 << 30), Some(32 << 30)));
+        assert!(m.shared, "32 GB of dedicated VRAM is what this is not");
+        assert_eq!(g.mem_secondary(), None);
+    }
+
+    /// An AMD APU has both: a BIOS carve-out the kernel accounts separately,
+    /// and the rest of the system pool. The carve-out is the card's own, so
+    /// it keeps the meter unmarked — but the pool beside it is RAM, not a
+    /// spill across PCIe, so it is not called gtt either.
+    #[test]
+    fn an_apu_meters_its_carve_out_and_calls_the_rest_shared() {
+        let g = GpuSnapshot {
+            integrated: true,
+            vram_used_bytes: Some(412 << 20),
+            vram_total_bytes: Some(512 << 20),
+            gtt_used_bytes: Some(3 << 30),
+            gtt_total_bytes: Some(16 << 30),
+            ..Default::default()
+        };
+        let m = g.mem_primary();
+        assert_eq!((m.used, m.total), (Some(412 << 20), Some(512 << 20)));
+        assert!(!m.shared, "the carve-out is reserved for the GPU alone");
+        let s = g
+            .mem_secondary()
+            .expect("the system pool is the other half");
+        assert!(s.shared, "nothing spilled anywhere on an APU");
+    }
+
+    /// A card that published nothing keeps saying nothing: no pool is
+    /// invented from the absence of the other one.
+    #[test]
+    fn a_card_with_no_memory_figures_at_all_reports_none() {
+        let g = GpuSnapshot::default();
+        let m = g.mem_primary();
+        assert_eq!((m.used, m.total), (None, None));
+        assert_eq!(g.mem_secondary(), None);
+        assert_eq!(g.mem_pct(), None);
+    }
+
+    /// Half a reading is a reading. A backend that got the usage but not the
+    /// total must not have it dropped by the fall-through to the system pool.
+    #[test]
+    fn one_known_half_still_selects_the_pool_it_came_from() {
+        let g = GpuSnapshot {
+            vram_used_bytes: Some(2 << 30),
+            gtt_used_bytes: Some(9 << 30),
+            ..Default::default()
+        };
+        let m = g.mem_primary();
+        assert_eq!((m.used, m.total), (Some(2 << 30), None));
+        assert_eq!(m.pct(), None, "no total, so no fill level to draw");
+        assert!(g.mem_secondary().is_some());
+    }
+
+    /// An empty pool that was actually read stays a reading, at every layer.
+    #[test]
+    fn a_measured_empty_pool_is_not_an_absent_one() {
+        let g = GpuSnapshot {
+            vram_used_bytes: Some(0),
+            vram_total_bytes: Some(8 << 30),
+            ..Default::default()
+        };
+        assert_eq!(g.mem_pct(), Some(0.0));
+        // A pool with no size cannot yield a percentage of anything.
+        assert_eq!(
+            MemReadout {
+                used: Some(0),
+                total: Some(0),
+                shared: false
+            }
+            .pct(),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

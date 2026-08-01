@@ -135,7 +135,26 @@ brand. Fallbacks differ too: `NVIDIA GPU 0` (index) against
 **Fix:** settle on a convention — prefer the marketing name, fall back to the
 codename, always suffix the card or index — and apply it uniformly.
 
-## 7. Residual YAGNI
+## 7. Intel memory totals could come from the DRM query ioctl
+
+**Severity: low, accuracy.** The Intel backend reads its system-pool total from
+`/proc/meminfo` `MemTotal`, which is exactly what i915 reports for its system
+region — verified against `/sys/kernel/debug/dri/*/i915_gem_objects` on a Tiger
+Lake part, where `system: total:0x3d5cc9000` equals `MemTotal` to the byte. So
+the total is right; what sysfs cannot give is anything more.
+
+`DRM_I915_QUERY_MEMORY_REGIONS` and xe's `DRM_XE_DEVICE_QUERY_MEM_REGIONS` on
+`/dev/dri/renderD*` (mode `0666`, so no privileges needed) publish per-region
+`probed_size` and `unallocated_size`. That would add the stolen region as its
+own figure instead of folding it into the system bucket, and — the real prize —
+give an Arc's local memory a _free_ figure rather than a sum over the fdinfo of
+processes this user happens to be able to read.
+
+**Cost:** a raw ioctl and per-driver structs in a backend that is otherwise pure
+sysfs reads, plus opening a device node. **Fix:** worth it only if the free-VRAM
+figure on discrete Arc is wanted; the iGPU totals would not change.
+
+## 8. Residual YAGNI
 
 - `src/theme.rs:89` `UiTheme::temp_ok` is `pub` but used only by `temp_style` at
   `:173` in the same file, unlike its peers `temp_warn` / `temp_crit`. Narrowing

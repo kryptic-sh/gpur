@@ -182,6 +182,12 @@ is reported as unknown rather than zero when neither answers. An Intel iGPU has
 no local memory region at all, so its system-RAM graphics pool is reported in
 the same GTT fields as an AMD APU's.
 
+The MEM meter shows whichever pool a card actually spends, and marks it `shared`
+when those bytes are system RAM: a dGPU meters its own VRAM and carries GTT —
+host RAM it spilled into across PCIe — beside it, while an iGPU, an APU and an
+Apple Silicon part are all metering RAM whatever field their driver publishes it
+through.
+
 PDH is the vendor-generic Windows backend (Task Manager's counters) and reports
 utilization, memory, and split encode/decode for every adapter no vendor backend
 already claimed.

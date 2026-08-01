@@ -90,7 +90,10 @@ impl SortBy {
 #[derive(Default)]
 pub struct History {
     pub util: Vec<Option<u64>>,
-    pub vram: Vec<Option<u64>>,
+    /// Fill level of the pool the MEM meter shows — a dGPU's VRAM, an iGPU's
+    /// share of system RAM. Named for the meter rather than for VRAM because
+    /// on a unified-memory card there is no VRAM to plot.
+    pub mem: Vec<Option<u64>>,
     pub power: Vec<Option<u64>>,
     pub temp: Vec<Option<u64>>,
 }
@@ -822,13 +825,13 @@ impl App {
             // distinction the meter above it does with `n/a`.
             let sample = |v: Option<f64>| v.map(|v| v.round() as u64);
             hist.util.push(sample(gpu.utilization_pct));
-            hist.vram.push(sample(gpu.vram_pct()));
+            hist.mem.push(sample(gpu.mem_pct()));
             hist.power.push(sample(gpu.power_w));
             hist.temp.push(sample(gpu.temperature_c));
             let overflow = hist.util.len().saturating_sub(cap);
             if overflow > 0 {
                 hist.util.drain(..overflow);
-                hist.vram.drain(..overflow);
+                hist.mem.drain(..overflow);
                 hist.power.drain(..overflow);
                 hist.temp.drain(..overflow);
             }
@@ -2043,7 +2046,7 @@ mod tests {
         let h = app.history_at(0).expect("history for card");
         assert_eq!(h.util, vec![None], "an unreadable utilization became a 0");
         assert_eq!(h.power, vec![None], "a missing power sensor became a 0");
-        assert_eq!(h.vram, vec![Some(0)], "a measured-empty pool lost its 0");
+        assert_eq!(h.mem, vec![Some(0)], "a measured-empty pool lost its 0");
         assert_eq!(h.temp, vec![Some(0)], "a measured 0°C became unknown");
     }
 
