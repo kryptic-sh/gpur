@@ -222,8 +222,8 @@ impl GpuBackend for NvmlBackend {
 #[cfg(target_os = "linux")]
 mod nouveau {
     use crate::backend::linux::{
-        card_name, cards_with_driver, driver_line, first_dir, hwmon_u64, pci_device_id, pcie_link,
-        pdev_of,
+        card_name, cards_with_driver, driver_line, fan_pct, first_dir, hwmon_u64, pci_device_id,
+        pcie_link, pdev_of,
     };
     use crate::backend::{GpuBackend, GpuSnapshot};
     use anyhow::Result;
@@ -288,7 +288,7 @@ mod nouveau {
             power_limit_w: hwmon_u64(h, "power1_max")
                 .filter(|v| *v > 0)
                 .map(|v| v as f64 / 1e6),
-            fan_pct: fan_pct(d),
+            fan_pct: fan_pct(h),
             fan_rpm: hwmon_u64(h, "fan1_input"),
             volt_mv: hwmon_u64(h, "in0_input"),
             pcie_gen,
@@ -299,15 +299,6 @@ mod nouveau {
             // under nouveau. None keeps "unknown" distinct from "idle"/"empty".
             ..Default::default()
         }
-    }
-
-    /// pwm duty as a percentage of this card's own scale. `pwm1_max` defaults
-    /// to hwmon's 255 when absent, as it does for amdgpu.
-    fn fan_pct(d: &NouveauDevice) -> Option<f64> {
-        let h = d.hwmon.as_deref();
-        let pwm = hwmon_u64(h, "pwm1")?;
-        let max = hwmon_u64(h, "pwm1_max").filter(|v| *v > 0).unwrap_or(255);
-        Some(pwm as f64 / max as f64 * 100.0)
     }
 
     /// Cards this backend claims from a fake `/sys/class/drm`, for the shared

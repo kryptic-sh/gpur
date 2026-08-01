@@ -22,8 +22,8 @@ pub(crate) fn claimed_ids(drm: &str) -> Vec<String> {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use crate::backend::linux::{
-        self, ClientSample, FdClient, SweepDevice, card_name, cards_with_driver, first_dir,
-        hwmon_u64, pdev_of, read_trim, read_u64,
+        self, ClientSample, FdClient, SweepDevice, card_name, cards_with_driver, fan_pct,
+        first_dir, hwmon_u64, pdev_of, read_trim, read_u64,
     };
     use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, clamp_pct};
     use anyhow::Result;
@@ -156,9 +156,7 @@ mod linux_impl {
         /// pre-GCN card beside a modern one is running both, and a header
         /// reading "amdgpu" would misattribute the gauges the old card lacks.
         fn driver_info(&self) -> Option<String> {
-            let drivers: std::collections::BTreeSet<&str> =
-                self.devices.iter().map(|d| d.driver.as_str()).collect();
-            linux::driver_line(&drivers.into_iter().collect::<Vec<_>>().join("+"))
+            linux::driver_line_for(self.devices.iter().map(|d| d.driver.as_str()))
         }
     }
 
@@ -457,12 +455,6 @@ mod linux_impl {
             .take_while(char::is_ascii_digit)
             .collect();
         digits.parse().ok()
-    }
-
-    fn fan_pct(h: Option<&Path>) -> Option<f64> {
-        let pwm = hwmon_u64(h, "pwm1")?;
-        let max = hwmon_u64(h, "pwm1_max").filter(|v| *v > 0).unwrap_or(255);
-        Some(pwm as f64 / max as f64 * 100.0)
     }
 
     #[cfg(test)]

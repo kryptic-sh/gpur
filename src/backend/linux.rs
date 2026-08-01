@@ -6,10 +6,11 @@
 //! Gated once, by `#[cfg(target_os = "linux")] mod linux;` in the parent.
 
 use super::{GpuProcess, ProcKind, clamp_pct};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 pub const PCI_IDS_PATHS: &[&str] = &["/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"];
@@ -315,6 +316,26 @@ pub fn hwmon_u64(hwmon: Option<&Path>, file: &str) -> Option<u64> {
     read_u64(&hwmon?.join(file))
 }
 
+/// Fan duty as a percentage of this card's own pwm scale. amdgpu, radeon and
+/// nouveau all drive their fan through the same hwmon attributes, so one reader
+/// serves them.
+///
+/// The divisor is `pwm1_max` where the chip publishes one, and 255 otherwise —
+/// not a guess, but the range the hwmon ABI documents for `pwmN`, which most
+/// drivers therefore never bother restating in a file. A published max of 0
+/// would divide the duty into an infinity and paint a meaningless meter, so it
+/// falls back to the documented 255 as well.
+///
+/// None when there is no `pwm1` at all: the card reports no fan, which the UI
+/// must keep distinct from a fan sitting at 0%.
+pub fn fan_pct(hwmon: Option<&Path>) -> Option<f64> {
+    let pwm = hwmon_u64(hwmon, "pwm1")?;
+    let max = hwmon_u64(hwmon, "pwm1_max")
+        .filter(|v| *v > 0)
+        .unwrap_or(255);
+    Some(pwm as f64 / max as f64 * 100.0)
+}
+
 pub fn read_trim(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
@@ -421,6 +442,21 @@ pub fn driver_line(prefix: &str) -> Option<String> {
     sysinfo::System::kernel_version().map(|k| format!("{prefix} · kernel {k}"))
 }
 
+/// The driver line for a backend whose cards are not all on one driver, as
+/// "amdgpu+radeon · kernel 6.12.1-arch1-1".
+///
+/// A single box can run `amdgpu` beside `radeon`, or `i915` beside `xe`, and
+/// the two halves of such a pair do not publish the same telemetry — a header
+/// naming only one of them attributes to that driver the gauges the other
+/// card's driver is the reason for lacking. So every driver actually in use is
+/// named. Deduplicated through a `BTreeSet`, which also fixes the order: the
+/// same set of cards renders the same string on every poll, whatever order the
+/// scan happened to list them in.
+pub fn driver_line_for<'a>(drivers: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let unique: BTreeSet<&str> = drivers.into_iter().collect();
+    driver_line(&unique.into_iter().collect::<Vec<_>>().join("+"))
+}
+
 /// Total system RAM in bytes. i915 and xe size their system memory region at
 /// `totalram_pages()`, so this is the real ceiling on system-backed (GTT-style)
 /// graphics memory for devices that publish no total of their own.
@@ -479,13 +515,39 @@ pub fn pci_device_name(ids: &str, vendor: &str, device: &str) -> Option<String> 
     None
 }
 
+/// The pci.ids database, read from disk at most once for the lifetime of the
+/// process.
+///
+/// The file is ~1.5 MB on current hwdata and `pci_device_name` scans it
+/// linearly, and `card_name` is called once per card by each of the three Linux
+/// backends — so a mixed AMD+Intel+nouveau rig used to read and re-read the
+/// same megabyte and a half several times over at probe. The contents cannot
+/// differ between those calls, so every read after the first is pure waste. The
+/// cache is process-wide rather than per backend for the same reason: the
+/// backends are reading one file, not one file each.
+///
+/// The `Option` inside the cell is the load-bearing part. A host with no
+/// hwdata package installed has neither path, and caching that miss is what
+/// stops it from stat-ing both paths again for every card it owns; only a
+/// successful read is worth remembering otherwise. The cost is that installing
+/// hwdata under a running gpur does not take effect until restart, which is a
+/// trade a probe-time lookup can afford.
+static PCI_IDS: OnceLock<Option<String>> = OnceLock::new();
+
+fn pci_ids() -> Option<&'static str> {
+    PCI_IDS
+        .get_or_init(|| {
+            PCI_IDS_PATHS
+                .iter()
+                .find_map(|p| fs::read_to_string(p).ok())
+        })
+        .as_deref()
+}
+
 /// Resolve a card's marketing name from pci.ids with a readable fallback.
 pub fn card_name(dev: &Path, idx: u32, vendor_hex: &str, fallback_brand: &str) -> String {
     let device_id = read_trim(&dev.join("device")).unwrap_or_default();
-    PCI_IDS_PATHS
-        .iter()
-        .find_map(|p| fs::read_to_string(p).ok())
-        .as_deref()
+    pci_ids()
         .and_then(|ids| pci_device_name(ids, vendor_hex, device_id.trim_start_matches("0x")))
         .unwrap_or_else(|| format!("{fallback_brand} GPU {device_id} (card{idx})"))
 }
@@ -780,6 +842,60 @@ drm-resident-vram0:\t4096 KiB
         fs::write(dev.join("current_link_width"), "4\n").unwrap();
         fs::write(dev.join("max_link_speed"), "Unknown\n").unwrap();
         assert_eq!(pcie_link(&dev), (None, Some(4), None, None));
+    }
+
+    /// Every card's pwm is read against its own ceiling, and the ceiling is
+    /// hwmon's documented 255 whenever the chip does not publish a usable one.
+    #[test]
+    fn fan_duty_is_a_percentage_of_this_cards_own_pwm_scale() {
+        let h = scratch("fan");
+        // The common case: no pwm1_max file, so the hwmon-documented 0..255.
+        fs::write(h.join("pwm1"), "128\n").unwrap();
+        assert!((fan_pct(Some(&h)).unwrap() - 128.0 / 255.0 * 100.0).abs() < 1e-9);
+
+        // A chip with a scale of its own must be divided by that scale, not by
+        // 255 — half duty on a 0..100 fan is 50%, not 128%.
+        fs::write(h.join("pwm1_max"), "100\n").unwrap();
+        fs::write(h.join("pwm1"), "50\n").unwrap();
+        assert!((fan_pct(Some(&h)).unwrap() - 50.0).abs() < 1e-9);
+
+        // A published max of 0 would divide the duty into an infinity, so it
+        // falls back to 255 like an absent file.
+        fs::write(h.join("pwm1_max"), "0\n").unwrap();
+        assert!((fan_pct(Some(&h)).unwrap() - 50.0 / 255.0 * 100.0).abs() < 1e-9);
+
+        // No pwm1 at all is a card that reports no fan — unknown, not a fan
+        // that has stopped, which would draw a confident empty meter.
+        fs::remove_file(h.join("pwm1")).unwrap();
+        assert_eq!(fan_pct(Some(&h)), None);
+        assert_eq!(fan_pct(None), None);
+    }
+
+    /// A box running two of a vendor's drivers at once has to say so: the
+    /// header names each driver in play exactly once, in an order that does not
+    /// depend on the scan's.
+    #[test]
+    fn the_driver_line_names_every_driver_in_use_once() {
+        let line = |drivers: &[&str]| driver_line_for(drivers.to_vec());
+        let Some(kernel) = sysinfo::System::kernel_version() else {
+            return; // no /proc/sys/kernel/osrelease: nothing to compare against
+        };
+
+        // amdgpu beside a pre-GCN radeon card, listed in either scan order.
+        assert_eq!(
+            line(&["amdgpu", "radeon"]),
+            Some(format!("amdgpu+radeon · kernel {kernel}"))
+        );
+        assert_eq!(line(&["radeon", "amdgpu"]), line(&["amdgpu", "radeon"]));
+
+        // Two cards on one driver name it once, not "i915+i915".
+        assert_eq!(
+            line(&["i915", "i915", "xe"]),
+            Some(format!("i915+xe · kernel {kernel}"))
+        );
+
+        // The single-driver case is exactly what driver_line alone renders.
+        assert_eq!(line(&["nouveau"]), driver_line("nouveau"));
     }
 
     #[test]

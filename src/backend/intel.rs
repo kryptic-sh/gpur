@@ -179,11 +179,11 @@ mod linux_impl {
             self.last_procs.clone()
         }
 
+        /// Names the drivers actually in use: a box can have an i915 iGPU beside
+        /// an xe Arc card, and the two publish different telemetry, so a header
+        /// naming one of them misattributes what the other lacks.
         fn driver_info(&self) -> Option<String> {
-            let drivers: std::collections::BTreeSet<&str> =
-                self.devices.iter().map(|d| d.driver.as_str()).collect();
-            let names = drivers.into_iter().collect::<Vec<_>>().join("+");
-            linux::driver_line(&names)
+            linux::driver_line_for(self.devices.iter().map(|d| d.driver.as_str()))
         }
     }
 
