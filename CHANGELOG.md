@@ -8,6 +8,19 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-08-01
+
+### Changed
+
+- Dependencies refreshed to their latest compatible versions: clap 4.6.4 to
+  4.6.5, clap_builder 4.6.2 to 4.6.5, serial2 0.2.37 to 0.2.38 and toml 1.1.3 to
+  1.1.4. No manifest ranges and no code changed.
+
+  The hjkl crates stay on 0.33. Their 0.39 is semver-incompatible and spans
+  config, keymap, theme and splash — config and cache paths, keybindings,
+  theming — so it remains a behavioural change deliberately left for its own
+  release, as it was in 0.10.1.
+
 ## [0.10.2] - 2026-08-01
 
 A full-codebase review pass. Findings and the reasoning behind each fix are in
