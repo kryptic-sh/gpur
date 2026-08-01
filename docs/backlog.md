@@ -105,6 +105,34 @@ Whether a row of `n/a` beats an absent card is a product call, not a bug.
   was diagnosed from NVIDIA's documentation, not from an observation, and
   nothing in CI could have caught it or can confirm the fix.
 
+  The `hardware` modules in `intel.rs` and `amd.rs` are the half of this that
+  does not need CI: they run against whatever card the developer's machine has,
+  and skip otherwise. `GPUR_REQUIRE_AMD` / `GPUR_REQUIRE_AMD_APU` /
+  `GPUR_REQUIRE_AMD_DGPU` / `GPUR_REQUIRE_INTEL` are what a self-hosted runner
+  would set so the skip cannot become the permanent state.
+
+- **What the AMD hardware tests still do not reach**, on the machine they were
+  written against (an amdgpu APU plus an amdgpu discrete card):
+  - **`radeon`.** No pre-GCN card to run it, so `is_amd_driver`'s second half is
+    fixture-only. The class tests would file such a card as discrete (`is_apu`
+    sees no `gpu_metrics`), which is right, but nothing confirms it.
+  - **`pcie_bw`.** Neither card implements the counter — the APU because the
+    kernel marks it unsupported, Navi 31 because RDNA3 never implemented
+    `get_pcie_usage` — so `pcie_kbs`'s live path is fixture-only.
+    `pcie_bandwidth_is_reported_only_where_this_asic_counts_it` asserts the
+    absence, which is the half that is checkable here. Needs a Vega or Navi
+    1x/2x card.
+  - **Engine utilization and the enc/dec split.** The tests open a render node
+    to have a client to attribute, but a bare open submits no work: every
+    `drm-engine-*` counter stays absent, so the ns-delta path is exercised only
+    for its zero case and `enc`/`dec` never appear. Closing it means submitting
+    real GPU work from a test, which is a dependency (a compute runtime) rather
+    than an afternoon.
+  - **Throttling.** `the_throttle_label_only_names_reasons_this_card_measures`
+    checks that a label can only name a reason whose inputs exist; it cannot
+    make a card hit its cap, so the branch that produces a label is never taken
+    on an idle box.
+
 ## 5. NVIDIA temperature threshold unread
 
 **Severity: low.** `Device::temperature_threshold()` is available in

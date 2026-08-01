@@ -40,6 +40,25 @@ and this project adheres to
   gauges equal the sum of the process rows from the same sweep. They skip
   themselves where no i915/xe card is present; `GPUR_REQUIRE_INTEL=1` turns that
   skip into a failure for a runner that is supposed to have one.
+- **Hardware tests for the AMD backend** (`src/backend/amd.rs`), on the same
+  shape: the card scan and APU/discrete classification, gauge ranges, the sysfs
+  and hwmon attributes checked both ways (a gauge missing where the file exists,
+  and a gauge invented where none does), the labelled junction/memory
+  temperature channels, the DPM-table clock fallback a power-gated `freq1_input`
+  falls through to, the PCIe attributes, `pcie_bw` only where the ASIC counts
+  it, pci.ids naming, per-client state pruning and the enc/dec split against the
+  video total it came from. The `#[ignore]`d `live_poll_reports_devices`, which
+  printed a poll and had to be run by hand, is gone: these replace it.
+
+  The per-class memory rules — an APU charges a client `vram + gtt`, a discrete
+  card `vram` alone — are checked against this machine's own fdinfo, with the
+  test opening the card's render node read-only so there is a client to
+  attribute. A headless box owns no DRM client at all, which is what used to
+  make the rule impossible to check anywhere but on a running desktop.
+
+  Three gates, so a runner with the hardware cannot silently stop testing it:
+  `GPUR_REQUIRE_AMD`, plus `GPUR_REQUIRE_AMD_APU` and `GPUR_REQUIRE_AMD_DGPU`
+  for the class-specific halves, which skip independently of each other.
 
 ## [0.11.1] - 2026-08-01
 
