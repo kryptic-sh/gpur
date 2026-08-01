@@ -22,10 +22,11 @@ fn art_dims() -> (u16, u16) {
 /// `const` assertions below. Characters are counted the UTF-8 way — a byte
 /// that is not a continuation byte starts a new character — because the art is
 /// drawn in U+2588 FULL BLOCK, three bytes per column, so a raw byte count
-/// would report today's 33-column banner as 99 columns. The one place this
-/// still overcounts is a CRLF-saved file, where the CR that `str::lines` strips
-/// is counted as a column; that only ever overstates the width, which is the
-/// harmless direction for an upper bound.
+/// would report today's 33-column banner as 99 columns. A CRLF line ending is
+/// handled the way `str::lines` handles it — one CR before the newline is not a
+/// column — because `const_art_bounds_agree_with_the_runtime_dimensions` demands
+/// the two agree exactly, and a Windows checkout without a `.gitattributes`
+/// supplies exactly that input.
 const fn art_bounds() -> (usize, usize) {
     let bytes = ART.as_bytes();
     let mut rows = 0;
@@ -34,6 +35,13 @@ const fn art_bounds() -> (usize, usize) {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'\n' {
+            // `str::lines` strips one CR before the newline, so this has to as
+            // well or the two disagree by a column on every line. A Windows
+            // checkout without a `.gitattributes` really does put CRLF in
+            // `art.txt`, which is where that disagreement showed up.
+            if i > 0 && bytes[i - 1] == b'\r' {
+                line -= 1;
+            }
             rows += 1;
             if line > cols {
                 cols = line;
