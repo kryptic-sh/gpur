@@ -136,6 +136,99 @@ fn absent_metrics_are_null_not_zero() {
     );
 }
 
+/// The process-level counterpart to `absent_metrics_are_null_not_zero`, and
+/// the end-to-end check on C4's breaking change.
+///
+/// The record is written from `ProcRow` and read back into `GpuProcess` —
+/// two types serde-compatible only by field-name overlap — so widening one
+/// side alone would emit a `null` the reader cannot take: `#[serde(default)]`
+/// covers a *missing* key, not an explicit null, and `next_record` skips a
+/// record it fails to parse without saying so. That failure mode is silent
+/// by construction, which is why this goes through the real binary twice
+/// rather than asserting on the shape: replay a hand-written log carrying
+/// the nulls, then feed gpur's own emitted record straight back in. If
+/// either side of the loop still wanted a number, the second pass would come
+/// back with an empty process table (or exit 1 on `no valid JSONL records`)
+/// instead of the row.
+#[test]
+fn absent_process_metrics_survive_a_json_replay_round_trip() {
+    let sb = Sandbox::new("procnulls");
+    // Above Linux's pid_max, so this pid resolves to nothing here and the
+    // sysinfo enrichment cannot quietly fill the host columns back in.
+    const PID: u64 = 4_294_967_294;
+    let first = sb.path().join("in.jsonl");
+    std::fs::write(
+        &first,
+        format!(
+            "{{\"gpus\":[{{\"name\":\"Recorded GPU\",\"utilization_pct\":42.0}}],\
+             \"processes\":[{{\"pid\":{PID},\"gpu_index\":0,\"kind\":\"Compute\",\
+             \"gpu_util_pct\":null,\"gpu_mem_bytes\":null,\"user\":\"bob\",\
+             \"command\":\"train.py\",\"cpu_pct\":null,\"host_mem_bytes\":null}}]}}\n"
+        ),
+    )
+    .unwrap();
+
+    let replay_json = |log: &Path| -> serde_json::Value {
+        let out = sb
+            .cmd()
+            .args(["--json", "--tick-ms", "100", "--replay"])
+            .arg(log)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "replay of {} failed: {}",
+            log.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid JSON")
+    };
+
+    let emitted = replay_json(&first);
+    let check = |v: &serde_json::Value, pass: &str| {
+        let procs = v["processes"].as_array().unwrap();
+        assert_eq!(procs.len(), 1, "{pass}: the record's row was dropped: {v}");
+        let p = &procs[0];
+        assert_eq!(p["pid"].as_u64().unwrap(), PID, "{pass}");
+        assert_eq!(p["command"], "train.py", "{pass}");
+        for key in ["gpu_util_pct", "gpu_mem_bytes", "cpu_pct", "host_mem_bytes"] {
+            assert!(
+                p[key].is_null(),
+                "{pass}: {key} came back as {} rather than null",
+                p[key]
+            );
+        }
+    };
+    check(&emitted, "replay of the hand-written log");
+
+    // Close the loop: gpur's own output, fed back to gpur.
+    let second = sb.path().join("out.jsonl");
+    std::fs::write(&second, format!("{emitted}\n")).unwrap();
+    check(&replay_json(&second), "replay of gpur's own record");
+
+    // ...and the plain `--once` row spells both unknowns `-`, the way the
+    // per-process utilization column always has.
+    let out = sb
+        .cmd()
+        .args(["--once", "--tick-ms", "100", "--replay"])
+        .arg(&first)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    let line = s
+        .lines()
+        .find(|l| l.starts_with("  pid "))
+        .unwrap_or_else(|| panic!("no process row:\n{s}"));
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(cols[4], "-", "plain output fabricated a util: {line:?}");
+    assert_eq!(cols[5], "-", "plain output fabricated a gpu-mem: {line:?}");
+    assert!(
+        !line.contains("MiB"),
+        "an unreadable figure still printed a MiB total: {line:?}"
+    );
+}
+
 #[test]
 fn unknown_flag_fails() {
     let sb = Sandbox::new("badflag");
@@ -167,6 +260,13 @@ fn json_snapshot_emits_valid_shape() {
         assert!(p["gpu_index"].is_number());
         assert!(!p["command"].as_str().unwrap().is_empty());
         assert!(!p["user"].as_str().unwrap().is_empty());
+        // The mock reports a figure for every row, so these stay numbers
+        // even though the field is nullable since C4 — a `null` here would
+        // mean the widening had swallowed a value that was actually read.
+        assert!(
+            p["gpu_mem_bytes"].is_number(),
+            "mock gpu-mem came back unread: {p}"
+        );
     }
     let first = procs.first().unwrap()["gpu_mem_bytes"].as_u64().unwrap();
     let last = procs.last().unwrap()["gpu_mem_bytes"].as_u64().unwrap();

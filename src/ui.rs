@@ -927,6 +927,24 @@ fn draw_waveform_cells(
     );
 }
 
+/// A percentage cell in the process table, or `N/A` when the figure could
+/// not be read. One spelling for every unknown in this table: `N/A` is what
+/// the GPU% column has always printed, and a second word for the same idea
+/// in the next column along would read as a different kind of absence.
+/// (The GPU cards above say `n/a`; that block has its own house style and
+/// is never seen on the same line as these.)
+fn proc_pct(v: Option<f64>) -> String {
+    v.map(|v| format!("{v:>3.0}%"))
+        .unwrap_or_else(|| "N/A".into())
+}
+
+/// A whole-MiB cell in the process table, `N/A` when unreadable. `0MiB` is
+/// reserved for a figure that was read and came back empty.
+fn proc_mib(v: Option<u64>) -> String {
+    v.map(|b| format!("{}MiB", b / 1024 / 1024))
+        .unwrap_or_else(|| "N/A".into())
+}
+
 fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
     if area.height < 3 {
         app.proc_visible = 0;
@@ -1034,14 +1052,10 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
                 Cell::from(p.user.clone()),
                 Cell::from(p.gpu_index.to_string()),
                 Cell::from(p.kind.label()),
-                Cell::from(
-                    p.gpu_util_pct
-                        .map(|u| format!("{u:>3.0}%"))
-                        .unwrap_or_else(|| "N/A".into()),
-                ),
-                Cell::from(format!("{}MiB", p.gpu_mem_bytes / 1024 / 1024)),
-                Cell::from(format!("{:>3.0}%", p.cpu_pct)),
-                Cell::from(format!("{}MiB", p.host_mem_bytes / 1024 / 1024)),
+                Cell::from(proc_pct(p.gpu_util_pct)),
+                Cell::from(proc_mib(p.gpu_mem_bytes)),
+                Cell::from(proc_pct(p.cpu_pct.map(f64::from))),
+                Cell::from(proc_mib(p.host_mem_bytes)),
             ];
             if show_container {
                 cells.push(Cell::from(
@@ -1107,6 +1121,107 @@ mod tests {
 
     fn theme() -> UiTheme {
         crate::theme::load(None, crate::theme::detect_color_mode()).unwrap()
+    }
+
+    /// A backend the process-table test never polls: `draw_processes` reads
+    /// `app.procs`, which the test populates directly.
+    struct NoBackend;
+
+    impl crate::backend::GpuBackend for NoBackend {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+        fn poll(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Render the process table over the given rows and return its lines.
+    fn proc_table(rows: Vec<crate::app::ProcRow>) -> Vec<String> {
+        const W: u16 = 100;
+        const H: u16 = 6;
+        let mut app = App::new(
+            Box::new(NoBackend),
+            theme(),
+            crate::app::AppOptions {
+                tick_ms: 1000,
+                tick_explicit: false,
+                history_len: 60,
+                no_splash: true,
+                graph_style: GraphStyle::Ascii,
+                source: crate::backend::BackendSource::Live,
+                log: None,
+            },
+        );
+        app.all_procs = rows.clone();
+        app.procs = rows;
+        let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+        term.draw(|f| draw_processes(f, f.area(), &mut app))
+            .unwrap();
+        let buf = term.backend().buffer();
+        (0..H)
+            .map(|y| {
+                (0..W)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The whole point of C4: a figure the backend could not read must be
+    /// visibly absent, and a figure it read as empty must not be. Both rows
+    /// are rendered together so the two cannot converge on one spelling.
+    #[test]
+    fn proc_table_says_na_for_unreadable_columns_and_prints_a_real_zero() {
+        let row = |pid, command: &str, gpu_mem, cpu, host_mem| crate::app::ProcRow {
+            pid,
+            gpu_index: 0,
+            kind: crate::backend::ProcKind::Compute,
+            gpu_util_pct: Some(0.0),
+            gpu_mem_bytes: gpu_mem,
+            user: "me".into(),
+            cpu_pct: cpu,
+            host_mem_bytes: host_mem,
+            command: command.into(),
+            container: None,
+        };
+        let lines = proc_table(vec![
+            row(1, "unreadable", None, None, None),
+            row(2, "measured", Some(0), Some(0.0), Some(0)),
+        ]);
+        let find = |needle: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} row in {lines:#?}"))
+                .clone()
+        };
+        let unknown = find("unreadable");
+        let zero = find("measured");
+
+        // Three unreadable columns, three N/A cells — GPU MEM, CPU% and
+        // HOST MEM. GPU% is measured here, so it is not one of them.
+        assert_eq!(
+            unknown.matches("N/A").count(),
+            3,
+            "unreadable columns did not all say N/A: {unknown:?}"
+        );
+        assert!(
+            !unknown.contains("MiB"),
+            "an unreadable figure still claimed a MiB total: {unknown:?}"
+        );
+
+        // The measured-empty row keeps its numbers, and must not borrow the
+        // absent row's spelling.
+        assert_eq!(
+            zero.matches("0MiB").count(),
+            2,
+            "a measured-empty pool lost its 0MiB: {zero:?}"
+        );
+        assert!(
+            zero.contains("0%") && !zero.contains("N/A"),
+            "a measured zero rendered as unknown: {zero:?}"
+        );
     }
 
     /// Render one meter into a single-row terminal and return what it drew.

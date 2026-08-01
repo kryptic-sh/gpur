@@ -282,13 +282,51 @@ pub struct ProcRow {
     pub gpu_index: usize,
     pub kind: ProcKind,
     pub gpu_util_pct: Option<f64>,
-    pub gpu_mem_bytes: u64,
+    /// GPU memory held, straight off [`GpuProcess::gpu_mem_bytes`]. `None`
+    /// means the figure could not be read — the whole of NVIDIA-under-WDDM,
+    /// i.e. ordinary consumer Windows — and must render and serialize as
+    /// unknown. `Some(0)` stays a measurement: this process holds nothing.
+    pub gpu_mem_bytes: Option<u64>,
     pub user: String,
-    pub cpu_pct: f32,
-    pub host_mem_bytes: u64,
+    /// Host CPU share. `None` only when the pid resolved to nothing at all:
+    /// `sysinfo`'s `cpu_usage()` is a real reading, so a resolved process
+    /// that happens to be asleep is `Some(0.0)`, not unknown.
+    pub cpu_pct: Option<f32>,
+    /// Host RSS, on the same terms as [`Self::cpu_pct`].
+    pub host_mem_bytes: Option<u64>,
     pub command: String,
     /// Container runtime + short id ("docker:ab12cd34ef56"), Linux only.
     pub container: Option<String>,
+}
+
+impl ProcRow {
+    /// Whether the column `by` sorts on is unreadable for this row rather
+    /// than zero. `SortBy::Pid` is never unknown — every row has one.
+    fn is_unmeasured(&self, by: SortBy) -> bool {
+        match by {
+            SortBy::GpuUtil => self.gpu_util_pct.is_none(),
+            SortBy::GpuMem => self.gpu_mem_bytes.is_none(),
+            SortBy::Cpu => self.cpu_pct.is_none(),
+            SortBy::HostMem => self.host_mem_bytes.is_none(),
+            SortBy::Pid => false,
+        }
+    }
+}
+
+/// Order an unreadable figure below a readable one; `None` when the two
+/// sides are equally (un)known and the caller should compare the values.
+///
+/// A metric the backend could not read is unmeasured, not idle or empty, so
+/// it has no place on the number line the other rows are sorted along.
+/// Folding it in as 0 would hand it the *top* of an ascending sort — the
+/// slot that reads "quietest process" — so callers must apply this before
+/// any ascending/descending flip, which sinks it in both directions.
+fn unmeasured_last(a_unknown: bool, b_unknown: bool) -> Option<std::cmp::Ordering> {
+    match (a_unknown, b_unknown) {
+        (false, true) => Some(std::cmp::Ordering::Less),
+        (true, false) => Some(std::cmp::Ordering::Greater),
+        _ => None,
+    }
 }
 
 /// A signal awaiting y/N confirmation. `start_time` pins the identity of the
@@ -877,8 +915,12 @@ impl App {
                                 .map(|u| u.name().to_string())
                         })
                         .unwrap_or_else(|| "-".into()),
-                    cpu_pct: gp.cpu_pct.or(p.map(|p| p.cpu_usage())).unwrap_or(0.0),
-                    host_mem_bytes: gp.host_mem_bytes.or(p.map(|p| p.memory())).unwrap_or(0),
+                    // Left None when neither the backend nor sysinfo could
+                    // supply the figure — i.e. the pid resolved to nothing.
+                    // Both sysinfo calls are real readings, so a live process
+                    // sitting idle still lands here as a measured zero.
+                    cpu_pct: gp.cpu_pct.or(p.map(|p| p.cpu_usage())),
+                    host_mem_bytes: gp.host_mem_bytes.or(p.map(|p| p.memory())),
                     command: gp
                         .command
                         .clone()
@@ -889,20 +931,24 @@ impl App {
                     gpu_index: gp.gpu_index,
                     kind: gp.kind,
                     gpu_util_pct: gp.gpu_util_pct,
-                    // `ProcRow::gpu_mem_bytes` is still a bare u64, so an
-                    // unaccountable figure flattens to 0 here and renders as
-                    // it always has; widened in the ProcRow pass, which is
-                    // where the display and the log record change together.
-                    gpu_mem_bytes: gp.gpu_mem_bytes.unwrap_or(0),
+                    gpu_mem_bytes: gp.gpu_mem_bytes,
                 }
             })
             .collect();
         // Backend enumeration order is an implementation detail (hash maps,
         // sysfs readdir). Pin one order here so `--json` and `--log` records
         // are reproducible and diffable regardless of UI sort state.
+        //
+        // Rows whose GPU memory could not be read sort below every row where
+        // it could, then by pid and gpu index like the rest — the same rule
+        // `rebuild_proc_view` applies to the table, so a record and the
+        // display agree on where an unknown belongs. Ordering them among the
+        // measured rows would need a number they do not have, and putting
+        // them first would give the top of the record to the rows carrying
+        // the least information.
         self.all_procs.sort_by(|a, b| {
-            b.gpu_mem_bytes
-                .cmp(&a.gpu_mem_bytes)
+            unmeasured_last(a.gpu_mem_bytes.is_none(), b.gpu_mem_bytes.is_none())
+                .unwrap_or_else(|| b.gpu_mem_bytes.cmp(&a.gpu_mem_bytes))
                 .then(a.pid.cmp(&b.pid))
                 .then(a.gpu_index.cmp(&b.gpu_index))
         });
@@ -973,24 +1019,25 @@ impl App {
             .cloned()
             .collect();
 
+        let by = self.sort_by;
         rows.sort_by(|a, b| {
-            // A row with no GPU% is unmeasured, not idle. Sink it below every
-            // measured row in BOTH directions — folding it in as 0.0 would
-            // hand it the top of an ascending sort.
-            if self.sort_by == SortBy::GpuUtil {
-                match (a.gpu_util_pct.is_none(), b.gpu_util_pct.is_none()) {
-                    (false, true) => return std::cmp::Ordering::Less,
-                    (true, false) => return std::cmp::Ordering::Greater,
-                    _ => {}
-                }
+            // Returned ahead of the direction flip below, so the rule holds
+            // in BOTH directions for every sortable column.
+            if let Some(ord) = unmeasured_last(a.is_unmeasured(by), b.is_unmeasured(by)) {
+                return ord;
             }
-            let ord = match self.sort_by {
+            // Both sides are equally (un)known by here, so the placeholders
+            // below only ever compare two unknowns against each other.
+            let ord = match by {
                 SortBy::GpuMem => a.gpu_mem_bytes.cmp(&b.gpu_mem_bytes),
                 SortBy::GpuUtil => a
                     .gpu_util_pct
                     .unwrap_or(0.0)
                     .total_cmp(&b.gpu_util_pct.unwrap_or(0.0)),
-                SortBy::Cpu => a.cpu_pct.total_cmp(&b.cpu_pct),
+                SortBy::Cpu => a
+                    .cpu_pct
+                    .unwrap_or(0.0)
+                    .total_cmp(&b.cpu_pct.unwrap_or(0.0)),
                 SortBy::HostMem => a.host_mem_bytes.cmp(&b.host_mem_bytes),
                 SortBy::Pid => a.pid.cmp(&b.pid),
             };
@@ -1283,6 +1330,38 @@ mod tests {
                     container: Some("docker:abcdef123456".into()),
                     ..Default::default()
                 },
+            ]
+        }
+    }
+
+    /// Rows emitted out of order, two of which the backend cannot account
+    /// for at all — the NVML-under-WDDM shape, where `UsedGpuMemory` comes
+    /// back `Unavailable`.
+    struct UnaccountedBackend;
+
+    impl GpuBackend for UnaccountedBackend {
+        fn name(&self) -> &'static str {
+            "unaccounted"
+        }
+        fn poll(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
+            Ok(vec![GpuSnapshot::default()])
+        }
+        fn processes(&mut self) -> Vec<crate::backend::GpuProcess> {
+            let row = |pid, gpu_mem_bytes| crate::backend::GpuProcess {
+                pid,
+                gpu_mem_bytes,
+                user: Some("me".into()),
+                command: Some("x".into()),
+                ..Default::default()
+            };
+            // Deliberately neither sorted nor grouped: a pass-through order
+            // would fail the assertion, and so would one that only happens to
+            // work because the unknowns arrived together.
+            vec![
+                row(30, None),
+                row(10, Some(1 << 20)),
+                row(20, None),
+                row(40, Some(4 << 20)),
             ]
         }
     }
@@ -1589,10 +1668,10 @@ mod tests {
             gpu_index: 0,
             kind: ProcKind::Compute,
             gpu_util_pct: None,
-            gpu_mem_bytes: 0,
+            gpu_mem_bytes: Some(0),
             user: "me".into(),
-            cpu_pct: 0.0,
-            host_mem_bytes: 0,
+            cpu_pct: Some(0.0),
+            host_mem_bytes: Some(0),
             command: "gpur".into(),
             container: None,
         }];
@@ -1781,6 +1860,32 @@ mod tests {
         assert_eq!(procs[0]["container"], "docker:abcdef123456");
     }
 
+    /// C4: the record's rows are pinned gpu-mem descending, and a row whose
+    /// GPU memory could not be read has no figure to sort by. It sits below
+    /// every row that has one, ties among the unknowns break on pid, and the
+    /// field serializes as `null` rather than the `0` it used to flatten to —
+    /// so the order stays reproducible and a consumer can still tell an
+    /// unreadable row from an empty one.
+    #[test]
+    fn record_rows_sink_unknown_gpu_mem_below_every_known_figure() {
+        let mut app = app_with(Box::new(UnaccountedBackend));
+        app.poll();
+        assert_eq!(
+            app.all_procs.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![40, 10, 20, 30],
+            "unknown gpu-mem rows are not last, or did not tie-break on pid"
+        );
+
+        let rec = app.record();
+        let procs = rec["processes"].as_array().unwrap();
+        assert_eq!(procs[0]["gpu_mem_bytes"], 4 << 20);
+        assert_eq!(procs[1]["gpu_mem_bytes"], 1 << 20);
+        assert!(
+            procs[2]["gpu_mem_bytes"].is_null() && procs[3]["gpu_mem_bytes"].is_null(),
+            "an unreadable figure serialized as a measurement: {rec}"
+        );
+    }
+
     /// Finding 11: a backend with no thermal or power sensor must leave those
     /// peaks unknown rather than reporting a run that never got above 0°C/0W.
     #[test]
@@ -1825,31 +1930,42 @@ mod tests {
         assert_eq!(s.avg_util_pct(), Some(50.0));
     }
 
-    /// Finding 7 in the process table: "unmeasured" must not win an ascending
-    /// GPU% sort by masquerading as 0.
-    #[test]
-    fn rows_with_unknown_gpu_util_sink_in_both_directions() {
-        let mut app = app_with(Box::new(LocalBackend));
-        let row = |pid, util| ProcRow {
+    /// Every metric measured, so a test can blank exactly the one it is about.
+    fn sortable_row(pid: u32) -> ProcRow {
+        ProcRow {
             pid,
             gpu_index: 0,
             kind: ProcKind::Compute,
-            gpu_util_pct: util,
-            gpu_mem_bytes: 0,
+            gpu_util_pct: Some(0.0),
+            gpu_mem_bytes: Some(0),
             user: "me".into(),
-            cpu_pct: 0.0,
-            host_mem_bytes: 0,
+            cpu_pct: Some(0.0),
+            host_mem_bytes: Some(0),
             command: "x".into(),
             container: None,
+        }
+    }
+
+    /// Pids 1 and 3 carry a low and a high reading of whichever column
+    /// `sort_by` orders on; pid 2 carries none of it. Pid 2 belongs last
+    /// both ways up: descending because it has no claim on the top, and
+    /// ascending because "unread" is not the smallest reading.
+    fn assert_unknown_sinks(sort_by: SortBy, set: impl Fn(&mut ProcRow, Option<f64>)) {
+        let mut app = app_with(Box::new(LocalBackend));
+        let row = |pid, v| {
+            let mut r = sortable_row(pid);
+            set(&mut r, v);
+            r
         };
         app.all_procs = vec![row(1, Some(10.0)), row(2, None), row(3, Some(90.0))];
-        app.sort_by = SortBy::GpuUtil;
+        app.sort_by = sort_by;
 
         app.sort_desc = true;
         app.rebuild_proc_view();
         assert_eq!(
             app.procs.iter().map(|p| p.pid).collect::<Vec<_>>(),
-            vec![3, 1, 2]
+            vec![3, 1, 2],
+            "{sort_by:?} descending did not sink the unmeasured row"
         );
 
         app.sort_desc = false;
@@ -1857,8 +1973,40 @@ mod tests {
         assert_eq!(
             app.procs.iter().map(|p| p.pid).collect::<Vec<_>>(),
             vec![1, 3, 2],
-            "an unmeasured row sorted as if it were 0%"
+            "{sort_by:?} ascending sorted the unmeasured row as if it were 0"
         );
+    }
+
+    /// Finding 7 in the process table: "unmeasured" must not win an ascending
+    /// GPU% sort by masquerading as 0.
+    #[test]
+    fn rows_with_unknown_gpu_util_sink_in_both_directions() {
+        assert_unknown_sinks(SortBy::GpuUtil, |r, v| r.gpu_util_pct = v);
+    }
+
+    /// C4: the same rule for GPU memory, which NVML leaves unreadable for
+    /// every process under WDDM — so on Windows this is the common case, and
+    /// an ascending GPU MEM sort would otherwise open on the rows nothing is
+    /// known about rather than on the genuinely smallest allocations.
+    #[test]
+    fn rows_with_unknown_gpu_mem_sink_in_both_directions() {
+        assert_unknown_sinks(SortBy::GpuMem, |r, v| {
+            r.gpu_mem_bytes = v.map(|v| v as u64 * 1024 * 1024)
+        });
+    }
+
+    /// C4: and for the host columns, unreadable when the pid resolves to
+    /// nothing at all.
+    #[test]
+    fn rows_with_unknown_cpu_sink_in_both_directions() {
+        assert_unknown_sinks(SortBy::Cpu, |r, v| r.cpu_pct = v.map(|v| v as f32));
+    }
+
+    #[test]
+    fn rows_with_unknown_host_mem_sink_in_both_directions() {
+        assert_unknown_sinks(SortBy::HostMem, |r, v| {
+            r.host_mem_bytes = v.map(|v| v as u64 * 1024 * 1024)
+        });
     }
 
     /// The heart of it: a GPU that changes position between polls keeps its

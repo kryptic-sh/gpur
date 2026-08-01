@@ -234,15 +234,27 @@ fn snapshot(app: &mut App, json: bool, tick_ms: u64) -> Result<()> {
         println!("{line}");
     }
     // Same rows the JSON record carries: unfiltered, deterministic order.
+    //
+    // The process rows spell an unreadable figure `-`, not the `n/a` the GPU
+    // lines above use and not the TUI table's `N/A`. That divergence is not
+    // new: the per-process utilization has printed `-` for as long as this
+    // output has existed, and these lines are column-split by scripts, so
+    // one column of a row disagreeing with its neighbours is worse than the
+    // two blocks of this output disagreeing with each other. The memory
+    // column follows the utilization column beside it.
+    let proc_mib = |b: Option<u64>| {
+        b.map(|b| format!("{}MiB", b / 1024 / 1024))
+            .unwrap_or_else(|| "-".to_string())
+    };
     for p in &app.all_procs {
         println!(
-            "  pid {:>7}  gpu {}  {:>4}  {:>5}MiB  {}",
+            "  pid {:>7}  gpu {}  {:>4}  {:>8}  {}",
             p.pid,
             p.gpu_index,
             p.gpu_util_pct
                 .map(|u| format!("{u:.0}%"))
                 .unwrap_or_else(|| "-".into()),
-            p.gpu_mem_bytes / 1024 / 1024,
+            proc_mib(p.gpu_mem_bytes),
             p.command,
         );
     }
