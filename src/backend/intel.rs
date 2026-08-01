@@ -38,18 +38,25 @@ mod linux_impl {
     const INTEL_VENDOR: &str = "0x8086";
 
     pub fn probe() -> Option<Box<dyn GpuBackend>> {
+        backend().map(|b| Box::new(b) as Box<dyn GpuBackend>)
+    }
+
+    /// The probe, but concrete: the hardware tests assert on state this
+    /// backend keeps between polls (the per-client counter maps), which a
+    /// `Box<dyn GpuBackend>` cannot reach.
+    fn backend() -> Option<IntelBackend> {
         let devices = scan("/sys/class/drm");
         if devices.is_empty() {
             return None;
         }
-        Some(Box::new(IntelBackend {
+        Some(IntelBackend {
             devices,
             sys_mem_total: linux::sys_mem_total_bytes(),
             i915_state: HashMap::new(),
             xe_state: HashMap::new(),
             energy_state: HashMap::new(),
             last_procs: Vec::new(),
-        }))
+        })
     }
 
     struct IntelDevice {
@@ -590,6 +597,591 @@ drm-resident-gtt:\t1024 KiB
             assert_eq!(m.local, (1024 << 20) + (8 << 20));
             assert_eq!(m.system, 1 << 20);
             assert!(m.saw_local);
+        }
+    }
+
+    /// Tests that read this machine's own Intel GPU. Everything above runs on
+    /// fabricated sysfs trees and canned fdinfo, which cannot catch what only
+    /// live hardware shows: a sysfs path that moved between kernel releases, a
+    /// counter the driver stopped publishing, or an invariant that holds on a
+    /// fixture and breaks against a real `/proc` sweep.
+    ///
+    /// So these read `/sys/class/drm` and `/proc` as they are, and skip
+    /// themselves where `probe` finds no i915/xe card — which is every CI
+    /// runner this project has. Set `GPUR_REQUIRE_INTEL=1` on a runner that is
+    /// supposed to have an Intel GPU: the skip becomes a failure, so the day
+    /// the card or the driver disappears from that machine is not the day the
+    /// suite quietly stops testing this backend.
+    ///
+    /// Read-only throughout: no test here writes sysfs, signals a process, or
+    /// depends on the machine being idle or busy.
+    #[cfg(test)]
+    mod hardware {
+        use super::*;
+        use crate::backend::ProcKind;
+        use std::fs;
+        use std::time::Duration;
+
+        /// This machine's Intel backend, or `None` with a note saying why the
+        /// caller is about to do nothing.
+        fn intel() -> Option<IntelBackend> {
+            if let Some(b) = backend() {
+                return Some(b);
+            }
+            assert!(
+                std::env::var_os("GPUR_REQUIRE_INTEL").is_none(),
+                "GPUR_REQUIRE_INTEL is set, but no i915/xe card was found in \
+                 /sys/class/drm — this machine cannot test the Intel backend"
+            );
+            eprintln!("skipping: no Intel GPU on this machine");
+            None
+        }
+
+        /// Enough of a gap for the counter deltas to have something to divide.
+        const GAP: Duration = Duration::from_millis(100);
+
+        #[test]
+        fn the_scan_claims_this_machines_intel_cards() {
+            let Some(b) = intel() else { return };
+            for d in &b.devices {
+                assert!(
+                    !d.name.is_empty(),
+                    "a nameless card renders as a blank header row"
+                );
+                assert!(
+                    is_intel_driver(&d.driver),
+                    "{} claimed on driver {:?}",
+                    d.name,
+                    d.driver
+                );
+                // Every Intel GPU is a PCI device, iGPUs included. The BDF is
+                // what fdinfo's `drm-pdev` is matched against, so a card
+                // without one can never have a single client attributed to it.
+                assert!(d.pdev.is_some(), "{} has no PCI address", d.name);
+                // The card dir has to stay the DRM minor, not the PCI device:
+                // i915 keeps the clock and `lmem_total_bytes` there.
+                assert!(
+                    d.card
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("card")),
+                    "{:?} is not a DRM minor dir",
+                    d.card
+                );
+                assert!(d.dev.join("vendor").exists(), "{:?}", d.dev);
+            }
+        }
+
+        #[test]
+        fn a_live_poll_reports_only_values_this_hardware_can_produce() {
+            let Some(mut b) = intel() else { return };
+            let gpus = b.poll().unwrap();
+            assert_eq!(gpus.len(), b.devices.len(), "one snapshot per card");
+
+            for g in &gpus {
+                for (what, pct) in [
+                    ("utilization", g.utilization_pct),
+                    ("video", g.video_util_pct),
+                ] {
+                    if let Some(v) = pct {
+                        assert!((0.0..=100.0).contains(&v), "{} {what} {v}%", g.name);
+                    }
+                }
+                if let Some(t) = g.temperature_c {
+                    assert!((-50.0..=150.0).contains(&t), "{} at {t}°C", g.name);
+                }
+                if let Some(w) = g.power_w {
+                    assert!((0.0..=1000.0).contains(&w), "{} at {w} W", g.name);
+                }
+                if let Some(w) = g.power_limit_w {
+                    assert!((0.0..=1000.0).contains(&w), "{} limit {w} W", g.name);
+                }
+                if let Some(mhz) = g.clock_mhz {
+                    assert!(mhz <= 5000, "{} at {mhz} MHz", g.name);
+                }
+                assert!(
+                    g.device_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("pci:")),
+                    "{} has no PCI-derived identity: {:?}",
+                    g.name,
+                    g.device_id
+                );
+                assert_eq!(
+                    g.gtt_total_bytes,
+                    linux::sys_mem_total_bytes(),
+                    "{}: system-backed graphics memory is capped by system RAM",
+                    g.name
+                );
+                if let Some(total) = g.vram_total_bytes {
+                    assert!(total > 0, "{}: a published total of 0 is not one", g.name);
+                }
+                assert!(
+                    g.vram_used_bytes.is_none() || g.vram_total_bytes.is_some(),
+                    "{}: VRAM usage without a total draws a meter with no scale",
+                    g.name
+                );
+                if g.integrated {
+                    // An iGPU has no local memory pool at all, and a 0/0 VRAM
+                    // meter over one claims an empty pool that doesn't exist.
+                    assert_eq!(g.vram_total_bytes, None, "{} is integrated", g.name);
+                    assert_eq!(g.vram_used_bytes, None, "{} is integrated", g.name);
+                }
+                // Counters neither Intel driver publishes. A value here means
+                // something started fabricating one.
+                assert_eq!(g.mem_util_pct, None, "{}", g.name);
+                assert_eq!(g.enc_util_pct, None, "{}", g.name);
+                assert_eq!(g.dec_util_pct, None, "{}", g.name);
+                assert_eq!(g.fan_pct, None, "{}", g.name);
+                assert_eq!(g.fan_rpm, None, "{}", g.name);
+                assert_eq!(g.throttle, None, "{}", g.name);
+                assert_eq!(g.mem_clock_mhz, None, "{}", g.name);
+                assert_eq!(g.temp_junction_c, None, "{}", g.name);
+                assert_eq!(g.temp_mem_c, None, "{}", g.name);
+                assert_eq!(g.volt_mv, None, "{}", g.name);
+                assert_eq!(g.perf_level, None, "{}", g.name);
+                assert_eq!(g.pcie_rx_kbs, None, "{}", g.name);
+                assert_eq!(g.pcie_tx_kbs, None, "{}", g.name);
+            }
+        }
+
+        /// `App` keys graph history, session peaks and folding on the device
+        /// id, and holds a card's row at its index. Both have to name the same
+        /// card on every poll of the same machine.
+        #[test]
+        fn device_identity_and_order_survive_repeated_polls() {
+            let Some(mut b) = intel() else { return };
+            let first = b.poll().unwrap();
+            std::thread::sleep(GAP);
+            let second = b.poll().unwrap();
+
+            let identity = |gpus: &[GpuSnapshot]| {
+                gpus.iter()
+                    .map(|g| (g.name.clone(), g.device_id.clone(), g.integrated))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(identity(&first), identity(&second));
+        }
+
+        /// Intel publishes cumulative energy (µJ), not watts, so the first
+        /// poll has nothing to subtract from: it must report `None` rather
+        /// than a card sitting at a confident 0 W. The second poll is the
+        /// first real reading.
+        #[test]
+        fn power_is_an_energy_delta_so_the_first_poll_reports_none() {
+            let Some(mut b) = intel() else { return };
+            let energy: Vec<bool> = b
+                .devices
+                .iter()
+                .map(|d| {
+                    d.hwmon
+                        .as_deref()
+                        .is_some_and(|h| read_u64(&h.join("energy1_input")).is_some())
+                })
+                .collect();
+            if !energy.contains(&true) {
+                eprintln!("skipping: no readable hwmon energy counter on this machine");
+                return;
+            }
+
+            let first = b.poll().unwrap();
+            std::thread::sleep(GAP);
+            let second = b.poll().unwrap();
+
+            for (i, _) in energy.iter().enumerate().filter(|(_, has)| **has) {
+                assert_eq!(
+                    first[i].power_w, None,
+                    "{}: nothing to take a delta against yet",
+                    first[i].name
+                );
+                let w = second[i].power_w.unwrap_or_else(|| {
+                    panic!("{}: no energy delta on the second poll", first[i].name)
+                });
+                assert!((0.0..=1000.0).contains(&w), "{} at {w} W", first[i].name);
+            }
+        }
+
+        /// The process table is built by the same fdinfo sweep that feeds the
+        /// gauges, so a row in it is proof the sweep read that device's
+        /// clients — which is exactly the condition under which its gauges are
+        /// measurements rather than `None`.
+        #[test]
+        fn processes_come_from_the_poll_sweep_and_name_a_device_it_read() {
+            let Some(mut b) = intel() else { return };
+            assert!(
+                b.processes().is_empty(),
+                "processes() serves the last poll's sweep, it does not scan"
+            );
+
+            let gpus = b.poll().unwrap();
+            let procs = b.processes();
+            for p in &procs {
+                assert!(
+                    p.gpu_index < gpus.len(),
+                    "pid {} attributed to card {} of {}",
+                    p.pid,
+                    p.gpu_index,
+                    gpus.len()
+                );
+                let util = p
+                    .gpu_util_pct
+                    .expect("the sweep computes a figure for every client it reads");
+                assert!((0.0..=100.0).contains(&util), "pid {} at {util}%", p.pid);
+                assert!(
+                    p.gpu_mem_bytes.is_some(),
+                    "pid {}: fdinfo regions were read, so zero is a reading",
+                    p.pid
+                );
+
+                let g = &gpus[p.gpu_index];
+                assert!(
+                    g.utilization_pct.is_some(),
+                    "{} has attributed clients but reports no utilization",
+                    g.name
+                );
+                assert!(
+                    g.gtt_used_bytes.is_some(),
+                    "{} has attributed clients but reports no system memory",
+                    g.name
+                );
+            }
+            if procs.is_empty() {
+                eprintln!(
+                    "note: no readable DRM clients — run as a user owning one to \
+                     exercise attribution"
+                );
+            }
+        }
+
+        /// The counter-delta maps are keyed on (pid, drm-client-id) and pruned
+        /// against what each sweep saw. A leak here is unbounded: a gpur left
+        /// running on a busy box would keep an entry for every short-lived
+        /// client forever.
+        #[test]
+        fn per_client_delta_state_is_pruned_to_clients_that_still_exist() {
+            let Some(mut b) = intel() else { return };
+            b.poll().unwrap();
+            std::thread::sleep(GAP);
+            // Bracket the sweep: a pid it charges must have been alive during
+            // it, so it shows up in one of these two readings unless it both
+            // appeared and exited inside the sweep — which a process holding a
+            // DRM client does not do.
+            let before: HashSet<u32> = linux::proc_pids().into_iter().collect();
+            b.poll().unwrap();
+            let after: HashSet<u32> = linux::proc_pids().into_iter().collect();
+
+            for (pid, client) in b.i915_state.keys().chain(b.xe_state.keys()) {
+                assert!(
+                    before.contains(pid) || after.contains(pid),
+                    "counter state kept for client {client} of dead pid {pid}"
+                );
+            }
+            assert!(
+                b.energy_state.len() <= b.devices.len(),
+                "energy state is per card, not per poll"
+            );
+        }
+
+        /// The header names the drivers actually in use, because an i915 iGPU
+        /// beside an xe card publishes different telemetry and a line naming
+        /// one of them misattributes what the other lacks.
+        #[test]
+        fn the_driver_line_names_every_driver_this_machine_runs() {
+            let Some(b) = intel() else { return };
+            let line = b
+                .driver_info()
+                .expect("the kernel release is readable on Linux");
+            for d in &b.devices {
+                assert!(line.contains(&d.driver), "{line:?} omits {}", d.driver);
+            }
+            assert!(line.contains("kernel"), "{line:?}");
+        }
+
+        /// The total is chained across three sysfs locations that no fixture
+        /// can prove are the real ones. Looking on the PCI dir instead of the
+        /// DRM minor is what made every DKMS-i915 Arc card read as having no
+        /// VRAM at all, and that reads as a missing meter, never an error.
+        #[test]
+        fn the_vram_total_is_read_from_where_this_driver_publishes_it() {
+            let Some(b) = intel() else { return };
+            for d in &b.devices {
+                assert_eq!(
+                    d.vram_total,
+                    vram_total(&d.card, &d.dev),
+                    "{}: total is not a stable read of sysfs",
+                    d.name
+                );
+                if d.driver == "i915" && !d.card.join("lmem_total_bytes").exists() {
+                    assert_eq!(
+                        d.vram_total, None,
+                        "{}: mainline i915 publishes no total, so none may be invented",
+                        d.name
+                    );
+                }
+            }
+        }
+
+        /// i915 keeps the current clock on the card dir, xe under the tile.
+        /// A path that drifts reads as a card with no clock rather than an
+        /// error, so the check is against the files that are actually there.
+        #[test]
+        fn the_current_clock_is_read_from_where_this_driver_keeps_it() {
+            let Some(b) = intel() else { return };
+            for d in &b.devices {
+                let published = d.card.join("gt_cur_freq_mhz").exists()
+                    || d.dev.join("tile0/gt0/freq0/cur_freq").exists()
+                    || d.card.join("gt/gt0/rps_cur_freq_mhz").exists();
+                if !published {
+                    eprintln!("note: {} publishes no clock file", d.name);
+                    continue;
+                }
+                assert!(
+                    gt_cur_freq_mhz(d).is_some(),
+                    "{}: sysfs has a clock file this backend did not read",
+                    d.name
+                );
+                let mhz = gt_cur_freq_mhz(d).unwrap();
+                assert!(
+                    (1..=5000).contains(&mhz),
+                    "{} at {mhz} MHz — a clock read as 0 is a file that stopped parsing",
+                    d.name
+                );
+            }
+        }
+
+        /// The three hwmon gauges, checked against the hwmon dir this card
+        /// actually has. Both directions matter: a gauge missing where the
+        /// file exists is telemetry silently dropped, and a gauge present
+        /// where no file does is a number invented from nothing.
+        ///
+        /// Whole classes of Intel iGPU (Tiger Lake and friends on i915)
+        /// register no hwmon at all, which is why the UI has to render
+        /// temperature and power as absent rather than as zero.
+        #[test]
+        fn the_hwmon_gauges_are_read_where_hwmon_exists_and_stay_none_where_it_does_not() {
+            let Some(mut b) = intel() else { return };
+            let hwmon: Vec<Option<PathBuf>> = b.devices.iter().map(|d| d.hwmon.clone()).collect();
+            // Two polls: power is an energy delta, and the first has none.
+            b.poll().unwrap();
+            std::thread::sleep(GAP);
+            let gpus = b.poll().unwrap();
+
+            for (i, g) in gpus.iter().enumerate() {
+                let h = hwmon[i].as_deref();
+                assert_eq!(
+                    g.temperature_c.is_some(),
+                    hwmon_u64(h, "temp1_input").is_some(),
+                    "{}: temperature disagrees with hwmon temp1_input",
+                    g.name
+                );
+                assert_eq!(
+                    g.power_limit_w.is_some(),
+                    hwmon_u64(h, "power1_max").is_some_and(|v| v > 0),
+                    "{}: power limit disagrees with hwmon power1_max",
+                    g.name
+                );
+                assert_eq!(
+                    g.power_w.is_some(),
+                    hwmon_u64(h, "energy1_input").is_some()
+                        || hwmon_u64(h, "power1_input").is_some(),
+                    "{}: power disagrees with the hwmon counters on disk",
+                    g.name
+                );
+                if h.is_none() {
+                    assert_eq!(
+                        (g.temperature_c, g.power_w, g.power_limit_w),
+                        (None, None, None),
+                        "{}: no hwmon dir, so all three are unknown",
+                        g.name
+                    );
+                    eprintln!(
+                        "note: {} registers no hwmon — temperature and power are \
+                         unavailable on this card",
+                        g.name
+                    );
+                }
+            }
+        }
+
+        /// PCIe comes from the PCI core's own attributes, identical for every
+        /// vendor's endpoint. An iGPU is not a PCIe endpoint in any useful
+        /// sense and its bridge answers "Unknown", which has to read as absent.
+        #[test]
+        fn the_pcie_link_is_the_pci_core_attributes_verbatim() {
+            let Some(mut b) = intel() else { return };
+            let gpus = b.poll().unwrap();
+            for (i, g) in gpus.iter().enumerate() {
+                let (cur_gen, width, max_gen, max_width) = linux::pcie_link(&b.devices[i].dev);
+                // The maximum is a fixed capability. The negotiated link can
+                // change between the poll and this read — cards downshift when
+                // idle — so only its presence is comparable.
+                assert_eq!(g.pcie_max_gen, max_gen, "{}", g.name);
+                assert_eq!(g.pcie_max_width, max_width, "{}", g.name);
+                assert_eq!(g.pcie_gen.is_some(), cur_gen.is_some(), "{}", g.name);
+                assert_eq!(g.pcie_width.is_some(), width.is_some(), "{}", g.name);
+                if cur_gen.is_none() {
+                    eprintln!("note: {} negotiates no readable PCIe link", g.name);
+                }
+            }
+        }
+
+        /// The header should name the card, not repeat its PCI id. The lookup
+        /// is checked against a second, independent read of the pci.ids
+        /// database rather than against the same helper's output.
+        #[test]
+        fn the_card_name_is_this_devices_pci_ids_entry() {
+            let Some(b) = intel() else { return };
+            let Ok(ids) = fs::read_to_string("/usr/share/hwdata/pci.ids") else {
+                eprintln!("skipping: no pci.ids database installed");
+                return;
+            };
+            for d in &b.devices {
+                let idx = d
+                    .card
+                    .file_name()
+                    .and_then(|n| linux::card_index(&n.to_string_lossy()))
+                    .expect("a card dir is named cardN");
+                assert_eq!(d.name, card_name(&d.dev, idx, "8086", "Intel"));
+
+                let device_id = fs::read_to_string(d.dev.join("device")).unwrap();
+                let device_id = device_id.trim().trim_start_matches("0x");
+                if let Some(marketing) = linux::pci_device_name(&ids, "8086", device_id) {
+                    assert_eq!(
+                        d.name, marketing,
+                        "card{idx} is listed in pci.ids but rendered as a fallback"
+                    );
+                }
+            }
+        }
+
+        /// The device gauges and the process rows are two views of one fdinfo
+        /// sweep, and the UI shows them side by side: a card metered at 6%
+        /// over rows summing to 40% is a bug a user can see. Asserted on the
+        /// second poll, because the first has no counter deltas to divide and
+        /// is also where a mainline-i915 Arc first learns it is discrete.
+        #[test]
+        fn the_device_gauges_are_the_sum_of_the_rows_from_the_same_sweep() {
+            let Some(mut b) = intel() else { return };
+            b.poll().unwrap();
+            std::thread::sleep(GAP);
+            let gpus = b.poll().unwrap();
+            let procs = b.processes();
+
+            for (i, g) in gpus.iter().enumerate() {
+                let rows: Vec<&GpuProcess> = procs.iter().filter(|p| p.gpu_index == i).collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                let util: f64 = rows.iter().filter_map(|p| p.gpu_util_pct).sum();
+                let mem: u64 = rows.iter().filter_map(|p| p.gpu_mem_bytes).sum();
+
+                let metered = g
+                    .utilization_pct
+                    .expect("rows exist, so this device's clients were read");
+                assert!(
+                    (metered - clamp_pct(util)).abs() < 1e-6,
+                    "{}: meter says {metered}%, rows sum to {util}%",
+                    g.name
+                );
+                // Rows charge the pool the device actually spends: the system
+                // pool on an iGPU, VRAM on a card that publishes a total.
+                let pool = if g.integrated {
+                    g.gtt_used_bytes
+                } else if g.vram_total_bytes.is_some() {
+                    g.vram_used_bytes
+                } else {
+                    continue;
+                };
+                assert_eq!(
+                    pool,
+                    Some(mem),
+                    "{}: memory meter and rows disagree",
+                    g.name
+                );
+            }
+        }
+
+        /// Core and video utilization are filled from the same sweep by two
+        /// different code paths — one goes through `attributed_sum`, one reads
+        /// its map directly. They must still agree on whether this device was
+        /// measured at all, or the UI shows a video figure beside a core gauge
+        /// reading n/a.
+        #[test]
+        fn video_utilization_is_reported_wherever_core_utilization_is() {
+            let Some(mut b) = intel() else { return };
+            let gpus = b.poll().unwrap();
+            for g in &gpus {
+                assert_eq!(
+                    g.utilization_pct.is_some(),
+                    g.video_util_pct.is_some(),
+                    "{}: core {:?} vs video {:?}",
+                    g.name,
+                    g.utilization_pct,
+                    g.video_util_pct
+                );
+            }
+        }
+
+        /// Attribution end to end: every DRM client this user owns has to
+        /// reach a row. Found by walking `/proc` independently of the sweep,
+        /// then intersected with a second walk so a client that opened or
+        /// closed around the poll cannot fail the test.
+        #[test]
+        fn every_drm_client_this_user_owns_reaches_a_process_row() {
+            let Some(mut b) = intel() else { return };
+            let devices: Vec<SweepDevice> = b
+                .devices
+                .iter()
+                .map(|d| SweepDevice {
+                    pdev: d.pdev.clone(),
+                    driver: d.driver.clone(),
+                })
+                .collect();
+            // (pid, card) -> touched a render engine.
+            let walk = || {
+                let mut out: HashMap<(u32, usize), bool> = HashMap::new();
+                for pid in linux::proc_pids() {
+                    for c in linux::drm_clients(pid) {
+                        if let Some(gpu) = linux::client_device(&devices, &c) {
+                            let graphics = c.engine_ns.keys().any(|k| k == "render" || k == "rcs")
+                                || c.cycles.keys().any(|k| k == "rcs");
+                            *out.entry((pid, gpu)).or_default() |= graphics;
+                        }
+                    }
+                }
+                out
+            };
+
+            let before = walk();
+            b.poll().unwrap();
+            let after = walk();
+            let rows: HashMap<(u32, usize), ProcKind> = b
+                .processes()
+                .iter()
+                .map(|p| ((p.pid, p.gpu_index), p.kind))
+                .collect();
+
+            if before.is_empty() {
+                eprintln!(
+                    "note: this user owns no readable DRM client — nothing to \
+                     attribute on this machine"
+                );
+            }
+            for (key, graphics) in &before {
+                let Some(still_graphics) = after.get(key) else {
+                    continue; // client went away around the poll
+                };
+                let (pid, gpu) = *key;
+                let kind = rows.get(key).unwrap_or_else(|| {
+                    panic!("pid {pid}'s client of card {gpu} was not attributed to any row")
+                });
+                if *graphics && *still_graphics {
+                    assert_eq!(
+                        *kind,
+                        ProcKind::Graphics,
+                        "pid {pid} runs on a render engine but is filed as compute"
+                    );
+                }
+            }
         }
     }
 }
