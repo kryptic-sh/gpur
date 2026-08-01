@@ -5,42 +5,32 @@ full-codebase review in `docs/code-review.md`. Everything already fixed lives in
 `CHANGELOG.md`; only open work is listed here, with closed entries struck
 through where the reasoning behind them is still worth keeping.
 
-Roughly ordered by what is worth doing first. Item 0 is a genuine correctness
-bug and is the only one; the remainder is granularity, cost, coverage and
-polish.
+Roughly ordered by what is worth doing first. Nothing open here is a correctness
+bug — item 0 was the only one and it is closed; the remainder is granularity,
+cost, coverage and polish.
 
 ---
 
-## 0. Per-process GPU memory reads `0MiB` for every NVIDIA process on Windows
+## 0. ~~Per-process GPU memory reads `0MiB` for every NVIDIA process on Windows~~ — CLOSED in 0.11.0
 
-**Severity: medium. Needs a decision, because the fix breaks log
-compatibility.** Finding C4 in `docs/code-review.md`, which has the full
-write-up.
+Review finding C4. `GpuProcess::gpu_mem_bytes` and `ProcRow`'s `gpu_mem_bytes` /
+`cpu_pct` / `host_mem_bytes` are `Option` now, so a figure the backend could not
+read renders as `N/A` (`-` in `--once`) and serializes as `null` rather than a
+confident zero. NVML reports no per-process memory at all under WDDM — the
+ordinary consumer Windows configuration — so that was every NVIDIA process row
+on Windows, not a rare unknown.
 
-`GpuProcess::gpu_mem_bytes` is a bare `u64`, so NVML's
-`UsedGpuMemory::Unavailable` becomes `0` and renders as a confident `0MiB`. The
-review first attributed that to MIG and permission-limited queries; the
-nvml-wrapper docs are blunter than that:
+The cost was taken deliberately: `--json` and `--log` emit `null` where they
+emitted `0`, so a log written by 0.11 or later cannot be read by an older gpur,
+which is why it went out as a minor release. The useful direction still works —
+0.11 replays pre-0.11 recordings, since `0` remains a valid reading.
 
-> Under WDDM, `NVML_VALUE_NOT_AVAILABLE` is always reported because Windows KMD
-> manages all the memory, not the NVIDIA driver.
-
-WDDM is the ordinary consumer Windows configuration, so this is not an edge case
-— it is every NVIDIA process row on Windows, always. The same `unwrap_or(0)`
-pattern hits `ProcRow::cpu_pct` and `ProcRow::host_mem_bytes` when sysinfo
-cannot resolve a pid, though those already carry `Option` at the backend layer.
-
-**Why it is not simply applied.** The record is written from `ProcRow` and read
-back into `GpuProcess`, two types serde-compatible only by field-name overlap.
-Emitting `null` for `gpu_mem_bytes` without widening `GpuProcess` too is not a
-cosmetic change — `#[serde(default)]` covers _missing_ keys, not explicit nulls,
-so `u64` fails to deserialize. Measured against the real binary: a log whose
-records all carry the null is rejected outright (`no valid JSONL records`, exit
-1), and a log where only some do has those frames **silently skipped** by
-`next_record`. Both types must therefore change together, and logs written by
-the new version become unreadable to older gpur binaries, which cannot be
-patched retroactively. That is the actual cost — not the `0` → `null` shape
-change — and it is why this wants a minor bump rather than a patch.
+Kept here rather than deleted because the asymmetry is worth remembering: the
+record is written from `ProcRow` and read back into `GpuProcess`, two types that
+line up only by field name, and `#[serde(default)]` covers missing keys but not
+explicit nulls. Any future field that gains a `null` has to be widened on both
+sides in the same release, or replay rejects whole records — silently, in the
+mixed case.
 
 ## 1. Windows vendor exclusion is per vendor, not per adapter
 

@@ -10,11 +10,11 @@ passes. Nothing here is a crash or a memory-safety problem.
 
 ## Status
 
-Everything below has been fixed except **C4**, which is left open because it
-breaks log compatibility and that is a call for the maintainer, not a review
-finding to apply unilaterally — its severity has since been revised up, see the
-entry. **D4** was judged not worth the extraction and is recorded as
-considered-and-declined.
+Every finding below is now fixed. **C4** was held back longest because it breaks
+log compatibility, which was the maintainer's call rather than a review finding
+to apply unilaterally; it shipped in 0.11.0 once that call was made, and its
+severity had been revised up in the meantime — see the entry. **D4** was judged
+not worth the extraction and is recorded as considered-and-declined.
 
 Two consequences of these fixes are behaviour changes in their own right and are
 recorded under "Decisions taken deliberately" in `backlog.md`: an Intel GPU with

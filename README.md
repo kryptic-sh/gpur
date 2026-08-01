@@ -243,9 +243,20 @@ can be diffed against a snapshot:
 
 `backend` and `driver` are what a maintainer needs first in a bug report.
 `processes` is the **unfiltered** table in a fixed order (GPU memory descending,
-then pid, then GPU index), so a UI filter can never silently drop rows from a
-recording and script output does not depend on the persisted sort. `--once`
-combined with `--log` writes exactly one record.
+then pid, then GPU index, with figures the backend could not read sorted last),
+so a UI filter can never silently drop rows from a recording and script output
+does not depend on the persisted sort. `--once` combined with `--log` writes
+exactly one record.
+
+**Any metric can be `null`**, at both levels: a reading the backend could not
+take is absent rather than zero, because `0%` and `0MiB` are claims about an
+idle GPU and an empty pool. Per process that covers `gpu_util_pct`,
+`gpu_mem_bytes`, `cpu_pct` and `host_mem_bytes` — NVML reports no per-process
+memory at all under WDDM, the usual Windows configuration, so those rows are
+`null` there rather than a fabricated `0`. Consumers should treat `null` as "not
+measured", not as zero. Recordings made before 0.11 carry `0` in those fields
+and still replay; the reverse is not true, so a log written by 0.11 or later
+cannot be read by an older gpur.
 
 ## License
 
