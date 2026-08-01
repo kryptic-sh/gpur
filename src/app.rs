@@ -328,8 +328,74 @@ fn state_path() -> Option<std::path::PathBuf> {
 }
 
 pub fn load_state() -> Option<UiState> {
-    let text = std::fs::read_to_string(state_path()?).ok()?;
+    read_state(&state_path()?)
+}
+
+/// Split out from [`load_state`] so the round-trip is testable: `state_path`
+/// answers with the real cache dir, which a test must not write into.
+fn read_state(path: &std::path::Path) -> Option<UiState> {
+    let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// Where the half-written state lives until it is complete. A sibling of the
+/// target, so the rename that publishes it stays within one filesystem — that
+/// is the condition for rename being atomic, and crossing a mount point would
+/// turn it into a copy that can tear like the write we are trying to avoid.
+/// The pid keeps two gpur instances quitting at the same moment from writing
+/// through each other's partial file and renaming the loser's bytes into
+/// place.
+fn state_temp_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Publish `state` at `path` without ever exposing a truncated file.
+///
+/// `fs::write` truncates first, so a crash, a `kill -9` or a full disk part
+/// way through left a short file that [`read_state`] can only give up on —
+/// and it gives up silently, so every fold, sort and poll rate the user had
+/// accumulated vanished with no message. The quit path is precisely where
+/// that is likeliest: `install_signal_teardown` calls `std::process::exit`
+/// from a signal thread and does not wait for this. Writing a temp file and
+/// renaming it over the target means a reader sees either the whole old file
+/// or the whole new one, never the seam.
+///
+/// The temp file is created 0600 where the platform has modes, and the target
+/// inherits that through the rename. Nothing in `state.json` is secret — it is
+/// folds, a sort key and a tick rate — so this is least privilege on a
+/// per-user cache file for its own sake and for consistency with the log,
+/// not a defence against a specific disclosure.
+///
+/// Best-effort throughout, per [`App::save_state`]: every failure path leaves
+/// the previous `state.json` untouched and returns, and takes the temp file
+/// with it so a repeatedly failing rename cannot litter the cache dir.
+fn write_state(path: &std::path::Path, state: &UiState) {
+    let Ok(json) = serde_json::to_string_pretty(state) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = state_temp_path(path);
+    if write_private(&tmp, json.as_bytes()).is_err() || std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// `fs::write`, but the file is created owner-only where the platform has
+/// file modes. Windows has no equivalent knob here and writes as before.
+fn write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(contents)
 }
 
 /// Startup knobs for [`App::new`], resolved from CLI + config.
@@ -504,12 +570,7 @@ impl App {
             tick_ms: self.tick_ms,
             tick_ms_explicit: Some(self.tick_explicit),
         };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write(path, json);
-        }
+        write_state(&path, &state);
     }
 
     /// Folds worth writing to `state.json`: only real device ids (a
@@ -1177,7 +1238,7 @@ mod tests {
         app.history_at(idx).expect("history for card").util.clone()
     }
 
-    /// A scratch dir holding one replay log, wiped when the guard drops.
+    /// A scratch dir, wiped when the guard drops.
     /// Mirrors `backend::linux::testing::Sandbox` — that one is Linux-only and
     /// lives behind a private module, so this shares the pattern rather than
     /// the type. The pid and the counter are the point: a fixed name under the
@@ -1187,7 +1248,7 @@ mod tests {
     struct Scratch(std::path::PathBuf);
 
     impl Scratch {
-        fn replay_log(tag: &str, body: &str) -> Self {
+        fn new(tag: &str) -> Self {
             use std::sync::atomic::{AtomicU32, Ordering};
             static N: AtomicU32 = AtomicU32::new(0);
             let dir = std::env::temp_dir().join(format!(
@@ -1196,12 +1257,21 @@ mod tests {
                 N.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("rec.jsonl"), body).unwrap();
             Scratch(dir)
         }
 
+        fn replay_log(tag: &str, body: &str) -> Self {
+            let scratch = Self::new(tag);
+            std::fs::write(scratch.path(), body).unwrap();
+            scratch
+        }
+
+        fn join(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+
         fn path(&self) -> std::path::PathBuf {
-            self.0.join("rec.jsonl")
+            self.join("rec.jsonl")
         }
     }
 
@@ -1834,5 +1904,75 @@ mod tests {
             None
         );
         assert_eq!(container_of_cgroup("0::/system.slice/sshd.service"), None);
+    }
+
+    /// Everything the TUI persists has to come back on the next run. The
+    /// atomic-write rework moved the writing side onto a temp file and a
+    /// rename; if the published name or the serialisation drifted from what
+    /// the loader reads, the only symptom would be folds, sort order and
+    /// poll rate quietly resetting on every launch.
+    #[test]
+    fn a_saved_state_is_read_back_unchanged_by_the_loader() {
+        let scratch = Scratch::new("state-roundtrip");
+        let path = scratch.join("state.json");
+        let state = UiState {
+            folded_devices: vec!["GPU-abc".into(), "GPU-def".into()],
+            sort_by: SortBy::Pid,
+            sort_desc: false,
+            tick_ms: 250,
+            tick_ms_explicit: Some(true),
+        };
+        write_state(&path, &state);
+
+        let back = read_state(&path).expect("a state that was just saved would not load");
+        assert_eq!(back.folded_devices, state.folded_devices);
+        assert_eq!(back.sort_by, state.sort_by);
+        assert_eq!(back.sort_desc, state.sort_desc);
+        assert_eq!(back.tick_ms, state.tick_ms);
+        assert_eq!(back.tick_ms_explicit, state.tick_ms_explicit);
+        // The scratch file is an implementation detail of the save, not
+        // something every quit should leave lying in the cache dir.
+        assert!(
+            !state_temp_path(&path).exists(),
+            "the temp file outlived a successful save"
+        );
+    }
+
+    /// A save that cannot complete must not cost the user the state they
+    /// already had. `fs::write` truncated the target before writing a byte,
+    /// so anything going wrong past that point left a short file that
+    /// `read_state` can only discard — silently, since a monitor never
+    /// refuses to quit over a bad save. The temp file plus rename never
+    /// touches the target until every byte is on disk.
+    ///
+    /// The failure is staged by putting a *directory* where the temp file
+    /// wants to be: deterministic on every platform, and unlike a read-only
+    /// parent it still fails when the suite happens to run as root.
+    #[test]
+    fn a_failed_save_leaves_the_previous_state_file_intact() {
+        let scratch = Scratch::new("state-failed-save");
+        let path = scratch.join("state.json");
+        write_state(
+            &path,
+            &UiState {
+                tick_ms: 250,
+                ..Default::default()
+            },
+        );
+
+        std::fs::create_dir_all(state_temp_path(&path)).unwrap();
+        write_state(
+            &path,
+            &UiState {
+                tick_ms: 999,
+                ..Default::default()
+            },
+        );
+
+        let back = read_state(&path).expect("a failed save destroyed the previous state file");
+        assert_eq!(
+            back.tick_ms, 250,
+            "a save that never completed was published anyway"
+        );
     }
 }
