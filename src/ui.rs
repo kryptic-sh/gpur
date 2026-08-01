@@ -377,13 +377,20 @@ fn caption<'a>(text: String, text_style: Style, border: Style) -> Line<'a> {
 }
 
 /// Sample index `i` of a right-aligned window of `window` values over `data`:
-/// newest sample at the right edge, missing history reads as 0.
-fn windowed(data: &[u64], i: usize, window: usize) -> u64 {
+/// newest sample at the right edge, `None` for a sample the backend could not
+/// read.
+///
+/// The left pad is `None` too, because history that has not been collected yet
+/// is not a reading of 0 — the same claim this signature exists to stop making.
+/// So a freshly started gpur on a wide terminal draws a mostly dim graph that
+/// fills in with color from the right as samples accumulate. That is intended:
+/// the graph shows how much of the window it can actually speak for.
+fn windowed(data: &[Option<u64>], i: usize, window: usize) -> Option<u64> {
     if data.len() >= window {
         data[data.len() - window + i]
     } else {
         let pad = window - data.len();
-        if i < pad { 0 } else { data[i - pad] }
+        if i < pad { None } else { data[i - pad] }
     }
 }
 
@@ -713,13 +720,21 @@ fn draw_meter(frame: &mut Frame, area: Rect, meter: Meter<'_>, t: &UiTheme, styl
 /// Five-cell inline sparkline of recent samples, scaled to `max` — the
 /// `⣀⣀⣀⣠⣤` blips btop puts next to temps and power draws. Follows the
 /// configured glyph set.
-fn mini_spark(data: &[u64], max: u64, style: GraphStyle) -> String {
+///
+/// An unknown sample renders as a gap: a space in block and ascii, no dots in
+/// braille. The waveform can dim an unknown column, but the caller draws these
+/// five cells wholly in `t.dim`, so absence has nowhere to go but the glyph. A
+/// measured 0 keeps its baseline glyph (`▁`, `_`, or a bottom dot row), which
+/// is what makes the two readable apart.
+fn mini_spark(data: &[Option<u64>], max: u64, style: GraphStyle) -> String {
     const CELLS: usize = 5;
     let max = max.max(1);
     if style != GraphStyle::Braille {
         return (0..CELLS)
             .map(|c| {
-                let v = windowed(data, c, CELLS).min(max);
+                let Some(v) = windowed(data, c, CELLS).map(|v| v.min(max)) else {
+                    return ' ';
+                };
                 if style == GraphStyle::Block {
                     let lvl = ((v as usize * 8).div_ceil(max as usize)).clamp(1, 8);
                     EIGHTHS[lvl]
@@ -735,13 +750,22 @@ fn mini_spark(data: &[u64], max: u64, style: GraphStyle) -> String {
     for c in 0..CELLS {
         let mut bits = 0u8;
         for (s, bit_col) in DOT_BITS.iter().enumerate() {
-            let v = windowed(data, c * 2 + s, n);
+            // An unknown sub-column contributes no dots, so a cell whose
+            // samples are all unknown ends at `bits == 0` and is drawn as a
+            // space — a known sample always sets at least one bit.
+            let Some(v) = windowed(data, c * 2 + s, n) else {
+                continue;
+            };
             let dots = ((v.min(max) as usize * 4).div_ceil(max as usize)).clamp(1, 4);
             for d in 0..dots {
                 bits |= bit_col[3 - d];
             }
         }
-        out.push(char::from_u32(BRAILLE_BASE + bits as u32).unwrap_or('⠀'));
+        if bits == 0 {
+            out.push(' ');
+        } else {
+            out.push(char::from_u32(BRAILLE_BASE + bits as u32).unwrap_or('⠀'));
+        }
     }
     out
 }
@@ -760,9 +784,23 @@ fn human_bytes(b: u64) -> String {
 /// Lower-block glyphs by filled eighths (index 0..=8).
 const EIGHTHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Ascii coverage ramp indexed by fill level 0..=4. Level 0 is the baseline
-/// `_`, drawn by `mini_spark` so an all-zero sparkline still shows a line;
-/// the waveform skips empty cells outright and never indexes it.
+/// `_`: a line with nothing on it. Two callers reach for it, and neither
+/// indexes it by fill level — the ramp's 1..=4 are the measured heights.
+/// `mini_spark` draws it for a measured 0 (an all-zero sparkline still shows
+/// a line, and its unknowns are spaces). The waveform draws it for an
+/// *unknown* sample, whose measured 0 is the `.` sliver at level 1 — ascii has
+/// to separate the two by shape, because it is the glyph set for terminals
+/// that may not render the dim style at all.
+///
+/// So `_` means "measured 0" in one widget and "nothing read" in the other.
+/// They are never adjacent, and within each widget the contrast is the one
+/// that matters there; the alternative was giving up the distinction in
+/// whichever widget lost the glyph.
 const ASCII_RAMP: [char; 5] = ['_', '.', '-', '+', '#'];
+/// Upper one eighth block. The mirror of `EIGHTHS[1]` for a bar hanging from
+/// the top of a cell — the only such partial Unicode has, which is why the
+/// down half draws every other height with the complement trick instead.
+const UPPER_EIGHTH: char = '▔';
 const BRAILLE_BASE: u32 = 0x2800;
 /// Braille dot bit for (sub-column, dot-row counted from cell top).
 const DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
@@ -773,15 +811,19 @@ const DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x8
 /// `color`, the gpu%/vram% edge labels); the glyph-specific per-column fill
 /// lives in the closure. `cell` receives (buf, row data, half-height rows,
 /// distance-from-midline cy, row y, color, half).
+///
+/// `color` is the gradient this row would use for a measured sample; a column
+/// with nothing to measure is the closure's business, since only it knows how
+/// its samples map onto cells, and it substitutes `t.dim` there.
 fn waveform_halves(
     frame: &mut Frame,
     area: Rect,
-    up_data: &[u64],
-    down_data: &[u64],
+    up_data: &[Option<u64>],
+    down_data: &[Option<u64>],
     t: &UiTheme,
     mut cell: impl FnMut(
         &mut ratatui::buffer::Buffer,
-        &[u64],
+        &[Option<u64>],
         usize,
         usize,
         u16,
@@ -824,11 +866,17 @@ fn waveform_halves(
 /// sliver, so an idle GPU still draws a thin center line. The glyph set is
 /// selectable: braille (2 samples/cell, 4 rows/cell), block eighths, or
 /// pure ascii.
+///
+/// An unknown sample also draws the minimum sliver, but in `t.dim` instead of
+/// the gradient: minimum height because we do not know the value and must not
+/// imply one, a sliver rather than a gap so the trace stays continuous and a
+/// dim run reads as "no data here" rather than as a hole in the widget. A
+/// measured 0 keeps its gradient color, which is the whole distinction.
 fn draw_waveform(
     frame: &mut Frame,
     area: Rect,
-    up_data: &[u64],
-    down_data: &[u64],
+    up_data: &[Option<u64>],
+    down_data: &[Option<u64>],
     t: &UiTheme,
     style: GraphStyle,
 ) {
@@ -853,8 +901,18 @@ fn draw_waveform(
         |buf, data, rows, cy, y, color, half| {
             for cx in 0..cols {
                 let mut bits = 0u8;
+                // A ratatui cell carries one foreground, but braille packs two
+                // samples into it: dim the cell only when every sample in it is
+                // unknown. A known sample must never be greyed out, so a mixed
+                // cell keeps the gradient — the dim run then marks exactly the
+                // stretch where nothing at all was read.
+                let mut known = false;
                 for (s, bit_col) in DOT_BITS.iter().enumerate() {
-                    let dots = dots_for(windowed(data, cx * 2 + s, n), rows);
+                    let sample = windowed(data, cx * 2 + s, n);
+                    known |= sample.is_some();
+                    // Unknown draws the minimum sliver: `dots_for` already
+                    // floors at 1, so a 0 stands in for "no value to imply".
+                    let dots = dots_for(sample.unwrap_or(0), rows);
                     let in_cell = dots.saturating_sub(cy * 4).min(4);
                     for d in 0..in_cell {
                         // Up half fills cells bottom-up, down half top-down.
@@ -866,7 +924,11 @@ fn draw_waveform(
                     && let Some(cell) = buf.cell_mut((area.x + cx as u16, y))
                 {
                     cell.set_char(char::from_u32(BRAILLE_BASE + bits as u32).unwrap_or('⠀'));
-                    cell.set_fg(color);
+                    if known {
+                        cell.set_fg(color);
+                    } else {
+                        cell.set_style(t.dim);
+                    }
                 }
             }
         },
@@ -875,12 +937,13 @@ fn draw_waveform(
 
 /// Block/ascii waveform: one sample per column. Block mode uses eighth
 /// glyphs (down-growing partials via fg/bg swap since Unicode has no lower
-/// upper-partials); ascii uses a `.-+#` coverage ramp.
+/// upper-partials); ascii uses a `.-+#` coverage ramp. An unknown sample draws
+/// the minimum sliver in `t.dim`; see [`draw_waveform`].
 fn draw_waveform_cells(
     frame: &mut Frame,
     area: Rect,
-    up_data: &[u64],
-    down_data: &[u64],
+    up_data: &[Option<u64>],
+    down_data: &[Option<u64>],
     t: &UiTheme,
     style: GraphStyle,
 ) {
@@ -899,24 +962,57 @@ fn draw_waveform_cells(
         t,
         |buf, data, rows, cy, y, color, half| {
             for cx in 0..cols {
-                let v = windowed(data, cx, cols).min(100) as usize;
+                let sample = windowed(data, cx, cols);
+                // An unknown sample stands in as 0, which the `.max(1)` below
+                // turns into the minimum sliver — height we are entitled to
+                // draw without implying a value. The dim style is what says so.
+                let v = sample.unwrap_or(0).min(100) as usize;
                 let units = ((v * rows * unit) / 100).max(1);
                 let in_cell = units.saturating_sub(cy * unit).min(unit);
                 if in_cell == 0 {
                     continue;
                 }
-                let (ch, cell_style) = match style {
-                    GraphStyle::Block if half == 0 => (EIGHTHS[in_cell], Style::new().fg(color)),
-                    GraphStyle::Block => {
-                        if in_cell == 8 {
-                            ('█', Style::new().fg(color))
-                        } else {
-                            // Complement trick: paint the empty lower part in
-                            // the background color over a bar-colored cell.
-                            (EIGHTHS[8 - in_cell], Style::new().fg(bg).bg(color))
+                let (ch, cell_style) = if sample.is_none() {
+                    // The sliver is exactly one sub-unit, so in the down half
+                    // it hangs from the top of the cell: `▔` is the single
+                    // upper partial Unicode does have, and it is all a sliver
+                    // needs. The complement trick below is no use here — it
+                    // carries the bar color in the *background*, and an
+                    // unreadable sample must be dim in the foreground.
+                    //
+                    // Ascii spends a different glyph rather than leaning on
+                    // the dim style: `--graphs ascii` is for terminals with
+                    // poor font support, which are the same terminals least
+                    // likely to render DIM as anything at all, and under
+                    // `ColorMode::Mono` the dim style *is* only DIM. So the
+                    // unknown sliver is the bare baseline `_` against the `.`
+                    // a measured 0 draws, and the styling is a bonus. (`_`
+                    // sits low in the cell in both halves; ascii's ramp is a
+                    // coverage ramp, not a positional one, so neither half
+                    // has a glyph that hangs from the top anyway.)
+                    let ch = match (style, half) {
+                        (GraphStyle::Block, 0) => EIGHTHS[1],
+                        (GraphStyle::Block, _) => UPPER_EIGHTH,
+                        _ => ASCII_RAMP[0],
+                    };
+                    (ch, t.dim)
+                } else {
+                    match style {
+                        GraphStyle::Block if half == 0 => {
+                            (EIGHTHS[in_cell], Style::new().fg(color))
                         }
+                        GraphStyle::Block => {
+                            if in_cell == 8 {
+                                ('█', Style::new().fg(color))
+                            } else {
+                                // Complement trick: paint the empty lower part
+                                // in the background color over a bar-colored
+                                // cell.
+                                (EIGHTHS[8 - in_cell], Style::new().fg(bg).bg(color))
+                            }
+                        }
+                        _ => (ASCII_RAMP[in_cell], Style::new().fg(color)),
                     }
-                    _ => (ASCII_RAMP[in_cell], Style::new().fg(color)),
                 };
                 if let Some(cell) = buf.cell_mut((area.x + cx as u16, y)) {
                     cell.set_char(ch);
@@ -1412,18 +1508,219 @@ mod tests {
         assert_eq!(popup_width(&[]), 6); // borders only
     }
 
+    /// The baseline glyph has two callers with opposite meanings, and the
+    /// reason is worth pinning down: `mini_spark` cannot dim anything (the
+    /// caller styles it whole), so its unknown is a gap and `_` is left to
+    /// mean a measured 0. The waveform cannot leave a gap (the trace has to
+    /// stay continuous), so its unknown takes `_` and a measured 0 takes the
+    /// level-1 sliver. Neither widget is ambiguous within itself.
     #[test]
-    fn ascii_ramp_baseline_only_reachable_from_mini_spark() {
-        // The waveform indexes 1..=4 (it skips empty cells); mini_spark
-        // indexes 0..=4 and relies on the baseline glyph.
+    fn the_ascii_baseline_is_a_measured_zero_in_a_spark_and_unknown_in_a_waveform() {
         assert_eq!(ASCII_RAMP[0], '_');
+        // mini_spark: a measured 0 draws the line, unknown draws nothing.
+        assert_eq!(mini_spark(&[Some(0); 5], 100, GraphStyle::Ascii), "_____");
+        assert_eq!(mini_spark(&[Some(100); 5], 100, GraphStyle::Ascii), "#####");
         assert_eq!(
-            mini_spark(&[0, 0, 0, 0, 0], 100, GraphStyle::Ascii),
-            "_____"
+            mini_spark(&[None::<u64>; 5], 100, GraphStyle::Ascii),
+            "     "
         );
+
+        // The waveform, the other way round.
+        let t = color_theme();
+        let data = [None, Some(0)];
+        let grid = waveform_grid(&t, GraphStyle::Ascii, &data, &data, 2, 4);
+        for y in [1, 2] {
+            assert_eq!(grid[y][0].0, ASCII_RAMP[0].to_string(), "row {y}");
+            assert_eq!(grid[y][1].0, ASCII_RAMP[1].to_string(), "row {y}");
+        }
+    }
+
+    /// Backlog 6: history that has not been collected is not a reading of 0,
+    /// and neither is a sample the backend could not read.
+    #[test]
+    fn windowed_pads_with_unknown_rather_than_zero() {
+        let data = [Some(10), None, Some(0)];
+        // Exactly one window's worth: every sample straight through.
         assert_eq!(
-            mini_spark(&[100, 100, 100, 100, 100], 100, GraphStyle::Ascii),
-            "#####"
+            (0..3).map(|i| windowed(&data, i, 3)).collect::<Vec<_>>(),
+            vec![Some(10), None, Some(0)]
         );
+        // Narrower window: right-aligned on the newest samples.
+        assert_eq!(windowed(&data, 0, 2), None);
+        assert_eq!(windowed(&data, 1, 2), Some(0));
+        // Wider than the history: the left pad is unknown, not a flat zero
+        // line, so a fresh gpur starts dim and colors in from the right.
+        assert_eq!(
+            (0..5).map(|i| windowed(&data, i, 5)).collect::<Vec<_>>(),
+            vec![None, None, Some(10), None, Some(0)]
+        );
+        let empty: [Option<u64>; 0] = [];
+        assert_eq!(windowed(&empty, 0, 3), None);
+    }
+
+    /// A theme pinned to truecolor. The waveform tests compare a cell's color
+    /// against `t.dim`'s, and 16-color quantization can land the dim gray and
+    /// a gradient stop on the same index, which would make the comparison
+    /// meaningless rather than merely different.
+    fn color_theme() -> UiTheme {
+        crate::theme::load(None, crate::theme::ColorMode::Truecolor).unwrap()
+    }
+
+    /// Render a mirrored waveform and return (symbol, style) per cell, by row.
+    fn waveform_grid(
+        t: &UiTheme,
+        style: GraphStyle,
+        up: &[Option<u64>],
+        down: &[Option<u64>],
+        w: u16,
+        h: u16,
+    ) -> Vec<Vec<(String, Style)>> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw_waveform(f, f.area(), up, down, t, style))
+            .unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .filter_map(|x| {
+                        buf.cell((x, y))
+                            .map(|c| (c.symbol().to_string(), c.style()))
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The point of backlog 6: a column the backend could not read draws as a
+    /// dim sliver, and a column it read as 0 keeps its gradient color. Both
+    /// halves, all three glyph sets — an honest graph in one style and a
+    /// fabricated zero in another would be no better than before.
+    #[test]
+    fn waveform_draws_unknown_dim_and_a_measured_zero_in_color() {
+        let t = color_theme();
+        let dim = t.dim.fg.expect("a truecolor dim style has a foreground");
+        for style in [GraphStyle::Braille, GraphStyle::Block, GraphStyle::Ascii] {
+            // Braille packs two samples per column, so it needs two per cell.
+            let data: Vec<Option<u64>> = if style == GraphStyle::Braille {
+                vec![None, None, Some(0), Some(0)]
+            } else {
+                vec![None, Some(0)]
+            };
+            // 4 rows: the edge labels sit on rows 0 and 3, the midline
+            // slivers on row 1 (up half) and row 2 (down half).
+            let grid = waveform_grid(&t, style, &data, &data, 2, 4);
+            for y in [1, 2] {
+                let (unknown_sym, unknown) = grid[y][0].clone();
+                let (zero_sym, zero) = grid[y][1].clone();
+                assert_eq!(
+                    unknown.fg,
+                    Some(dim),
+                    "{style:?} row {y}: unknown column not dim ({unknown_sym:?})"
+                );
+                assert_ne!(
+                    zero.fg,
+                    Some(dim),
+                    "{style:?} row {y}: a measured zero was greyed out ({zero_sym:?})"
+                );
+                assert_ne!(
+                    zero.bg,
+                    Some(dim),
+                    "{style:?} row {y}: a measured zero was greyed out in the background"
+                );
+                // A sliver, not a gap: the trace stays continuous so a dim run
+                // reads as "no data" rather than as a hole in the widget.
+                assert_ne!(
+                    unknown_sym.trim(),
+                    "",
+                    "{style:?} row {y}: unknown column drew nothing"
+                );
+                assert_ne!(zero_sym.trim(), "", "{style:?} row {y}: zero drew nothing");
+                // The down half hangs its sliver from the top of the cell,
+                // and block mode cannot use the complement trick there: the
+                // dim has to be in the foreground to be a foreground check.
+                if style == GraphStyle::Block && y == 2 {
+                    assert_eq!(unknown_sym, UPPER_EIGHTH.to_string());
+                }
+                // Ascii carries the distinction in the glyph as well, since
+                // it is the style used where color and DIM may not land.
+                if style == GraphStyle::Ascii {
+                    assert_ne!(
+                        unknown_sym, zero_sym,
+                        "row {y}: ascii leaned on style alone"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `NO_COLOR=1` / `TERM=dumb`: `t.dim` is nothing but `Modifier::DIM`,
+    /// and the terminals that need `--graphs ascii` in the first place are
+    /// the ones least likely to render DIM as anything at all. So the ascii
+    /// waveform has to separate an unreadable sample from a measured zero
+    /// with no color and no styling in evidence — by symbol.
+    #[test]
+    fn mono_ascii_separates_unknown_from_a_measured_zero_by_symbol_alone() {
+        let t = crate::theme::load(None, crate::theme::ColorMode::Mono).unwrap();
+        assert_eq!(t.dim.fg, None, "mono dim has no color to lean on");
+        let data = [None, Some(0)];
+        let grid = waveform_grid(&t, GraphStyle::Ascii, &data, &data, 2, 4);
+        for y in [1, 2] {
+            let (unknown, zero) = (grid[y][0].0.clone(), grid[y][1].0.clone());
+            assert_eq!(unknown, "_", "row {y}");
+            assert_eq!(zero, ".", "row {y}");
+            assert_ne!(
+                unknown, zero,
+                "row {y}: mono ascii drew an unreadable sample and a measured \
+                 zero as the same cell"
+            );
+        }
+    }
+
+    /// One foreground per cell against two samples per cell: dim only when
+    /// there is nothing known in the cell to grey out.
+    #[test]
+    fn a_braille_cell_dims_only_when_all_its_samples_are_unknown() {
+        let t = color_theme();
+        let dim = t.dim.fg.expect("a truecolor dim style has a foreground");
+        // Column 0: both unknown. Column 1: one of each. Column 2: both known.
+        let data = vec![None, None, None, Some(50), Some(50), Some(50)];
+        let grid = waveform_grid(&t, GraphStyle::Braille, &data, &data, 3, 4);
+        for y in [1, 2] {
+            assert_eq!(grid[y][0].1.fg, Some(dim), "row {y}: all-unknown not dim");
+            assert_ne!(
+                grid[y][1].1.fg,
+                Some(dim),
+                "row {y}: a cell holding a known sample was greyed out"
+            );
+            // ...and the mixed cell really was drawn, so the check above is
+            // not passing on an untouched cell.
+            assert_ne!(grid[y][1].0.trim(), "", "row {y}: mixed cell drew nothing");
+            assert_ne!(grid[y][2].1.fg, Some(dim), "row {y}: known cell went dim");
+        }
+    }
+
+    /// The mini sparks are drawn wholly in `t.dim` by the caller, so dimming
+    /// cannot say anything there: an unknown sample has to be a gap in the
+    /// glyphs, and a measured zero has to keep its baseline glyph.
+    #[test]
+    fn mini_spark_leaves_a_gap_for_unknown_and_a_baseline_for_zero() {
+        let data = [Some(0), None, Some(50), None, Some(100)];
+        assert_eq!(mini_spark(&data, 100, GraphStyle::Ascii), "_ - #");
+        assert_eq!(mini_spark(&data, 100, GraphStyle::Block), "▁ ▄ █");
+        // Braille reads two samples per cell: cells 1 and 3 are wholly
+        // unknown and blank, the rest keep their dots.
+        let braille = [
+            Some(0),
+            Some(0),
+            None,
+            None,
+            Some(100),
+            Some(100),
+            None,
+            None,
+            Some(0),
+            Some(0),
+        ];
+        assert_eq!(mini_spark(&braille, 100, GraphStyle::Braille), "⣀ ⣿ ⣀");
     }
 }

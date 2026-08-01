@@ -83,12 +83,16 @@ impl SortBy {
     }
 }
 
+/// Per-device graph history. `None` is a sample the backend could not read,
+/// kept distinct from a measured `0` all the way to the glyph: the waveform
+/// draws an unknown column as a minimum sliver in the dim style rather than
+/// in the gradient, and `mini_spark` leaves it blank.
 #[derive(Default)]
 pub struct History {
-    pub util: Vec<u64>,
-    pub vram: Vec<u64>,
-    pub power: Vec<u64>,
-    pub temp: Vec<u64>,
+    pub util: Vec<Option<u64>>,
+    pub vram: Vec<Option<u64>>,
+    pub power: Vec<Option<u64>>,
+    pub temp: Vec<Option<u64>>,
 }
 
 /// What per-device state hangs off. Position is not identity: a device count
@@ -812,15 +816,15 @@ impl App {
             last_seen.insert(key.clone(), *polls);
             session.entry(key.clone()).or_default().add(gpu);
             let hist = history.entry(key.clone()).or_default();
-            // A waveform has no glyph for "unknown", so an unreadable metric
-            // records as a flat 0 line. The meter above it says `n/a`, which
-            // is where the distinction is actually made.
-            hist.util
-                .push(gpu.utilization_pct.unwrap_or(0.0).round() as u64);
-            hist.vram.push(gpu.vram_pct().unwrap_or(0.0).round() as u64);
-            hist.power.push(gpu.power_w.unwrap_or(0.0).round() as u64);
-            hist.temp
-                .push(gpu.temperature_c.unwrap_or(0.0).round() as u64);
+            // An unreadable metric is recorded as `None`, not as a 0: the
+            // waveform draws such a column as a dim minimum sliver and the
+            // mini sparks leave it blank, so the graph makes the same
+            // distinction the meter above it does with `n/a`.
+            let sample = |v: Option<f64>| v.map(|v| v.round() as u64);
+            hist.util.push(sample(gpu.utilization_pct));
+            hist.vram.push(sample(gpu.vram_pct()));
+            hist.power.push(sample(gpu.power_w));
+            hist.temp.push(sample(gpu.temperature_c));
             let overflow = hist.util.len().saturating_sub(cap);
             if overflow > 0 {
                 hist.util.drain(..overflow);
@@ -1433,7 +1437,7 @@ mod tests {
         }
     }
 
-    fn util_history(app: &App, idx: usize) -> Vec<u64> {
+    fn util_history(app: &App, idx: usize) -> Vec<Option<u64>> {
         app.history_at(idx).expect("history for card").util.clone()
     }
 
@@ -2009,6 +2013,40 @@ mod tests {
         });
     }
 
+    /// Backlog 6: the history ring has to carry the same distinction the
+    /// meters do. A metric the backend could not read is `None`; a metric it
+    /// read as empty is `Some(0)`, and the graph renders the two differently.
+    #[test]
+    fn history_separates_an_unreadable_sample_from_a_measured_zero() {
+        struct HalfSensored;
+        impl GpuBackend for HalfSensored {
+            fn name(&self) -> &'static str {
+                "half"
+            }
+            fn poll(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
+                Ok(vec![GpuSnapshot {
+                    device_id: Some("a".into()),
+                    // Unreadable: no utilization counter, no power sensor.
+                    utilization_pct: None,
+                    power_w: None,
+                    // Measured, and the measurement is zero.
+                    vram_used_bytes: Some(0),
+                    vram_total_bytes: Some(8 << 30),
+                    temperature_c: Some(0.0),
+                    ..Default::default()
+                }])
+            }
+        }
+
+        let mut app = app_with(Box::new(HalfSensored));
+        app.poll();
+        let h = app.history_at(0).expect("history for card");
+        assert_eq!(h.util, vec![None], "an unreadable utilization became a 0");
+        assert_eq!(h.power, vec![None], "a missing power sensor became a 0");
+        assert_eq!(h.vram, vec![Some(0)], "a measured-empty pool lost its 0");
+        assert_eq!(h.temp, vec![Some(0)], "a measured 0°C became unknown");
+    }
+
     /// The heart of it: a GPU that changes position between polls keeps its
     /// own waveform history and its own session peaks.
     #[test]
@@ -2022,9 +2060,9 @@ mod tests {
         app.poll();
 
         assert_eq!(app.gpus[0].name, "b");
-        assert_eq!(util_history(&app, 0), vec![90, 20]);
+        assert_eq!(util_history(&app, 0), vec![Some(90), Some(20)]);
         assert_eq!(app.session_at(0).unwrap().max_util_pct, Some(90.0));
-        assert_eq!(util_history(&app, 1), vec![10, 30]);
+        assert_eq!(util_history(&app, 1), vec![Some(10), Some(30)]);
         assert_eq!(app.session_at(1).unwrap().max_util_pct, Some(30.0));
     }
 
@@ -2041,10 +2079,10 @@ mod tests {
         app.poll();
 
         assert_eq!(app.gpus[1].name, "a");
-        assert_eq!(util_history(&app, 1), vec![10, 40]);
+        assert_eq!(util_history(&app, 1), vec![Some(10), Some(40)]);
         assert_eq!(app.session_at(1).unwrap().max_util_pct, Some(40.0));
         // And the device that stayed is untouched by the churn.
-        assert_eq!(util_history(&app, 0), vec![90, 20, 30]);
+        assert_eq!(util_history(&app, 0), vec![Some(90), Some(20), Some(30)]);
     }
 
     /// The cursor names a GPU, not a slot.
