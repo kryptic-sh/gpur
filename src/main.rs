@@ -70,12 +70,7 @@ fn main() -> Result<()> {
         })?,
     };
     let log = match &cli.log {
-        Some(path) => Some(std::io::BufWriter::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?,
-        )),
+        Some(path) => Some(std::io::BufWriter::new(open_log(path)?)),
         None => None,
     };
 
@@ -129,6 +124,29 @@ fn main() -> Result<()> {
     restore_extras();
     ratatui::restore();
     result
+}
+
+/// Open the `--log` sink, readable only by its owner where the platform has
+/// file modes. Every record carries the full process table — command lines,
+/// usernames, container ids (see `App::record`) — and argv routinely holds
+/// `--api-key=…`, `--token=…` or a database URL with its password in it.
+/// Created under the usual `umask 022` the file lands world-readable, and
+/// `--log` is meant to be left running for hours on exactly the kind of
+/// shared box where that matters.
+///
+/// `mode` applies only when the file is created, which is the behaviour we
+/// want: appending to a log the user already owns must not silently re-tighten
+/// permissions they may have relaxed on purpose. Windows has no equivalent
+/// knob here, so it simply opens as before.
+fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
 }
 
 /// Undo what we set up beyond ratatui's own raw-mode/alt-screen handling.
