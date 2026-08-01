@@ -8,6 +8,83 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-08-01
+
+A full-codebase review pass. Findings and the reasoning behind each fix are in
+`docs/code-review.md`; the suite grew from 170 to 178 tests, each one pinning a
+finding below.
+
+### Fixed
+
+- **An Intel GPU whose processes gpur could not read was drawn as a measured
+  `0%`.** Intel publishes no device-level busy counter, so utilization is summed
+  over the DRM clients found by the `/proc` fdinfo sweep — and `/proc/<pid>/fd`
+  is unreadable for every process another user owns. An unprivileged gpur
+  therefore painted a confident, meter-drawn `0%` over someone else's saturated
+  iGPU, and an empty GTT pool beside it. A device the sweep attributed no client
+  to now reports `n/a`; one whose clients were read and summed to zero keeps its
+  honest `0%`, so an idle GPU still draws an empty meter.
+- **The kill dialog could send SIGKILL while reporting SIGTERM.**
+  `Process::kill_with` answers `None` where the signal is unsupported — SIGTERM
+  on Windows — and the fallback was a plain `kill()`, which is `SIGKILL`. The
+  dialog asked about SIGTERM, the status line then said SIGTERM, and the process
+  was killed uncatchably. gpur now refuses and says the signal is unsupported;
+  escalating has to be the user's own keystroke.
+- **A failing `--replay` session could re-detect itself into live hardware.**
+  The five-consecutive-failure re-detect kept `--mock` but not `--replay`, so a
+  bare detect would have answered with this machine's backend — flipping
+  `can_signal()` from false to true and leaving a stranger's recorded pids aimed
+  at local processes. The whole choice is now carried in one value, and startup
+  and re-detect run the same call, so a re-detect can only reproduce the kind of
+  backend the session began with.
+- **The process cache grew for the life of the session.** `sysinfo` only evicts
+  pids from inside the set it is handed, and gpur hands it only the pids
+  currently on a GPU — so every short-lived job a node ever ran stayed cached
+  until gpur exited. Departed pids are now swept each poll, without the
+  all-processes refresh the narrow update set exists to avoid.
+- **CPU% was sampled faster than it can be measured.** `cpu_usage()` divides a
+  process's own jiffy delta by a `/proc/stat` delta `sysinfo` will not retake
+  inside 200 ms, so at `--tick-ms 50` four polls in five divided one tick of
+  process time by 200 ms of machine time. The CPU half of the refresh is now
+  rationed to that minimum; the column keeps its last value in between rather
+  than blanking.
+- Recorded process rows naming a GPU outside the replayed frame — a truncated or
+  hand-edited log — are dropped instead of drawn against a card that was never
+  recorded, matching the rule the composite backend already applies to its live
+  children.
+- Two card-height sums in the GPU pane wrapped `u16`: past 8191 cards the total
+  read as "everything fits", and a pane within one card of `u16::MAX` kept
+  admitting cards past its own bottom.
+
+### Security
+
+- **`--log` is created readable only by its owner** where the platform has file
+  modes. Every record carries the full process table — command lines, usernames,
+  container ids — and argv routinely holds `--api-key=`, `--token=` or a
+  database URL with its password in it. Under the usual `umask 022` the file
+  landed world-readable, on exactly the kind of shared machine where `--log` is
+  left running for hours. A log that already exists keeps the permissions its
+  owner gave it.
+- **`state.json` is published through a temp file and a rename.** `fs::write`
+  truncates first, so a crash, a `kill -9` or a full disk part way through left
+  a short file that the loader could only discard — silently, taking every fold,
+  sort key and poll rate with it. The quit path is where that was likeliest: the
+  signal handler exits without waiting for the save.
+
+### Changed
+
+- Graph history is retained per what the active glyph set can draw. Only braille
+  packs two samples into a terminal column, so `--graphs block` and
+  `--graphs ascii` were holding twice the samples any graph could ever show.
+- `pci.ids` is read at most once per process rather than once per card by each
+  Linux backend — a mixed AMD + Intel + nouveau rig re-read the same ~1.5 MB
+  several times over at probe. `fan_pct` and the multi-driver header line, both
+  duplicated verbatim between backends, now live beside the other shared sysfs
+  readers and have their first test coverage.
+- Unit-test fixtures no longer build fixed paths under the shared temp
+  directory. Concurrent `cargo test` runs raced on one directory, and the name
+  could be pre-created as a symlink the tests would then write through.
+
 ## [0.10.1] - 2026-07-28
 
 ### Changed
