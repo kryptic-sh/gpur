@@ -105,11 +105,20 @@ Whether a row of `n/a` beats an absent card is a product call, not a bug.
   was diagnosed from NVIDIA's documentation, not from an observation, and
   nothing in CI could have caught it or can confirm the fix.
 
-  The `hardware` modules in `intel.rs` and `amd.rs` are the half of this that
-  does not need CI: they run against whatever card the developer's machine has,
-  and skip otherwise. `GPUR_REQUIRE_AMD` / `GPUR_REQUIRE_AMD_APU` /
-  `GPUR_REQUIRE_AMD_DGPU` / `GPUR_REQUIRE_INTEL` are what a self-hosted runner
-  would set so the skip cannot become the permanent state.
+  **The Linux half is verified, by hand rather than by CI.** The `hardware`
+  modules in `intel.rs` and `amd.rs` run against whatever card the developer's
+  machine has and skip otherwise. Both have been run green on real silicon —
+  `amd.rs` on the amdgpu APU-plus-discrete machine this backlog is written on,
+  with `GPUR_REQUIRE_AMD`, `GPUR_REQUIRE_AMD_APU` and `GPUR_REQUIRE_AMD_DGPU`
+  all set; `intel.rs` on a separate Intel machine with `GPUR_REQUIRE_INTEL`. The
+  gates are not vacuous: setting `GPUR_REQUIRE_INTEL` on the AMD machine fails
+  the Intel suite outright rather than skipping it.
+
+  So what remains here is not that the Linux backends are unverified but that
+  **nothing enforces the verification** — the skip is still the default on any
+  machine, and NVIDIA, Windows and Apple have no equivalent live suite at all. A
+  self-hosted runner setting those variables is what makes the pass a standing
+  guarantee rather than a thing someone remembered to do.
 
 - **What the AMD hardware tests still do not reach**, on the machine they were
   written against (an amdgpu APU plus an amdgpu discrete card):
