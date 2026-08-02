@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-02
+
 ### Changed
 
 - **The `/proc` fdinfo sweep runs on a worker thread, and once per poll rather
@@ -716,7 +718,12 @@ whose "Settled by review" section records what was checked and still holds.
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.12.0
+[0.11.1]: https://github.com/kryptic-sh/gpur/releases/tag/v0.11.1
+[0.11.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.11.0
+[0.10.3]: https://github.com/kryptic-sh/gpur/releases/tag/v0.10.3
+[0.10.2]: https://github.com/kryptic-sh/gpur/releases/tag/v0.10.2
 [0.10.1]: https://github.com/kryptic-sh/gpur/releases/tag/v0.10.1
 [0.10.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.10.0
 [0.9.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.9.0
