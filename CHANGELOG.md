@@ -8,6 +8,18 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **The `hjkl-*` dependencies moved from 0.33 to 0.40** — `hjkl-config`,
+  `hjkl-keymap`, `hjkl-keymap-tui`, `hjkl-kitty`, `hjkl-splash` and
+  `hjkl-theme`. No call site changed: every symbol gpur uses is unchanged, and
+  the one removal in the range (`hjkl_config::write_default`) was never called
+  here. `hjkl-config` now resolves XDG paths through the new `hjkl-xdg` crate
+  rather than inline, with the same policy — `~/.config/gpur` and
+  `~/.cache/gpur` are where they were, and `XDG_CONFIG_HOME` / `XDG_CACHE_HOME`
+  are still honoured. Packagers should note three new transitive dependencies:
+  `hjkl-fs`, `hjkl-xdg` and `toml_edit`.
+
 ## [0.12.0] - 2026-08-02
 
 ### Changed

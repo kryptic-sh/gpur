@@ -741,21 +741,34 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hjkl-config"
-version = "0.33.6"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26b670dba2452811735324b288426859e6cb742ffefea9c1968c773a821cb482"
+checksum = "1b4afb0c95315317fc29f4cf1b49d634e77eb2ea2ff57eb8b1d3cb351dc43c90"
 dependencies = [
- "dirs",
+ "hjkl-fs",
+ "hjkl-xdg",
  "serde",
  "thiserror 2.0.19",
  "toml",
+ "toml_edit",
+]
+
+[[package]]
+name = "hjkl-fs"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83f94ff47097167e3566653f14dec708f57e621c4672dc72cce51154fbf3f176"
+dependencies = [
+ "hjkl-xdg",
+ "libc",
+ "windows-sys",
 ]
 
 [[package]]
 name = "hjkl-keymap"
-version = "0.33.6"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a08861185ec7fcb6ffcd8a89777483e7d8ef093fa8bb19f53639863b8546420b"
+checksum = "2163efe7edf1f15978c6295bbfcf847a026f951e22f38f75812662becfa28016"
 dependencies = [
  "bitflags 2.13.1",
  "thiserror 2.0.19",
@@ -763,9 +776,9 @@ dependencies = [
 
 [[package]]
 name = "hjkl-keymap-tui"
-version = "0.33.6"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea9426b59293cd76b8b9e9f147976bd3b5f6951a79393d2345758d219485ca58"
+checksum = "983f4efb48e3e475b76b198870fdce56b8795bf31b9a3f3469da9bfaffc4d65a"
 dependencies = [
  "crossterm",
  "hjkl-keymap",
@@ -773,28 +786,38 @@ dependencies = [
 
 [[package]]
 name = "hjkl-kitty"
-version = "0.33.6"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c22cbce87de9c6b44ac9d5185a8ed36dd6f203528b6a9db8b49072f6af9602a"
+checksum = "b48f956e14e268c17d66a721e95f90f0cd73133c08196b3317198161f53f84c9"
 dependencies = [
  "crossterm",
 ]
 
 [[package]]
 name = "hjkl-splash"
-version = "0.33.6"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bb0c02144b2b3d09ad4cf9b5f1f627424331f60a0b1e1dd8c72fa67dd3a0000"
+checksum = "8ce5658b86130d9eb9ba4e114c663ffa7bdf14e5306aae852039798333be3bc9"
 
 [[package]]
 name = "hjkl-theme"
-version = "0.33.6"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "742ed505c93f44aa605def19ac1ccf1ed7e379427e3dbd62fa4e7637f6715ba8"
+checksum = "85f8e7c6f53c396978e9cb4388b0222213b61d8e7274f06da8ea940a20931e28"
 dependencies = [
  "serde",
  "thiserror 2.0.19",
  "toml",
+]
+
+[[package]]
+name = "hjkl-xdg"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "034ff02e51edbcaf4b975cddeaeafef12515500d923e65f07a40e5f2442606c6"
+dependencies = [
+ "dirs",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -2039,6 +2062,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_edit"
+version = "0.25.13+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
+dependencies = [
+ "indexmap",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
 name = "toml_parser"
 version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2426,6 +2462,9 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "winreg"
