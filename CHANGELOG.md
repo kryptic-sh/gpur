@@ -10,6 +10,21 @@ and this project adheres to
 
 ### Changed
 
+- **The `/proc` fdinfo sweep runs on a worker thread, and once per poll rather
+  than once per vendor.** The Linux backends read per-process GPU state by
+  walking every process's DRM fds, which ran inside `App::poll` — so
+  `event::poll` could not run during it and keystrokes queued behind it. On a
+  machine with thousands of processes at `--tick-ms 100` the walk can outlast
+  the tick and the UI stops answering the keyboard. A `ProcScanner` thread now
+  owns the walk and the render thread reads the newest finished one. The walk is
+  also vendor-agnostic now, so an AMD + Intel box takes one walk per tick
+  instead of one per backend, each of which used to discard the other's clients.
+  Per-process figures can lag by up to one poll as a result; they are not
+  smeared by it, because a utilization is measured between the two walks' own
+  timestamps rather than against the clock when the backend got to them.
+  `--once` and `--json` keep walking on the polling thread, since they report
+  the delta across one known sleep and both walks have to bracket it.
+
 - **The MEM meter now shows the memory a card actually spends, and says when
   those bytes are system RAM.** An Intel iGPU has no local pool, so `vram_*` is
   `None` and the meter read `MEM n/a` beside a card demonstrably holding memory;

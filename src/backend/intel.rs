@@ -26,8 +26,8 @@ pub(crate) fn claimed_ids(drm: &str) -> Vec<String> {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use crate::backend::linux::{
-        self, ClientSample, FdClient, SweepDevice, card_name, cards_with_driver, first_dir,
-        hwmon_u64, pdev_of, read_u64,
+        self, ClientSample, FdClient, ProcSnapshot, SweepCursor, SweepDevice, card_name,
+        cards_with_driver, first_dir, hwmon_u64, pdev_of, read_u64,
     };
     use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, clamp_pct};
     use anyhow::Result;
@@ -55,6 +55,8 @@ mod linux_impl {
             i915_state: HashMap::new(),
             xe_state: HashMap::new(),
             energy_state: HashMap::new(),
+            cursor: SweepCursor::default(),
+            buckets: IntelBuckets::default(),
             last_procs: Vec::new(),
         })
     }
@@ -89,15 +91,24 @@ mod linux_impl {
         xe_state: HashMap<(u32, u64), FdClient>,
         /// gpu index -> (energy µJ, at) for power-from-energy deltas.
         energy_state: HashMap<usize, (u64, Instant)>,
-        /// Built during poll (same fdinfo sweep), served by processes().
+        /// This backend's place in the shared scanner's stream of /proc walks.
+        cursor: SweepCursor,
+        /// The last attributed walk's figures, and the process rows served by
+        /// `processes()`. Kept rather than recomputed because a poll can find
+        /// no new walk to attribute — see `attribute`.
+        buckets: IntelBuckets,
         last_procs: Vec<GpuProcess>,
     }
 
-    /// One fdinfo sweep, with the per-device buckets only Intel keeps: memory
-    /// split by where it lives, and the evidence that the sweep saw the device
-    /// at all.
-    struct IntelSweep {
-        sweep: linux::Sweep,
+    /// What one fdinfo sweep says about each device: the shared per-device
+    /// sums, plus the two things only Intel keeps — memory split by where it
+    /// lives, and the evidence that the sweep saw the device at all.
+    #[derive(Default)]
+    struct IntelBuckets {
+        /// gpu index -> summed client utilization %.
+        util: HashMap<usize, f64>,
+        /// gpu index -> summed client video-engine utilization %.
+        video_util: HashMap<usize, f64>,
         /// gpu index -> summed client-resident device-local (VRAM) bytes.
         local_mem: HashMap<usize, u64>,
         /// gpu index -> summed system-backed (GTT-equivalent) bytes.
@@ -116,14 +127,18 @@ mod linux_impl {
 
         fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
             // One fdinfo sweep feeds device utilization AND the process table.
-            let mut s = self.sweep_clients();
-            self.last_procs = std::mem::take(&mut s.sweep.procs);
+            // It runs against whatever walk the shared scanner has finished; a
+            // poll that finds no new one redraws the last figures.
+            if let Some(snap) = self.cursor.next() {
+                self.attribute(&snap);
+            }
 
             let now = Instant::now();
             let powers: Vec<Option<f64>> = (0..self.devices.len())
                 .map(|i| self.power_w(i, now))
                 .collect();
             let sys_mem_total = self.sys_mem_total;
+            let s = &self.buckets;
             let gpus = self
                 .devices
                 .iter()
@@ -142,10 +157,10 @@ mod linux_impl {
                         integrated: !d.discrete,
                         // Summed over this device's DRM clients — the only
                         // busy figure Intel offers.
-                        utilization_pct: attributed_sum(attributed, s.sweep.util.remove(&i))
+                        utilization_pct: attributed_sum(attributed, s.util.get(&i).copied())
                             .map(clamp_pct),
                         mem_util_pct: None,
-                        video_util_pct: s.sweep.video_util.remove(&i).map(clamp_pct),
+                        video_util_pct: s.video_util.get(&i).copied().map(clamp_pct),
                         enc_util_pct: None,
                         dec_util_pct: None,
                         throttle: None,
@@ -155,7 +170,7 @@ mod linux_impl {
                         // VRAM pool that the device does not have.
                         vram_used_bytes: d
                             .vram_total
-                            .and_then(|_| attributed_sum(attributed, s.local_mem.remove(&i))),
+                            .and_then(|_| attributed_sum(attributed, s.local_mem.get(&i).copied())),
                         // None, never 0: mainline i915 publishes no total.
                         vram_total_bytes: d.vram_total,
                         temperature_c: hwmon_u64(h, "temp1_input").map(|v| v as f64 / 1000.0),
@@ -173,7 +188,7 @@ mod linux_impl {
                         // System-RAM-backed graphics memory. This is the only
                         // memory an iGPU has, and the UI renders it exactly
                         // like amdgpu's GTT pool.
-                        gtt_used_bytes: attributed_sum(attributed, s.system_mem.remove(&i)),
+                        gtt_used_bytes: attributed_sum(attributed, s.system_mem.get(&i).copied()),
                         gtt_total_bytes: sys_mem_total,
                         ..Default::default()
                     }
@@ -195,8 +210,14 @@ mod linux_impl {
     }
 
     impl IntelBackend {
-        /// Scan all processes' Intel DRM clients once, via the shared sweep.
-        fn sweep_clients(&mut self) -> IntelSweep {
+        /// Attribute one /proc walk: refreshes the per-device figures and the
+        /// process rows.
+        ///
+        /// Only ever called with a walk this backend has not seen before. A
+        /// poll that re-derived the same one would divide every i915 counter
+        /// delta by a zero interval and report each card idle, so the caller
+        /// redraws the previous figures instead.
+        fn attribute(&mut self, snap: &ProcSnapshot) {
             let devices: Vec<SweepDevice> = self
                 .devices
                 .iter()
@@ -211,11 +232,14 @@ mod linux_impl {
             let mut system_mem: HashMap<usize, u64> = HashMap::new();
             let mut has_local: HashSet<usize> = HashSet::new();
             let mut attributed: HashSet<usize> = HashSet::new();
-            let now = Instant::now();
+            // The walk's own timestamp, not the clock at attribution: these
+            // counters were read when the walk ran, and dividing them by the
+            // interval since some later moment is a different measurement.
+            let now = snap.at;
             let i915_state = &mut self.i915_state;
             let xe_state = &mut self.xe_state;
 
-            let sweep = linux::sweep_clients(&devices, |pid, gpu, client| {
+            let mut sweep = linux::sweep_clients(snap, &devices, |pid, gpu, client| {
                 let key = (pid, client.id);
                 let (util, vutil) = if client.driver == "xe" {
                     let r = match xe_state.get(&key) {
@@ -265,12 +289,14 @@ mod linux_impl {
                 self.devices[gpu].discrete = true;
             }
 
-            IntelSweep {
-                sweep,
+            self.last_procs = std::mem::take(&mut sweep.procs);
+            self.buckets = IntelBuckets {
+                util: sweep.util,
+                video_util: sweep.video_util,
                 local_mem,
                 system_mem,
                 attributed,
-            }
+            };
         }
 
         /// Watts from the hwmon cumulative energy counter (µJ) delta, with a
@@ -426,8 +452,81 @@ mod linux_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::backend::linux::{parse_fdinfo, testing};
+        use crate::backend::linux::{ProcScanner, SweepCursor, parse_fdinfo, testing};
         use std::fs;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        /// One i915 client of the card at 00:02.0, with cumulative engine
+        /// counters as fdinfo prints them.
+        fn client(render_ns: u64, video_ns: u64) -> FdClient {
+            parse_fdinfo(&format!(
+                "drm-driver:\ti915\n\
+                 drm-client-id:\t7\n\
+                 drm-pdev:\t0000:00:02.0\n\
+                 drm-engine-render:\t{render_ns} ns\n\
+                 drm-engine-video:\t{video_ns} ns\n\
+                 drm-resident-system0:\t1048576\n"
+            ))
+            .unwrap()
+        }
+
+        /// The same two rules the AMD backend carries, and they bind harder
+        /// here: Intel has no device busy% in sysfs at all, so this sum IS the
+        /// card's utilization. A poll that re-derived the same walk would
+        /// divide identical counters by a zero interval and blank the gauge,
+        /// and one that measured against the clock at attribution rather than
+        /// against when the walk happened would peg it.
+        #[test]
+        fn utilization_spans_the_two_walks_and_survives_a_poll_without_one() {
+            let root = testing::tri_vendor("intel-async");
+            let scanner = ProcScanner::detached();
+            let devices = scan(&testing::drm(&root));
+            let mut b = IntelBackend {
+                devices,
+                sys_mem_total: Some(1 << 34),
+                i915_state: HashMap::new(),
+                xe_state: HashMap::new(),
+                energy_state: HashMap::new(),
+                cursor: SweepCursor::on(Arc::clone(&scanner)),
+                buckets: IntelBuckets::default(),
+                last_procs: Vec::new(),
+            };
+            let card = 0; // 00:02.0, the i915 card; 06:00.0 is the xe one
+
+            let t0 = Instant::now();
+            scanner.publish(vec![(10, client(0, 0))], t0);
+            let gpus = b.poll().unwrap();
+            assert_eq!(
+                gpus[card].utilization_pct,
+                Some(0.0),
+                "a first reading has no interval to divide by"
+            );
+
+            // A second later: 400 ms on render and 100 ms on the video engine,
+            // so the card was 50% busy over that second and 10% of it video.
+            scanner.publish(
+                vec![(10, client(400_000_000, 100_000_000))],
+                t0 + Duration::from_secs(1),
+            );
+            let gpus = b.poll().unwrap();
+            assert_eq!(gpus[card].utilization_pct, Some(50.0));
+            assert_eq!(gpus[card].video_util_pct, Some(10.0));
+            assert_eq!(gpus[card].gtt_used_bytes, Some(1 << 20));
+            let procs = b.processes();
+            assert_eq!(procs.len(), 1);
+            assert_eq!(procs[0].gpu_util_pct, Some(50.0));
+
+            // A poll with no new walk redraws the last figures. The card the
+            // sweep never saw stays unreadable rather than turning into a
+            // confident zero.
+            let gpus = b.poll().unwrap();
+            assert_eq!(gpus[card].utilization_pct, Some(50.0));
+            assert_eq!(gpus[card].video_util_pct, Some(10.0));
+            assert_eq!(gpus[card].gtt_used_bytes, Some(1 << 20));
+            assert_eq!(b.processes().len(), 1);
+            assert_eq!(gpus[1].utilization_pct, None, "no client on the xe card");
+        }
 
         /// Exactly the i915/xe cards, on a tree that also holds AMD and NVIDIA
         /// cards plus the render nodes and connectors that reach the same PCI
@@ -625,6 +724,10 @@ drm-resident-gtt:\t1024 KiB
         /// This machine's Intel backend, or `None` with a note saying why the
         /// caller is about to do nothing.
         fn intel() -> Option<IntelBackend> {
+            // These tests open DRM clients and then poll, so they are
+            // asserting on a walk that has to happen after the open — not on
+            // whichever one the worker thread last finished.
+            linux::ProcScanner::shared().set_synchronous(true);
             if let Some(b) = backend() {
                 return Some(b);
             }

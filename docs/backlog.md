@@ -47,27 +47,7 @@ composition wiring are covered by unit tests. That DXGI's `VendorId` matches
 `0x10DE`/`0x1002`/`0x8086` on a real adapter, and that NVML and DXGI agree on
 which cards exist, rest on inspection.
 
-## 2. The `/proc` sweep runs on the render thread
-
-**Severity: low.** `src/backend/linux.rs` `sweep_clients`, called from
-`App::poll` on the render loop.
-
-Each pid's `fd` directory is now walked once rather than once per driver
-(measured 4.2 ms against 7.8–9.9 ms over 588 pids), but the scan is still
-synchronous, so `event::poll` cannot run during it and keypresses queue. Fine at
-ordinary scale; on a 10k-process node at `--tick-ms 100` the sweep can exceed
-the tick.
-
-**And it multiplies per vendor.** Each Linux backend runs its own full `/proc`
-walk, so an AMD + Intel + nouveau box stats every fd of every process three
-times per tick, discarding the clients that belong to the other backends each
-time. Deduplicating means one sweep shared across children, which is a `mod.rs`
-design change rather than a per-backend fix.
-
-**Fix:** one shared sweep per poll, on a worker thread handing snapshots to the
-UI over a channel. Deliberately deferred — structural, not a bug fix.
-
-## 3. An NVIDIA card is still invisible when NVML is broken rather than absent
+## 2. An NVIDIA card is still invisible when NVML is broken rather than absent
 
 **Severity: low.** `src/backend/nvidia.rs`.
 
@@ -82,7 +62,7 @@ essentially nothing in sysfs — no busy counter, no VRAM, no hwmon in the usual
 place — so listing it would add a name and a PCI address and nothing else.
 Whether a row of `n/a` beats an absent card is a product call, not a bug.
 
-## 4. Remaining test gaps
+## 3. Remaining test gaps
 
 - **The kill path's signal branch.** Unit tests in `app.rs` cover every refusal
   and one successful signal against a spawned `sleep`, but no PTY test reaches
@@ -95,6 +75,20 @@ Whether a row of `n/a` beats an absent card is a product call, not a bug.
 - **Mouse kinds with no behaviour attached** — drag, middle and right button,
   and moves all fall to the `_ => None` arm. Untested because untested is what
   they are: there is nothing to assert yet.
+- **The threaded sweep reaches a real card only through the AMD backend.**
+  `the_worker_thread_feeds_the_backend_on_real_hardware` in `amd.rs` gives a
+  backend a `ProcScanner` wired the production way and asserts its own render
+  node reaches a row; `intel.rs` has no counterpart, so on Intel the worker path
+  is proven only against hand-published walks. The other hardware tests pin the
+  shared scanner to synchronous through `amd()` / `intel()`, deliberately — a
+  test that opens a client and polls is asserting on that client, so the walk
+  has to happen after the open. Worth adding the Intel twin next time that
+  machine is available.
+- **Nothing forces a refused thread spawn.** `ProcScanner::spawn_worker`
+  degrades to synchronous mode when the OS will not give it a thread, and that
+  degraded path is the one `synchronous_mode_walks_on_the_calling_thread` covers
+  — but the branch that chooses it is only reachable under thread exhaustion,
+  which no test creates.
 - **No CI job runs against real GPU hardware.** Inherent to hosted runners; the
   mitigation was fixture-testing every backend's pure parsers, which is why
   `windows.rs` and `apple.rs` have unit tests that run on any host. Closing it
@@ -142,7 +136,7 @@ Whether a row of `n/a` beats an absent card is a product call, not a bug.
     make a card hit its cap, so the branch that produces a label is never taken
     on an idle box.
 
-## 5. NVIDIA temperature threshold unread
+## 4. NVIDIA temperature threshold unread
 
 **Severity: low.** `Device::temperature_threshold()` is available in
 `nvml-wrapper 0.12.1` (`device.rs:4048`) and would let each card carry its own
@@ -161,7 +155,7 @@ the only temperature field ids in `nvml-wrapper-sys 0.9.1` are
 `NVML_FI_DEV_MEMORY_TEMP` (wired up) and the four `*_TLIMIT` margins, which are
 thresholds, not a hotspot reading.
 
-## 6. Device naming differs per backend
+## 5. Device naming differs per backend
 
 **Severity: low, cosmetic.** `nvidia.rs` gives the marketing name
 (`NVIDIA GeForce RTX 4090`), the Linux backends the pci.ids codename
@@ -172,7 +166,7 @@ brand. Fallbacks differ too: `NVIDIA GPU 0` (index) against
 **Fix:** settle on a convention — prefer the marketing name, fall back to the
 codename, always suffix the card or index — and apply it uniformly.
 
-## 7. Intel memory totals could come from the DRM query ioctl
+## 6. Intel memory totals could come from the DRM query ioctl
 
 **Severity: low, accuracy.** The Intel backend reads its system-pool total from
 `/proc/meminfo` `MemTotal`, which is exactly what i915 reports for its system
@@ -191,7 +185,7 @@ processes this user happens to be able to read.
 sysfs reads, plus opening a device node. **Fix:** worth it only if the free-VRAM
 figure on discrete Arc is wanted; the iGPU totals would not change.
 
-## 8. Residual YAGNI
+## 7. Residual YAGNI
 
 - `src/theme.rs:89` `UiTheme::temp_ok` is `pub` but used only by `temp_style` at
   `:173` in the same file, unlike its peers `temp_warn` / `temp_crit`. Narrowing
@@ -247,6 +241,31 @@ They are recorded so a later pass does not spend time re-deriving them.
 
 Recorded so they are not re-opened as findings.
 
+- **Per-process figures may be one poll old, and that is the trade the worker
+  thread buys.** `ProcScanner` publishes walks from another thread and the poll
+  reads the newest finished one, so a walk that lands mid-tick is drawn on the
+  following tick. Stale is not the same as wrong: a utilization is a cumulative
+  counter's delta divided by the interval between the two readings, and both
+  backends divide by `ProcSnapshot::at` — when the walk actually ran — rather
+  than by the clock at attribution. Measuring against attribution time is the
+  tempting simplification and it inflates: a walk delayed by a slow tick would
+  report a card that idled through it as pegged, which
+  `utilization_spans_the_two_walks_and_survives_a_poll_without_one` (in both
+  `amd.rs` and `intel.rs`) pins at 100% against the correct 50%/75%.
+- **A poll that finds no new walk redraws the last figures rather than
+  re-deriving them.** `SweepCursor` hands each walk to a backend once. Feeding
+  the same walk twice would divide identical counters by a zero interval and
+  report every process idle, so a walk running late would render as every card
+  flickering to 0% — worst exactly when the machine is busy enough to delay it.
+  The cached figures each backend keeps (`AmdBackend::media`, `IntelBuckets`)
+  exist for that, not as an optimisation.
+- **`--once` and `--json` keep the walk on the polling thread.** They poll twice
+  a known sleep apart and report the delta, so both walks have to bracket that
+  sleep; the newest-finished-walk rule would leave the sleep outside the
+  interval being measured and answer about a few milliseconds of the wrong
+  moment. `backend::sweep_on_poll_thread`, called from `main` when headless, is
+  the switch. There is no UI to keep responsive in that mode, so the thing the
+  worker exists to protect is not at stake.
 - **A record field cannot gain a `null` on one side only.** `--json` and `--log`
   are written from `ProcRow` and read back into `GpuProcess`, two types that
   line up only by field name, and `#[serde(default)]` covers a missing key but

@@ -22,8 +22,8 @@ pub(crate) fn claimed_ids(drm: &str) -> Vec<String> {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use crate::backend::linux::{
-        self, ClientSample, FdClient, SweepDevice, card_name, cards_with_driver, fan_pct,
-        first_dir, hwmon_u64, pdev_of, read_trim, read_u64,
+        self, ClientSample, FdClient, ProcSnapshot, SweepCursor, SweepDevice, card_name,
+        cards_with_driver, fan_pct, first_dir, hwmon_u64, pdev_of, read_trim, read_u64,
     };
     use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, clamp_pct};
     use anyhow::Result;
@@ -59,6 +59,8 @@ mod linux_impl {
             pcie_state: vec![None; devices.len()],
             devices,
             engine_state: HashMap::new(),
+            cursor: SweepCursor::default(),
+            media: HashMap::new(),
             last_procs: Vec::new(),
         })
     }
@@ -88,7 +90,13 @@ mod linux_impl {
         engine_state: HashMap<(u32, u64), EngineSample>,
         /// Per device: (rx count, tx count, sampled at) from `pcie_bw`.
         pcie_state: Vec<Option<(u64, u64, Instant)>>,
-        /// Built during poll's fdinfo sweep, served by processes().
+        /// This backend's place in the shared scanner's stream of /proc walks.
+        cursor: SweepCursor,
+        /// Last attribution's per-device media utilization, and the process
+        /// rows served by `processes()`. Both are kept rather than recomputed
+        /// because a poll can arrive with no new walk to attribute — see
+        /// `attribute`.
+        media: HashMap<usize, MediaUtil>,
         last_procs: Vec<GpuProcess>,
     }
 
@@ -137,11 +145,16 @@ mod linux_impl {
         }
 
         fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
-            // One fdinfo sweep per poll: per-process rows + device video util
-            // (sysfs has gpu_busy_percent but nothing for the VCN engines).
-            let media = self.sweep_clients();
+            // The fdinfo sweep gives the per-process rows and the device video
+            // util (sysfs has gpu_busy_percent but nothing for the VCN
+            // engines). It runs against whatever walk the shared scanner has
+            // finished; a poll that finds no new one keeps the last reading.
+            if let Some(snap) = self.cursor.next() {
+                self.attribute(&snap);
+            }
             let now = Instant::now();
             let pcie_state = &mut self.pcie_state;
+            let media = &self.media;
             Ok(self
                 .devices
                 .iter()
@@ -168,8 +181,14 @@ mod linux_impl {
     }
 
     impl AmdBackend {
-        /// Returns per-device media-engine utilization; refreshes last_procs.
-        fn sweep_clients(&mut self) -> HashMap<usize, MediaUtil> {
+        /// Attribute one /proc walk: refreshes the media-utilization map and
+        /// the process rows.
+        ///
+        /// Only ever called with a walk this backend has not seen before. A
+        /// poll that re-derived the same one would compute every counter delta
+        /// over a zero interval and report the whole machine idle, so the
+        /// caller redraws the previous result instead.
+        fn attribute(&mut self, snap: &ProcSnapshot) {
             let devices: Vec<SweepDevice> = self
                 .devices
                 .iter()
@@ -184,10 +203,13 @@ mod linux_impl {
             // amdgpu is the only driver naming the two ring classes apart, and
             // "never reported" has to stay distinguishable from 0%.
             let mut media: HashMap<usize, MediaUtil> = HashMap::new();
-            let now = Instant::now();
+            // The walk's own timestamp, not the clock at attribution: these
+            // counters were read when the walk ran, and dividing them by the
+            // interval since some later moment is a different measurement.
+            let now = snap.at;
             let engine_state = &mut self.engine_state;
 
-            let mut sweep = linux::sweep_clients(&devices, |pid, gpu, client| {
+            let mut sweep = linux::sweep_clients(snap, &devices, |pid, gpu, client| {
                 let engine_ns = client.total_engine_ns();
                 let video_ns = client.engine_ns_where(is_video_engine);
                 let enc_ns = client.engine_ns_where(is_enc_engine);
@@ -244,7 +266,7 @@ mod linux_impl {
             for (gpu, video) in sweep.video_util {
                 media.entry(gpu).or_default().video = video;
             }
-            media
+            self.media = media;
         }
     }
 
@@ -475,7 +497,10 @@ mod linux_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::backend::ProcKind;
         use crate::backend::linux::testing;
+        use std::sync::Arc;
+        use std::time::Duration;
 
         /// Exactly the AMD-driven cards, on a tree that also holds Intel and
         /// NVIDIA cards, an unbound 0x1002 device, and the render nodes and
@@ -530,6 +555,90 @@ mod linux_impl {
         /// Fake sysfs root for one test: unique per run, removed on drop.
         fn fake_sysfs(name: &str) -> testing::Sandbox {
             testing::Sandbox::new(name)
+        }
+
+        /// One amdgpu client of the card at 03:00.0, with cumulative engine
+        /// counters as fdinfo prints them.
+        fn client(gfx_ns: u64, dec_ns: u64) -> linux::FdClient {
+            linux::parse_fdinfo(&format!(
+                "drm-driver:\tamdgpu\n\
+                 drm-client-id:\t7\n\
+                 drm-pdev:\t0000:03:00.0\n\
+                 drm-engine-gfx:\t{gfx_ns} ns\n\
+                 drm-engine-dec:\t{dec_ns} ns\n"
+            ))
+            .unwrap()
+        }
+
+        /// A backend over a fake `/sys/class/drm`, reading walks from a
+        /// scanner the test publishes to by hand.
+        fn backend_on(root: &Path, scanner: &Arc<linux::ProcScanner>) -> AmdBackend {
+            let devices = scan(&testing::drm(root));
+            AmdBackend {
+                pcie_state: vec![None; devices.len()],
+                devices,
+                engine_state: HashMap::new(),
+                cursor: linux::SweepCursor::on(Arc::clone(scanner)),
+                media: HashMap::new(),
+                last_procs: Vec::new(),
+            }
+        }
+
+        /// The two rules that the walk moving off the poll thread turns on.
+        ///
+        /// A utilization is a cumulative counter's delta divided by the time
+        /// between the two readings, and those readings now happen on another
+        /// thread at times the poll does not choose. So the interval has to be
+        /// the one between the two WALKS: measuring against the clock at
+        /// attribution divides this walk's counters by an interval nothing was
+        /// sampled over, and reports a card that idled through a slow tick as
+        /// pegged.
+        ///
+        /// And a poll that finds no new walk has to redraw the last reading.
+        /// Re-attributing the same walk would divide identical counters by a
+        /// zero interval, so every card would drop to 0% whenever a walk ran
+        /// late — a flicker exactly when the machine is busiest.
+        #[test]
+        fn utilization_spans_the_two_walks_and_survives_a_poll_without_one() {
+            let root = testing::tri_vendor("amd-async");
+            let scanner = linux::ProcScanner::detached();
+            let mut b = backend_on(&root, &scanner);
+            let card = 0; // 03:00.0, the amdgpu card; 05:00.0 is the radeon one
+
+            // First walk: counters with nothing to subtract from yet.
+            let t0 = Instant::now();
+            scanner.publish(vec![(10, client(0, 0))], t0);
+            let gpus = b.poll().unwrap();
+            assert_eq!(
+                b.processes()[0].gpu_util_pct,
+                Some(0.0),
+                "a first reading has no interval to divide by"
+            );
+            assert_eq!(gpus[card].video_util_pct, Some(0.0));
+
+            // Second walk, a second later: 500 ms on gfx and 250 ms on the
+            // decoder, so 75% busy over that second and 25% of it video.
+            scanner.publish(
+                vec![(10, client(500_000_000, 250_000_000))],
+                t0 + Duration::from_secs(1),
+            );
+            let gpus = b.poll().unwrap();
+            // (pid, card, util, kind) — the whole row, since a cached row that
+            // kept its utilization while losing its pid would still be wrong.
+            let row = |b: &mut AmdBackend| {
+                let p = b.processes();
+                assert_eq!(p.len(), 1, "one client, one row");
+                (p[0].pid, p[0].gpu_index, p[0].gpu_util_pct, p[0].kind)
+            };
+            assert_eq!(row(&mut b), (10, card, Some(75.0), ProcKind::Graphics));
+            assert_eq!(gpus[card].video_util_pct, Some(25.0));
+            assert_eq!(gpus[card].dec_util_pct, Some(25.0));
+
+            // A poll with no new walk: the same figures, not a fresh zero.
+            let gpus = b.poll().unwrap();
+            assert_eq!(row(&mut b), (10, card, Some(75.0), ProcKind::Graphics));
+            assert_eq!(gpus[card].video_util_pct, Some(25.0));
+            assert_eq!(gpus[card].dec_util_pct, Some(25.0));
         }
 
         #[test]
@@ -692,6 +801,10 @@ drm-engine-enc:\t9770559248 ns
         /// This machine's AMD backend, or `None` with a note saying why the
         /// caller is about to do nothing.
         fn amd() -> Option<AmdBackend> {
+            // These tests open DRM clients and then poll, so they are
+            // asserting on a walk that has to happen after the open — not on
+            // whichever one the worker thread last finished.
+            linux::ProcScanner::shared().set_synchronous(true);
             if let Some(b) = backend() {
                 return Some(b);
             }
@@ -777,6 +890,52 @@ drm-engine-enc:\t9770559248 ns
                     None
                 }
             }
+        }
+
+        /// The threaded path, against a real card.
+        ///
+        /// Every other hardware test pins the shared scanner to synchronous so
+        /// that a client it opened is in the very next walk — which means none
+        /// of them exercises the worker, and the worker is what ships. This one
+        /// gives the backend a scanner wired the production way and asserts the
+        /// rows arrive anyway: not on the first poll necessarily, since the
+        /// walk is off this thread, but within a bounded number of them.
+        #[test]
+        fn the_worker_thread_feeds_the_backend_on_real_hardware() {
+            let Some(mut b) = amd() else { return };
+            b.cursor = linux::SweepCursor::on(linux::ProcScanner::detached_with_worker());
+            let all: Vec<usize> = (0..b.devices.len()).collect();
+            let held = hold_clients(&b, &all);
+            if held.opened.is_empty() {
+                eprintln!("note: no render node could be opened on this machine");
+                return;
+            }
+
+            let me = std::process::id();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut polls = 0;
+            let mut mine: Vec<usize> = Vec::new();
+            while Instant::now() < deadline {
+                b.poll().unwrap();
+                polls += 1;
+                mine = b
+                    .processes()
+                    .iter()
+                    .filter(|p| p.pid == me)
+                    .map(|p| p.gpu_index)
+                    .collect();
+                mine.sort_unstable();
+                if mine == held.opened {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            assert_eq!(
+                mine, held.opened,
+                "after {polls} polls the worker had not delivered a walk \
+                 containing this test's own clients"
+            );
         }
 
         /// Serializes the tests that open render nodes against each other.

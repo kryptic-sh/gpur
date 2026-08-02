@@ -43,6 +43,11 @@ fn main() -> Result<()> {
     // Headless output must not depend on what a human once did in the TUI:
     // sort/fold state is a UI preference, not part of the data.
     let headless = cli.once || cli.json;
+    if headless {
+        // One-shot output is a measurement, not a stream: the two polls have
+        // to bracket the sleep between them.
+        backend::sweep_on_poll_thread();
+    }
     // Precedence: CLI flag > last-used (persisted state) > config default.
     // Only an *interactively* chosen rate is "last-used" — otherwise the
     // state file shadows config.toml forever after the first run.

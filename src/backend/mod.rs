@@ -254,6 +254,22 @@ pub trait GpuBackend {
     }
 }
 
+/// Sample per-process GPU state on the polling thread rather than off it.
+///
+/// The Linux backends read per-process telemetry by walking `/proc`, which a
+/// worker thread does in the background so a poll never blocks the keyboard.
+/// A one-shot run wants the opposite: `--once` and `--json` take two polls a
+/// known sleep apart and report the delta, so both walks have to happen when
+/// the poll asks rather than whenever the worker last got to it, or the
+/// interval reported is not the interval that was waited out. No UI is running
+/// in that mode, so there is nothing for the walk to block.
+///
+/// A no-op on platforms whose backends do not sweep `/proc`.
+pub fn sweep_on_poll_thread() {
+    #[cfg(target_os = "linux")]
+    linux::ProcScanner::shared().set_synchronous(true);
+}
+
 const NO_BACKEND: &str = "no supported GPU backend found (run with --mock to demo the UI)";
 
 /// PCI vendor ids, as DXGI's `AdapterDesc1.VendorId` and lspci report them.

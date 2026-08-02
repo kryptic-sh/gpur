@@ -10,8 +10,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub const PCI_IDS_PATHS: &[&str] = &["/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"];
 /// DRM character-device major.
@@ -146,15 +147,42 @@ pub struct Sweep {
     pub seen: HashSet<(u32, u64)>,
 }
 
-/// Walk every process's DRM clients once, attribute each to a device by
-/// `drm-pdev`, and aggregate. Backends differ only in how one client's
-/// utilization and memory are derived, which is what `per_client(pid, gpu,
-/// client)` supplies — it gets the pid because both backends key their
-/// counter-delta state on (pid, drm-client-id).
+/// Every DRM client of every process this user can read, as one walk of
+/// `/proc`, with no vendor filtering applied.
+///
+/// Vendor-agnostic on purpose. The walk is the expensive half — a readdir,
+/// a stat per fd and a read per DRM fd, measured at 4.2 ms over 588 pids —
+/// while deciding which card a client belongs to is a string compare. Each
+/// Linux backend used to do its own full walk and throw away every client
+/// belonging to a sibling, so an AMD + Intel + nouveau box paid that 4.2 ms
+/// three times a tick to produce the identical set of clients. One walk feeds
+/// all of them.
+pub struct ProcSnapshot {
+    /// (pid, client). A process appears once per DRM client it holds.
+    pub clients: Vec<(u32, FdClient)>,
+    /// When the walk finished.
+    ///
+    /// Load-bearing, not diagnostic: the fdinfo engine counters are cumulative,
+    /// so a utilization is a counter delta over the wall-clock between the two
+    /// readings. Attribution now runs later than collection and by a margin
+    /// that varies, so measuring against `Instant::now()` at attribution time
+    /// would divide this snapshot's counters by an interval they were never
+    /// sampled over. Every caller stamps its delta state with this instead.
+    pub at: Instant,
+    /// Increments once per completed walk. A backend re-attributes only when
+    /// this moves; see [`SweepCursor`].
+    pub seq: u64,
+}
+
+/// Attribute a snapshot's clients to a backend's devices and aggregate.
+/// Backends differ only in how one client's utilization and memory are
+/// derived, which is what `per_client(pid, gpu, client)` supplies — it gets
+/// the pid because both backends key their counter-delta state on
+/// (pid, drm-client-id).
 ///
 /// A client with several duplicated fds appears once per fd; it is counted
 /// once, keyed on (pid, drm-client-id).
-pub fn sweep_clients<F>(devices: &[SweepDevice], mut per_client: F) -> Sweep
+pub fn sweep_clients<F>(snap: &ProcSnapshot, devices: &[SweepDevice], mut per_client: F) -> Sweep
 where
     F: FnMut(u32, usize, &FdClient) -> ClientSample,
 {
@@ -162,25 +190,21 @@ where
     // (pid, gpu) -> aggregated stats across that process's DRM clients.
     let mut agg: HashMap<(u32, usize), (f64, u64, bool)> = HashMap::new();
 
-    for pid in proc_pids() {
-        // One walk of each pid's fd dir, however many drivers are in play: the
-        // readdir+stat+read cost is per fd, so a pass per driver name paid it
-        // again for every fd the process holds.
-        for client in drm_clients(pid) {
-            let Some(gpu) = client_device(devices, &client) else {
-                continue;
-            };
-            if !sweep.seen.insert((pid, client.id)) {
-                continue;
-            }
-            let s = per_client(pid, gpu, &client);
-            *sweep.util.entry(gpu).or_default() += s.util_pct;
-            *sweep.video_util.entry(gpu).or_default() += s.video_pct;
-            let e = agg.entry((pid, gpu)).or_insert((0.0, 0, false));
-            e.0 += s.util_pct;
-            e.1 += s.mem_bytes;
-            e.2 |= s.graphics;
+    for (pid, client) in &snap.clients {
+        let pid = *pid;
+        let Some(gpu) = client_device(devices, client) else {
+            continue;
+        };
+        if !sweep.seen.insert((pid, client.id)) {
+            continue;
         }
+        let s = per_client(pid, gpu, client);
+        *sweep.util.entry(gpu).or_default() += s.util_pct;
+        *sweep.video_util.entry(gpu).or_default() += s.video_pct;
+        let e = agg.entry((pid, gpu)).or_insert((0.0, 0, false));
+        e.0 += s.util_pct;
+        e.1 += s.mem_bytes;
+        e.2 |= s.graphics;
     }
 
     sweep.procs = agg
@@ -190,6 +214,272 @@ where
         })
         .collect();
     sweep
+}
+
+/// Walk every readable process's DRM clients once.
+fn scan_proc(seq: u64) -> ProcSnapshot {
+    let mut clients = Vec::new();
+    for pid in proc_pids() {
+        // One walk of each pid's fd dir, however many drivers are in play: the
+        // readdir+stat+read cost is per fd, so a pass per driver name paid it
+        // again for every fd the process holds.
+        clients.extend(drm_clients(pid).into_iter().map(|c| (pid, c)));
+    }
+    ProcSnapshot {
+        clients,
+        at: Instant::now(),
+        seq,
+    }
+}
+
+/// How long a caller waits for the first walk before giving up on it.
+///
+/// Only a caller that has nothing at all to fall back on ever waits, and only
+/// because there is genuinely nothing to show until one walk has finished. The
+/// bound exists so that a worker that never publishes — killed, or wedged on a
+/// pathological `/proc` — costs one late frame rather than a frozen UI.
+const FIRST_SCAN_WAIT: Duration = Duration::from_secs(2);
+
+/// The `/proc` walk, moved off the render thread.
+///
+/// The scan is synchronous I/O over every process on the machine, and it used
+/// to run inside `App::poll` — so `event::poll` could not run while it did and
+/// keystrokes queued behind it. On an ordinary desktop that is invisible; on a
+/// node with thousands of processes at `--tick-ms 100` the walk can outlast the
+/// tick, and the UI stops answering the keyboard.
+///
+/// So a worker thread owns the walk and the render thread only ever reads the
+/// most recent finished one. The cost is that a snapshot is up to one poll old
+/// by the time it is drawn. That is a delay, not an error: [`ProcSnapshot::at`]
+/// stamps when the counters were actually read, so the utilizations derived
+/// from it still cover the interval they were sampled over.
+///
+/// Not every caller wants that trade — see [`ProcScanner::set_synchronous`].
+pub struct ProcScanner {
+    state: Mutex<ScanState>,
+    /// Signals the worker that someone wants a fresh walk.
+    wanted: Condvar,
+    /// Signals waiters that a walk has been published.
+    published: Condvar,
+    /// Walk on the calling thread and return only when it is done. See
+    /// [`ProcScanner::set_synchronous`].
+    synchronous: AtomicBool,
+}
+
+#[derive(Default)]
+struct ScanState {
+    latest: Option<Arc<ProcSnapshot>>,
+    /// A walk has been asked for and not yet started.
+    wanted: bool,
+    /// Walks completed, which is also the last published snapshot's `seq`.
+    seq: u64,
+}
+
+impl ProcScanner {
+    /// The one scanner, and the one worker thread, for this process. Shared
+    /// rather than per backend: two backends asking on the same tick is
+    /// exactly the duplicate walk this exists to remove.
+    pub fn shared() -> &'static Arc<ProcScanner> {
+        static SCANNER: OnceLock<Arc<ProcScanner>> = OnceLock::new();
+        SCANNER.get_or_init(|| {
+            let scanner = Arc::new(ProcScanner::new());
+            scanner.spawn_worker();
+            scanner
+        })
+    }
+
+    fn new() -> ProcScanner {
+        ProcScanner {
+            state: Mutex::new(ScanState {
+                // The first walk is wanted before anyone asks for it, so the
+                // worker starts on it while the UI is still drawing its first
+                // frame rather than after the first poll asks.
+                wanted: true,
+                ..ScanState::default()
+            }),
+            wanted: Condvar::new(),
+            published: Condvar::new(),
+            synchronous: AtomicBool::new(false),
+        }
+    }
+
+    /// Start the worker, degrading to synchronous mode if the OS refuses the
+    /// thread.
+    ///
+    /// Without that fallback a refused spawn is worse than never having had a
+    /// worker: nothing would ever publish, so every `latest` would wait out
+    /// `FIRST_SCAN_WAIT` and return nothing, and the process table would be
+    /// permanently empty behind a UI that stalls once per tick. Walking on the
+    /// calling thread is what this code did before the worker existed — a UI
+    /// that stutters beats one that hangs and shows nothing.
+    fn spawn_worker(self: &Arc<Self>) {
+        let scanner = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("gpur-proc-sweep".into())
+            .spawn(move || scanner.run())
+            .is_ok();
+        if !spawned {
+            self.set_synchronous(true);
+        }
+    }
+
+    /// Walk on the calling thread instead, blocking until it finishes.
+    ///
+    /// For `--once` and `--json`, which have no UI to keep responsive and are
+    /// asked for one measurement rather than a stream of them. Those take two
+    /// polls a fixed sleep apart and report the delta between them, so the two
+    /// walks must bracket that sleep — a walk that merely happens to be the
+    /// newest one finished would leave the sleep outside the interval being
+    /// measured, and the answer would cover a few milliseconds of the wrong
+    /// moment.
+    ///
+    /// Also what the hardware tests use, for the same reason: a test that opens
+    /// a DRM client and polls is asserting on that client, so it needs the walk
+    /// to happen after the open rather than whenever a worker got to it.
+    pub fn set_synchronous(&self, on: bool) {
+        self.synchronous.store(on, Ordering::Relaxed);
+    }
+
+    /// The newest finished walk, and a request for another.
+    ///
+    /// Never blocks once a walk has landed — that is the whole point — so the
+    /// snapshot it returns may be the same one as last poll. Callers detect
+    /// that through `seq` rather than re-deriving identical numbers; see
+    /// [`SweepCursor`].
+    pub fn latest(&self) -> Option<Arc<ProcSnapshot>> {
+        if self.synchronous.load(Ordering::Relaxed) {
+            return Some(self.scan_here());
+        }
+        let mut st = self.lock();
+        st.wanted = true;
+        self.wanted.notify_one();
+        if st.latest.is_none() {
+            // Nothing has ever been published: there is no stale answer to
+            // fall back on, so this one call waits for the first walk.
+            let (guard, _) = self
+                .published
+                .wait_timeout_while(st, FIRST_SCAN_WAIT, |st| st.latest.is_none())
+                .unwrap_or_else(|e| e.into_inner());
+            st = guard;
+        }
+        st.latest.clone()
+    }
+
+    /// Walk on the calling thread and publish, advancing `seq` exactly as the
+    /// worker does so a cursor cannot tell the two apart.
+    fn scan_here(&self) -> Arc<ProcSnapshot> {
+        let seq = {
+            let mut st = self.lock();
+            st.seq += 1;
+            st.seq
+        };
+        let snap = Arc::new(scan_proc(seq));
+        self.lock().latest = Some(Arc::clone(&snap));
+        snap
+    }
+
+    /// Locks through a poisoned mutex rather than panicking. The only state
+    /// behind it is a snapshot and two counters — a thread that died mid-update
+    /// leaves them consistent, and refusing to read them afterwards would take
+    /// the process table down with the worker.
+    fn lock(&self) -> std::sync::MutexGuard<'_, ScanState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The worker loop: walk when asked, publish, wait to be asked again.
+    /// Idle between polls, so a paused UI costs nothing.
+    fn run(self: Arc<Self>) {
+        loop {
+            let mut st = self.lock();
+            while !st.wanted {
+                st = self.wanted.wait(st).unwrap_or_else(|e| e.into_inner());
+            }
+            st.wanted = false;
+            let seq = st.seq + 1;
+            drop(st);
+
+            let snap = Arc::new(scan_proc(seq));
+
+            let mut st = self.lock();
+            st.seq = seq;
+            st.latest = Some(snap);
+            self.published.notify_all();
+        }
+    }
+}
+
+/// Test hooks: a scanner with no worker thread, whose walks are supplied by
+/// hand. The worker publishes when it finishes a walk of the real `/proc`,
+/// which is neither deterministic nor a machine-independent input — so the
+/// behaviour that depends on *which* walk a caller gets is driven from here
+/// instead, and the worker gets its own test.
+#[cfg(test)]
+impl ProcScanner {
+    pub fn detached() -> Arc<ProcScanner> {
+        Arc::new(ProcScanner::new())
+    }
+
+    /// A scanner wired the way production wires it — its own worker walking
+    /// the real `/proc` — but separate from the shared one, whose mode the
+    /// hardware tests have already pinned to synchronous.
+    pub fn detached_with_worker() -> Arc<ProcScanner> {
+        let scanner = ProcScanner::detached();
+        scanner.spawn_worker();
+        scanner
+    }
+
+    /// Publish a walk as a finished one, advancing `seq` exactly as both real
+    /// producers do.
+    pub fn publish(&self, clients: Vec<(u32, FdClient)>, at: Instant) {
+        let mut st = self.lock();
+        st.seq += 1;
+        st.latest = Some(Arc::new(ProcSnapshot {
+            clients,
+            at,
+            seq: st.seq,
+        }));
+    }
+}
+
+/// One backend's place in the stream of snapshots: hands back a walk only
+/// when it is one this backend has not already attributed.
+///
+/// Two backends on one machine share the scanner but keep their own cursor,
+/// since each has its own delta state to advance. Returning `None` is not an
+/// error — it means no new walk has finished since the last poll, and the
+/// caller must redraw its previous reading. Re-deriving the same snapshot
+/// instead would divide the same counters by a zero interval and report every
+/// process as idle, so a slow walk would render as a GPU that flickers to 0%.
+pub struct SweepCursor {
+    scanner: Arc<ProcScanner>,
+    seen_seq: Option<u64>,
+}
+
+impl Default for SweepCursor {
+    fn default() -> Self {
+        SweepCursor::on(Arc::clone(ProcScanner::shared()))
+    }
+}
+
+impl SweepCursor {
+    /// A cursor over a specific scanner. The backends all take the shared one;
+    /// this is what lets a test drive a scanner of its own.
+    pub fn on(scanner: Arc<ProcScanner>) -> Self {
+        SweepCursor {
+            scanner,
+            seen_seq: None,
+        }
+    }
+
+    /// The newest walk, if it is newer than the one this cursor last returned.
+    pub fn next(&mut self) -> Option<Arc<ProcSnapshot>> {
+        let snap = self.scanner.latest()?;
+        if self.seen_seq == Some(snap.seq) {
+            return None;
+        }
+        self.seen_seq = Some(snap.seq);
+        Some(snap)
+    }
 }
 
 /// Which of `devices` a DRM client belongs to — an index into the *calling
@@ -1073,6 +1363,197 @@ drm-resident-vram0:\t4096 KiB
             Some("DG2 [Arc A770]")
         );
         assert_eq!(pci_device_name(IDS, "1002", "0e3b"), None);
+    }
+
+    /// A walk carrying `clients`, stamped now.
+    fn snapshot(clients: Vec<(u32, FdClient)>) -> ProcSnapshot {
+        ProcSnapshot {
+            clients,
+            at: Instant::now(),
+            seq: 1,
+        }
+    }
+
+    fn sweep_dev(pdev: &str, driver: &str) -> SweepDevice {
+        SweepDevice {
+            pdev: Some(pdev.to_string()),
+            driver: driver.to_string(),
+        }
+    }
+
+    /// Every client of one process on one card folds into a single row, and
+    /// the per-device totals are the sum over the clients of every process.
+    /// Only reachable as a test now that the walk is an input rather than
+    /// something this function goes and does.
+    #[test]
+    fn the_sweep_totals_per_device_and_rows_per_process() {
+        let devices = [
+            sweep_dev("0000:75:00.0", "amdgpu"),
+            sweep_dev("0000:00:02.0", "i915"),
+        ];
+        let amd = || parse_fdinfo(AMD_FDINFO).unwrap();
+        let i915 = || parse_fdinfo(I915_FDINFO).unwrap();
+        // pid 10 holds two clients of card 0; pid 11 one of card 0 and one of
+        // card 1. Client ids differ, so nothing here is a duplicate.
+        let mut second = amd();
+        second.id = 999;
+        let snap = snapshot(vec![(10, amd()), (10, second), (11, amd()), (11, i915())]);
+
+        // Each client contributes a fixed 10% and 1 MiB, so the sums below are
+        // a count of the clients that reached each bucket.
+        let sweep = sweep_clients(&snap, &devices, |_, _, _| ClientSample {
+            util_pct: 10.0,
+            video_pct: 1.0,
+            mem_bytes: 1 << 20,
+            graphics: true,
+        });
+
+        assert_eq!(sweep.util[&0], 30.0, "three amdgpu clients");
+        assert_eq!(sweep.util[&1], 10.0, "one i915 client");
+        assert_eq!(sweep.video_util[&0], 3.0);
+
+        let mut rows: Vec<(u32, usize, Option<u64>)> = sweep
+            .procs
+            .iter()
+            .map(|p| (p.pid, p.gpu_index, p.gpu_mem_bytes))
+            .collect();
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            [
+                // pid 10's two clients of card 0 are one row, summed.
+                (10, 0, Some(2 << 20)),
+                (11, 0, Some(1 << 20)),
+                // The same process on a second card is a second row.
+                (11, 1, Some(1 << 20)),
+            ]
+        );
+        assert_eq!(sweep.seen.len(), 4, "one entry per (pid, client id)");
+    }
+
+    /// A client reachable through several fds appears once per fd in the walk
+    /// and must be counted once — otherwise a process that dup'd its DRM fd
+    /// reads as using the card twice over.
+    #[test]
+    fn one_client_seen_twice_is_counted_once() {
+        let devices = [sweep_dev("0000:75:00.0", "amdgpu")];
+        let client = || parse_fdinfo(AMD_FDINFO).unwrap();
+        let snap = snapshot(vec![(10, client()), (10, client())]);
+
+        let mut calls = 0;
+        let sweep = sweep_clients(&snap, &devices, |_, _, _| {
+            calls += 1;
+            ClientSample {
+                util_pct: 10.0,
+                mem_bytes: 1 << 20,
+                ..ClientSample::default()
+            }
+        });
+
+        assert_eq!(calls, 1, "the per-client closure ran for the duplicate");
+        assert_eq!(sweep.util[&0], 10.0);
+        assert_eq!(sweep.procs.len(), 1);
+        assert_eq!(sweep.procs[0].gpu_mem_bytes, Some(1 << 20));
+    }
+
+    /// A walk carries every vendor's clients, since it is taken once for all
+    /// of them. Each backend must take only its own — and must not even ask
+    /// its closure about a sibling's client, which is where the delta state
+    /// for a foreign client would be minted.
+    #[test]
+    fn a_backend_attributes_only_its_own_vendors_clients() {
+        let devices = [sweep_dev("0000:75:00.0", "amdgpu")];
+        let mut orphan = parse_fdinfo(AMD_FDINFO).unwrap();
+        orphan.pdev = None;
+        let snap = snapshot(vec![
+            (10, parse_fdinfo(AMD_FDINFO).unwrap()),
+            (11, parse_fdinfo(I915_FDINFO).unwrap()),
+            (12, parse_fdinfo(XE_FDINFO).unwrap()),
+            (13, orphan),
+        ]);
+
+        let mut seen_pids = Vec::new();
+        let sweep = sweep_clients(&snap, &devices, |pid, _, _| {
+            seen_pids.push(pid);
+            ClientSample::default()
+        });
+
+        assert_eq!(seen_pids, [10]);
+        assert_eq!(sweep.procs.len(), 1);
+        assert_eq!(sweep.seen.len(), 1);
+    }
+
+    /// The cursor's whole job: a walk is attributed once. Handing the same one
+    /// back would divide identical counters by a zero interval, and the card
+    /// would flicker to 0% every time a walk ran late.
+    #[test]
+    fn a_cursor_attributes_each_walk_once() {
+        let scanner = ProcScanner::detached();
+        let mut cursor = SweepCursor::on(Arc::clone(&scanner));
+        let now = Instant::now();
+
+        scanner.publish(vec![(10, parse_fdinfo(AMD_FDINFO).unwrap())], now);
+        let first = cursor.next().expect("a published walk");
+        assert_eq!(first.clients.len(), 1);
+        assert!(cursor.next().is_none(), "the same walk came back twice");
+        assert!(cursor.next().is_none(), "and again");
+
+        scanner.publish(Vec::new(), now + Duration::from_secs(1));
+        let second = cursor.next().expect("the newer walk");
+        assert!(second.seq > first.seq);
+        assert!(cursor.next().is_none());
+
+        // Two backends share one scanner and each attributes every walk, so a
+        // second cursor is not affected by the first having consumed it.
+        let mut other = SweepCursor::on(Arc::clone(&scanner));
+        assert_eq!(other.next().map(|s| s.seq), Some(second.seq));
+    }
+
+    /// The worker path end to end: a thread does the walking, and successive
+    /// requests come back as successively newer walks of the real `/proc`.
+    #[test]
+    fn the_worker_thread_publishes_successive_walks() {
+        let scanner = ProcScanner::detached();
+        scanner.spawn_worker();
+        let mut cursor = SweepCursor::on(Arc::clone(&scanner));
+
+        // The first call waits for the first walk, because there is nothing
+        // to fall back on. Anything after it may or may not find a new walk
+        // ready — that is the point of the worker — so take walks as they
+        // land rather than assuming one per call.
+        let first = cursor.next().expect("the worker published a first walk");
+        let deadline = Instant::now() + FIRST_SCAN_WAIT;
+        let mut walks = vec![first];
+        while walks.len() < 3 && Instant::now() < deadline {
+            if let Some(s) = cursor.next() {
+                walks.push(s);
+            }
+        }
+
+        assert_eq!(walks.len(), 3, "the worker stopped publishing");
+        for w in walks.windows(2) {
+            assert!(w[1].seq > w[0].seq, "a walk was published twice");
+            assert!(w[1].at > w[0].at, "walks are not ordered in time");
+        }
+    }
+
+    /// Synchronous mode is what `--once` rests on: the walk happens when the
+    /// poll asks for it, so two polls a known interval apart bracket that
+    /// interval. A caller must never be handed a walk older than its request.
+    #[test]
+    fn synchronous_mode_walks_on_the_calling_thread() {
+        let scanner = ProcScanner::detached();
+        scanner.set_synchronous(true);
+        let mut cursor = SweepCursor::on(Arc::clone(&scanner));
+
+        // No worker was spawned, so anything returned here was walked by this
+        // thread; every call yields a walk newer than the last.
+        let asked = Instant::now();
+        let first = cursor.next().expect("walked here");
+        let second = cursor.next().expect("walked here again");
+        assert!(second.seq > first.seq, "the same walk was served twice");
+        assert!(first.at >= asked, "served a walk older than the request");
+        assert!(second.at > first.at);
     }
 
     /// The fdinfo sweep sums regions it read, so its zero is a reading. Unlike
