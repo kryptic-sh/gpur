@@ -31,7 +31,9 @@ and Alpine jobs succeeded. Only `Publish AUR (gpur-bin)` failed, on
 Not a configuration fault. The same `git ls-remote` fails identically from a
 developer machine with a working AUR account, while `ssh aur@aur.archlinux.org`
 answers its greeter normally — the interactive shell is up and git-upload-pack
-is not. Re-run attempts at the time all hit the same banner.
+is not. Re-run attempts at the time all hit the same banner, and a re-check the
+following day (2026-08-03) got the same one — so this is an outage measured in
+days, not minutes.
 
 **To finish:** once `git ls-remote ssh://aur@aur.archlinux.org/gpur-bin.git`
 succeeds, `gh run rerun 30735988517 --failed`. The job is idempotent — it exits
@@ -122,6 +124,16 @@ Whether a row of `n/a` beats an absent card is a product call, not a bug.
   degraded path is the one `synchronous_mode_walks_on_the_calling_thread` covers
   — but the branch that chooses it is only reachable under thread exhaustion,
   which no test creates.
+- **The hjkl 0.40 path re-home was read, not run, off Linux.** `hjkl-config`
+  0.40 delegates config/cache resolution to the new `hjkl-xdg` crate instead of
+  its own inline `xdg_base`. The two resolvers were compared side by side and
+  implement the same policy — XDG vars honoured on every platform when absolute
+  and non-empty, otherwise `~/.config` / `~/.cache` via `dirs::home_dir()`,
+  deliberately not `%APPDATA%` or `~/Library/Application Support` — so no path
+  should move anywhere. What was actually exercised is Linux only:
+  `tests/tui.rs` points `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` at a sandbox,
+  drives the real binary through a PTY and reads `state.json` back out of it.
+  The Windows and macOS halves rest on reading the resolver.
 - **No CI job runs against real GPU hardware.** Inherent to hosted runners; the
   mitigation was fixture-testing every backend's pure parsers, which is why
   `windows.rs` and `apple.rs` have unit tests that run on any host. Closing it
@@ -226,6 +238,21 @@ figure on discrete Arc is wanted; the iGPU totals would not change.
 - `src/keys.rs:7` `enum Mode { Normal }` has one variant threaded through
   `Keymap<Action, Mode>`. Required by the `hjkl-keymap` API, so it cannot go,
   but no second mode is planned — filter and confirm bypass the keymap entirely.
+
+## 8. Noted upstream, not gpur's to fix
+
+- **`hjkl-splash`'s changelog files a removal against the wrong release.** Its
+  0.40.0 entry says the `ratatui` feature and `start_screen::render` were
+  dropped there, but neither exists in any 0.33.x published to crates.io either
+  — no `pub fn render` in the source and no `ratatui` in the manifest, in 0.33.3
+  through 0.33.6 — and that crate's `src` is byte-identical between 0.33.6 and
+  0.40.0. So the removal shipped at or before 0.33.3 and the entry followed
+  late, which the crate's changelog jumping straight from 0.2.0 to 0.40.0
+  explains: the whole 0.33 series was published without entries. Harmless for
+  gpur, which renders the splash itself and never called `start_screen::render`,
+  but it misleads the next consumer reading that changelog to decide whether an
+  upgrade is safe — and it means the 0.33 series has no changelog at all. Fix
+  belongs in the hjkl repo.
 
 ---
 
