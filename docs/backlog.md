@@ -84,6 +84,19 @@ Whether a row of `n/a` beats an absent card is a product call, not a bug.
   test that opens a client and polls is asserting on that client, so the walk
   has to happen after the open. Worth adding the Intel twin next time that
   machine is available.
+- **One walk serving every vendor is unverified on a mixed-vendor box.** Both
+  backends take `SweepCursor::default()` (`amd.rs`, `intel.rs`), which is the
+  shared `ProcScanner`, so structurally an AMD + Intel machine takes one walk a
+  tick rather than one per backend. Nothing has observed it: the machine this
+  was written on has AMD cards only, and no test asserts a walk count across two
+  live backends. `a_cursor_attributes_each_walk_once` covers the half that is
+  checkable anywhere — two cursors over one scanner each receive the same walk.
+- **No before/after measurement of the responsiveness this bought.** The 4.2 ms
+  over 588 pids in the old entry measured the walk itself, and the walk's code
+  is unchanged — what moved is which thread runs it. That keystrokes no longer
+  queue behind it follows from `App::poll` no longer walking, not from anything
+  timed, and the pathological case that motivated the work (a 10k-process node
+  at `--tick-ms 100`) has never been run.
 - **Nothing forces a refused thread spawn.** `ProcScanner::spawn_worker`
   degrades to synchronous mode when the OS will not give it a thread, and that
   degraded path is the one `synchronous_mode_walks_on_the_calling_thread` covers
@@ -252,6 +265,19 @@ Recorded so they are not re-opened as findings.
   report a card that idled through it as pegged, which
   `utilization_spans_the_two_walks_and_survives_a_poll_without_one` (in both
   `amd.rs` and `intel.rs`) pins at 100% against the correct 50%/75%.
+- **The first poll of a session waits for the first walk.** There is no earlier
+  reading to fall back on, and starting with an empty process table that fills
+  in a tick later reads as "no processes" rather than as "not yet measured". The
+  wait is bounded by `FIRST_SCAN_WAIT` so a worker that never publishes costs
+  one late frame instead of a hang. Every later poll takes whatever is ready.
+- **Where a walk outlasts the tick, process figures update at the walk's pace,
+  not the tick's.** `SweepCursor` returns `None` on a poll with no new walk and
+  the last figures are redrawn, so a `--tick-ms 50` session on a machine whose
+  walk takes 70 ms refreshes the device gauges every 50 ms and the process rows
+  every 70. That is the intended degradation rather than a bug to file: the
+  alternative is the tick waiting on the walk, which is what this change
+  removed. The utilizations stay honest across it because they are measured
+  between the walks' own timestamps.
 - **A poll that finds no new walk redraws the last figures rather than
   re-deriving them.** `SweepCursor` hands each walk to a backend once. Feeding
   the same walk twice would divide identical counters by a zero interval and
