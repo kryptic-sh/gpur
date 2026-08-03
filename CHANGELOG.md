@@ -22,6 +22,12 @@ and this project adheres to
 
 ### Fixed
 
+- **Nouveau-driven NVIDIA cards are no longer hidden beside proprietary ones
+  (Linux).** The NVML backend was returned as soon as one card on the
+  proprietary driver was found, so a rig mixing `nvidia` and `nouveau` omitted
+  every open-driver card. The nouveau sysfs scan now runs alongside NVML and its
+  cards are appended to the NVML snapshots.
+
 - **Slowing the poll rate no longer overflows on a huge interval.** `--tick-ms`
   is unbounded above, so pressing `-` on a value above `u64::MAX / 2` wrapped
   `* 2` to zero (release; the loop then polled at maximum rate) or panicked

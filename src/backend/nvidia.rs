@@ -17,19 +17,31 @@ use nvml_wrapper::{Device, Nvml};
 use std::collections::HashMap;
 
 pub fn probe() -> Option<Box<dyn GpuBackend>> {
-    if let Some(b) = nvml_probe() {
-        return Some(b);
-    }
-    // NVML is the only source of NVIDIA telemetry, and it exists only with the
-    // proprietary driver. Without it the card is still sitting in
-    // /sys/class/drm, and no other backend will claim it — the AMD and Intel
-    // scans filter on their own PCI vendor — so leaving it there drops a card
-    // off a mixed rig entirely rather than showing it with fewer gauges.
     #[cfg(target_os = "linux")]
-    if let Some(b) = nouveau::probe() {
-        return Some(b);
+    {
+        if let Some(nvml) = nvml_probe() {
+            // NVML only sees the cards on the proprietary driver; a rig can
+            // mix it with nouveau, so merge the sysfs cards in rather than
+            // dropping them from the listing.
+            return match nouveau::probe() {
+                Some(nv) => {
+                    Some(Box::new(MergedNvidiaBackend { nvml, nouveau: nv }) as Box<dyn GpuBackend>)
+                }
+                None => Some(Box::new(nvml) as Box<dyn GpuBackend>),
+            };
+        }
+        // NVML is the only source of NVIDIA telemetry, and it exists only with
+        // the proprietary driver. Without it the card is still sitting in
+        // /sys/class/drm, and no other backend will claim it — the AMD and
+        // Intel scans filter on their own PCI vendor — so leaving it there
+        // drops a card off a mixed rig entirely rather than showing it with
+        // fewer gauges.
+        nouveau::probe()
     }
-    None
+    #[cfg(not(target_os = "linux"))]
+    {
+        nvml_probe().map(|b| Box::new(b) as Box<dyn GpuBackend>)
+    }
 }
 
 /// Device ids the sysfs fallback claims from a fake `/sys/class/drm`, for the
@@ -39,7 +51,7 @@ pub(crate) fn claimed_ids(drm: &str) -> Vec<String> {
     nouveau::claimed_ids(drm)
 }
 
-fn nvml_probe() -> Option<Box<dyn GpuBackend>> {
+fn nvml_probe() -> Option<NvmlBackend> {
     let nvml = Nvml::init().ok()?;
     match nvml.device_count() {
         Ok(n) if n > 0 => {
@@ -49,13 +61,13 @@ fn nvml_probe() -> Option<Box<dyn GpuBackend>> {
             let uuids = (0..n)
                 .map(|i| nvml.device_by_index(i).ok().and_then(|d| d.uuid().ok()))
                 .collect();
-            Some(Box::new(NvmlBackend {
+            Some(NvmlBackend {
                 nvml,
                 count: n,
                 driver,
                 uuids,
                 last_util_ts: vec![0; n as usize],
-            }))
+            })
         }
         _ => None,
     }
@@ -208,6 +220,45 @@ impl GpuBackend for NvmlBackend {
     }
 }
 
+/// NVML plus any nouveau-bound cards beside them (Linux). NVML only sees
+/// devices on the proprietary driver, so a mixed-driver rig would otherwise
+/// omit every nouveau card.
+#[cfg(target_os = "linux")]
+struct MergedNvidiaBackend {
+    nvml: NvmlBackend,
+    nouveau: Box<dyn GpuBackend>,
+}
+
+#[cfg(target_os = "linux")]
+impl GpuBackend for MergedNvidiaBackend {
+    fn name(&self) -> &'static str {
+        // Keep the "nvml" namespace so a pure-NVML session and a mixed one
+        // give the proprietary cards the same device-id prefix.
+        "nvml"
+    }
+
+    fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
+        let mut gpus = self.nvml.poll()?;
+        gpus.append(&mut self.nouveau.poll()?);
+        Ok(gpus)
+    }
+
+    fn processes(&mut self) -> Vec<GpuProcess> {
+        // nouveau has no per-process visibility; NVML rows index 0..count,
+        // which stay valid because the nouveau snapshots come after them.
+        self.nvml.processes()
+    }
+
+    fn driver_info(&self) -> Option<String> {
+        let a = self.nvml.driver_info();
+        let b = self.nouveau.driver_info();
+        match (a, b) {
+            (Some(a), Some(b)) => Some(format!("{a} · {b}")),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
 /// NVIDIA cards on the open `nouveau` driver, read from sysfs.
 ///
 /// nouveau publishes no busy counter and no VRAM total anywhere in sysfs, and
@@ -217,8 +268,9 @@ impl GpuBackend for NvmlBackend {
 /// card listed with half its gauges empty is still a listed card; the
 /// alternative here is that it does not appear at all.
 ///
-/// Reached only when NVML did not initialise, so it can never list a card NVML
-/// already reported.
+/// Runs alongside NVML: a rig can mix the proprietary driver and nouveau, and
+/// NVML only sees the cards on the proprietary side, so the two scans must
+/// both run. When NVML is absent this is the only NVIDIA listing left.
 #[cfg(target_os = "linux")]
 mod nouveau {
     use crate::backend::linux::{
