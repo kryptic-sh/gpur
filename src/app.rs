@@ -1313,7 +1313,7 @@ impl App {
                 self.tick_explicit = true;
             }
             Action::TickSlower => {
-                self.tick_ms = (self.tick_ms * 2).min(10_000);
+                self.tick_ms = self.tick_ms.saturating_mul(2).min(10_000);
                 self.tick_explicit = true;
             }
             Action::Digit(i) => {
@@ -1882,6 +1882,19 @@ mod tests {
         app.apply(Action::TickFaster);
         assert_eq!(app.tick_ms, MIN_TICK_MS);
         // An interactive change is the only thing that makes the rate sticky.
+        assert!(app.tick_explicit);
+    }
+
+    /// `-` on a tick too large to double must clamp to 10 s, not wrap to 0
+    /// (release) or panic (debug): `--tick-ms` is unbounded above and only
+    /// floored, so `* 2` on `9_223_372_036_854_775_808` (2^63, CLI-parseable)
+    /// used to wrap to exactly 0.
+    #[test]
+    fn tick_slower_clamps_a_huge_tick_instead_of_wrapping() {
+        let mut app = app_with(Box::new(LocalBackend));
+        app.tick_ms = 9_223_372_036_854_775_808;
+        app.apply(Action::TickSlower);
+        assert_eq!(app.tick_ms, 10_000);
         assert!(app.tick_explicit);
     }
 

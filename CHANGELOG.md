@@ -22,6 +22,11 @@ and this project adheres to
 
 ### Fixed
 
+- **Slowing the poll rate no longer overflows on a huge interval.** `--tick-ms`
+  is unbounded above, so pressing `-` on a value above `u64::MAX / 2` wrapped
+  `* 2` to zero (release; the loop then polled at maximum rate) or panicked
+  (debug). The doubling is now saturating, so the 10 s clamp actually clamps.
+
 - **Terminal setup failures now restore the terminal before exiting.** If
   enabling the kitty keyboard protocol or mouse capture failed after ratatui put
   the tty into raw mode and the alternate screen, gpur returned the error
