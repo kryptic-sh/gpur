@@ -22,6 +22,12 @@ and this project adheres to
 
 ### Fixed
 
+- **Terminal setup failures now restore the terminal before exiting.** If
+  enabling the kitty keyboard protocol or mouse capture failed after ratatui put
+  the tty into raw mode and the alternate screen, gpur returned the error
+  without undoing either — the invoking shell was left in raw mode. Both error
+  paths now run the full teardown first.
+
 - **Replay no longer skips the first recorded frame.** `load` consumed record 1
   to validate the file, then the first `poll` advanced past it, so an N-record
   log replayed records 2..N and headless `--once`/`--json` skipped the recorded

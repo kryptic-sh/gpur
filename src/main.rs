@@ -113,8 +113,19 @@ fn main() -> Result<()> {
     // our teardown in front of it — a panic must not leave the shell with
     // mouse reporting on.
     let mut terminal = ratatui::try_init().context("initializing the terminal")?;
-    hjkl_kitty::enable(&mut stdout())?;
-    crossterm::execute!(stdout(), EnableMouseCapture)?;
+    // try_init has already put the tty into raw mode + alt screen; on these
+    // two paths the panic hook and signal teardown are not installed yet, so
+    // restore explicitly before bailing (restore_extras is idempotent).
+    if let Err(e) = hjkl_kitty::enable(&mut stdout()) {
+        restore_extras();
+        ratatui::restore();
+        return Err(e).context("enabling kitty keyboard protocol");
+    }
+    if let Err(e) = crossterm::execute!(stdout(), EnableMouseCapture) {
+        restore_extras();
+        ratatui::restore();
+        return Err(e).context("enabling mouse capture");
+    }
     {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
