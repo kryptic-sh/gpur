@@ -336,6 +336,25 @@ fn unmeasured_last(a_unknown: bool, b_unknown: bool) -> Option<std::cmp::Orderin
     }
 }
 
+/// Parse `/proc/<pid>/stat` field 22 (process start time in clock ticks since
+/// boot) from a raw stat line. The comm field (field 2) is parenthesized and
+/// may itself contain spaces and `)` characters, so the comm closer is the
+/// LAST `)`; everything after it is field 3 onwards. Field 22 is the 19th
+/// whitespace-separated token after field 3.
+#[cfg(target_os = "linux")]
+fn parse_start_ticks(stat: &str) -> Option<u64> {
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Read `/proc/<pid>/stat` field 22 for a live local process.
+#[cfg(target_os = "linux")]
+fn proc_start_ticks(pid: u32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| parse_start_ticks(&stat))
+}
+
 /// A signal awaiting y/N confirmation. `start_time` pins the identity of the
 /// target: a pid alone is not one, since the process can exit between the
 /// prompt and the keystroke and the number be handed to something else.
@@ -347,6 +366,12 @@ pub struct PendingKill {
     pub force: bool,
     /// Truncated command line, for the dialog and the result message.
     pub command: String,
+    /// Raw `/proc/<pid>/stat` field 22 (process start time in clock ticks
+    /// since boot), captured when the dialog opened. Finer than the
+    /// seconds-resolution `start_time`, and what the pidfd fast path re-reads
+    /// to catch a same-second PID reuse.
+    #[cfg(target_os = "linux")]
+    pub start_ticks: Option<u64>,
 }
 
 /// UI state persisted across runs (folded cards, sort, poll rate) — the
@@ -1106,11 +1131,15 @@ impl App {
             self.set_status(format!("kill: pid {pid} is not a live local process"));
             return;
         };
+        #[cfg(target_os = "linux")]
+        let start_ticks = proc_start_ticks(pid);
         self.pending_kill = Some(PendingKill {
             pid,
             start_time,
             force,
             command,
+            #[cfg(target_os = "linux")]
+            start_ticks,
         });
         self.input_mode = InputMode::Confirm;
     }
@@ -1127,6 +1156,8 @@ impl App {
             start_time,
             force,
             command,
+            #[cfg(target_os = "linux")]
+            start_ticks,
         } = k;
         let sig_name = if force { "SIGKILL" } else { "SIGTERM" };
         // A failed poll can swap the backend under a pending dialog.
@@ -1176,6 +1207,55 @@ impl App {
                 "kill: pid {pid} has no executable (kernel thread?) — refusing"
             ));
             return;
+        }
+        // pidfd fast path (Linux): pidfd_open pins the process identity at
+        // this instant, so a replacement that reuses the pid after the open
+        // can never receive the signal (the pidfd still names the original,
+        // and pidfd_send_signal answers ESRCH once it exits), and the
+        // clock-tick start comparison catches a same-second replacement at
+        // pin time. Fall through to the kill_with path below when the kernel
+        // or sandbox has no pidfd support.
+        #[cfg(target_os = "linux")]
+        {
+            let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) }
+                as libc::c_int;
+            if pidfd >= 0 {
+                // Re-read identity at pin time: field 22 differs for any
+                // process that took the number after the dialog opened.
+                let cur = proc_start_ticks(pid);
+                let start = start_ticks;
+                if cur != start {
+                    unsafe { libc::close(pidfd) };
+                    self.set_status(format!("kill: pid {pid} was reused by another process"));
+                    return;
+                }
+                let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
+                let ret = unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        pidfd,
+                        sig,
+                        std::ptr::null_mut::<libc::siginfo_t>(),
+                        0,
+                    )
+                };
+                unsafe { libc::close(pidfd) };
+                if ret == 0 {
+                    self.set_status(format!("sent {sig_name} to {pid} ({command})"));
+                    return;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ESRCH) {
+                    // The pidfd pins the ORIGINAL process, so an ESRCH here
+                    // means it exited — never that a reused pid got signalled.
+                    self.set_status(format!("kill: pid {pid} exited before the signal was sent"));
+                } else {
+                    self.set_status(format!(
+                        "{sig_name} to {pid} failed (permission? try as root)"
+                    ));
+                }
+                return;
+            }
         }
         // kill_with returns None when the signal isn't supported on this
         // platform (Term on Windows). Falling back to plain kill() there sent
@@ -1516,6 +1596,8 @@ mod tests {
             start_time,
             force: false,
             command: "victim".into(),
+            #[cfg(target_os = "linux")]
+            start_ticks: proc_start_ticks(pid),
         });
         app.input_mode = InputMode::Confirm;
     }
@@ -1665,6 +1747,25 @@ mod tests {
             status_of(&app)
         );
         let _ = child.wait();
+    }
+
+    /// The comm field (field 2) is parenthesized and may embed spaces and `)`
+    /// characters; only the LAST `)` closes it. Field 22 (starttime) is the
+    /// 19th whitespace token after field 3 (state).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parse_start_ticks_handles_comm_with_spaces_and_parens() {
+        // Comm `(a)b) c)`; tokens after the last `)` run S, 3, 4, …, so the
+        // 22nd field (starttime) is the value at index 19, i.e. "21".
+        let stat = "1 (a)b) c) S 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23";
+        assert_eq!(parse_start_ticks(stat), Some(21));
+        // A plain comm parses the same way: field 22 is "19" here.
+        let plain = "9 (init) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20";
+        assert_eq!(parse_start_ticks(plain), Some(19));
+        // Short or malformed stat lines yield None, never a panic.
+        assert_eq!(parse_start_ticks(""), None);
+        assert_eq!(parse_start_ticks("1"), None);
+        assert_eq!(parse_start_ticks("1 (a) S 3 4"), None);
     }
 
     #[test]

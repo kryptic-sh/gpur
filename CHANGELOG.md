@@ -20,6 +20,20 @@ and this project adheres to
   are still honoured. Packagers should note three new transitive dependencies:
   `hjkl-fs`, `hjkl-xdg` and `toml_edit`.
 
+### Fixed
+
+- **Kill confirmation no longer signals a PID that was reused while the dialog
+  was open (Linux).** The confirm path pinned the target with a
+  seconds-resolution start-time comparison and then signalled by numeric PID, so
+  a process that exited during the prompt and a replacement that took its number
+  within the same second passed the check. `confirm_kill` now opens a `pidfd`
+  (pin + send via `pidfd_send_signal`) and additionally re-reads
+  `/proc/<pid>/stat` field 22 (clock-tick start time) at pin time. A reused PID
+  fails the tick comparison at pin time, and a replacement after the pin cannot
+  receive the signal — the pidfd still names the original, and the kernel
+  answers `ESRCH`. Kernels or sandboxes without pidfd support fall through to
+  the previous behaviour.
+
 ## [0.12.0] - 2026-08-02
 
 ### Changed

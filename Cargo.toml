@@ -54,6 +54,9 @@ libc = "0.2"
 [target."cfg(windows)".dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Performance", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [target."cfg(unix)".dependencies]
 signal-hook = "0.4"
 
