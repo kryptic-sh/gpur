@@ -92,6 +92,12 @@ impl Tui {
         cmd.args(args);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // A parent shell's NO_COLOR must not leak into the harness: the colour
+        // assertions in this file depend on the app painting, and NO_COLOR is
+        // the one variable the child would otherwise inherit. An empty value
+        // reads as "colour is fine" to `detect_color_mode`, and the explicit
+        // `("NO_COLOR", Some("1"))` override in the no_color test replaces it.
+        cmd.env("NO_COLOR", "");
         cmd.env("XDG_CONFIG_HOME", &home.0);
         cmd.env("XDG_CACHE_HOME", &home.0);
         cmd.env("XDG_DATA_HOME", &home.0);
