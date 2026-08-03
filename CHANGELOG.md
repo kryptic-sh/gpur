@@ -22,6 +22,11 @@ and this project adheres to
 
 ### Fixed
 
+- **Replay no longer skips the first recorded frame.** `load` consumed record 1
+  to validate the file, then the first `poll` advanced past it, so an N-record
+  log replayed records 2..N and headless `--once`/`--json` skipped the recorded
+  first interval. The first poll now hands back the preloaded record.
+
 - **Kill confirmation no longer signals a PID that was reused while the dialog
   was open (Linux).** The confirm path pinned the target with a
   seconds-resolution start-time comparison and then signalled by numeric PID, so

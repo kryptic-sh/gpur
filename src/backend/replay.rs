@@ -26,6 +26,9 @@ pub struct ReplayBackend {
     lines: std::io::Lines<std::io::BufReader<std::fs::File>>,
     last: LogRecord,
     finished: bool,
+    /// `load` already consumed the first record into `last` to validate the
+    /// file; the first poll must hand that one back without advancing.
+    first: bool,
 }
 
 pub fn load(path: &Path) -> Result<Box<dyn GpuBackend>> {
@@ -40,6 +43,7 @@ pub fn load(path: &Path) -> Result<Box<dyn GpuBackend>> {
         lines,
         last: first,
         finished: false,
+        first: true,
     }))
 }
 
@@ -60,7 +64,11 @@ impl GpuBackend for ReplayBackend {
     }
 
     fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
-        if !self.finished {
+        if self.first {
+            // `load` preloaded the first record; hand it back as-is so the
+            // first poll plays the same frame `load` validated.
+            self.first = false;
+        } else if !self.finished {
             match next_record(&mut self.lines) {
                 Some(rec) => self.last = rec,
                 None => self.finished = true, // hold the final frame
@@ -198,6 +206,28 @@ mod tests {
         );
         let mut b = load(&path).unwrap();
         assert_eq!(b.processes()[0].gpu_mem_bytes, None);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// `load` validates the file by preloading the first record into `last`;
+    /// the first poll must replay that record rather than skipping straight
+    /// to the second, and EOF must keep holding the final frame.
+    #[test]
+    fn the_first_poll_returns_the_preloaded_record() {
+        let path = write_log(
+            "first",
+            concat!(
+                r#"{"gpus":[{"name":"first"}],"processes":[]}"#,
+                "\n",
+                r#"{"gpus":[{"name":"second"}],"processes":[]}"#,
+                "\n"
+            ),
+        );
+        let mut b = load(&path).unwrap();
+        assert_eq!(b.poll().unwrap()[0].name, "first");
+        assert_eq!(b.poll().unwrap()[0].name, "second");
+        // At EOF the last frame holds forever.
+        assert_eq!(b.poll().unwrap()[0].name, "second");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
