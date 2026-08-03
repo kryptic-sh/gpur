@@ -274,8 +274,16 @@ mod linux_impl {
                     video_pct: clamp_pct(vutil),
                     // A process row wants the memory the device actually
                     // spends: VRAM on a dGPU, the system pool on an iGPU,
-                    // which is all an iGPU ever reports.
-                    mem_bytes: if discrete[gpu] { mem.local } else { mem.system },
+                    // which is all an iGPU ever reports. A mainline-i915 dGPU
+                    // proves itself discrete only once a sweep shows local
+                    // residency, which upgrades `discrete` after this closure —
+                    // so a client that showed local regions this sweep is
+                    // charged its local bytes regardless of the stale flag.
+                    mem_bytes: if discrete[gpu] || mem.saw_local {
+                        mem.local
+                    } else {
+                        mem.system
+                    },
                     graphics: client.engine_ns.keys().any(|k| k == "render" || k == "rcs")
                         || client.cycles.keys().any(|k| k == "rcs"),
                 }

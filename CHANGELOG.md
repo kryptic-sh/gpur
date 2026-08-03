@@ -22,6 +22,14 @@ and this project adheres to
 
 ### Fixed
 
+- **A mainline-i915 dGPU's process rows no longer under-report memory on the
+  first sweep.** Such a card proves itself discrete only once a sweep shows
+  local-memory residency, which upgraded the `discrete` flag only after that
+  sweep's process rows were built — so the first poll charged its clients'
+  `system` bytes (zero) instead of their device-local residency. A client that
+  showed local regions this sweep is now charged its local bytes regardless of
+  the stale flag.
+
 - **PDH items marked invalid no longer become GPU measurements (Windows).**
   `PdhGetFormattedCounterArrayW` can report success while individual items carry
   `CStatus = PDH_CSTATUS_INVALID_DATA`; those items' values were read into
