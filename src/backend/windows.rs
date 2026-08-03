@@ -152,9 +152,9 @@ mod win {
         CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
     };
     use windows::Win32::System::Performance::{
-        PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA,
-        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
-        PdhOpenQueryW,
+        PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER,
+        PDH_HQUERY, PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
+        PdhGetFormattedCounterArrayW, PdhOpenQueryW,
     };
     use windows::core::{PCWSTR, w};
 
@@ -459,8 +459,15 @@ mod win {
         (0..count as usize)
             .filter_map(|i| unsafe {
                 let item = &*items.add(i);
-                let name = item.szName.to_string().ok()?.to_lowercase();
-                Some((name, item.FmtValue.Anonymous.doubleValue))
+                // PDH can report success while marking an item's data invalid
+                // (e.g. a counter that has not collected twice yet); such an
+                // item must not flow into the measurements as a real reading.
+                (item.FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
+                    .then(|| {
+                        let name = item.szName.to_string().ok()?.to_lowercase();
+                        Some((name, item.FmtValue.Anonymous.doubleValue))
+                    })
+                    .flatten()
             })
             .collect()
     }

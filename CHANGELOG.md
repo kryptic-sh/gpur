@@ -22,6 +22,12 @@ and this project adheres to
 
 ### Fixed
 
+- **PDH items marked invalid no longer become GPU measurements (Windows).**
+  `PdhGetFormattedCounterArrayW` can report success while individual items carry
+  `CStatus = PDH_CSTATUS_INVALID_DATA`; those items' values were read into
+  utilization and memory figures as if real. Items whose status is not
+  `PDH_CSTATUS_VALID_DATA` are now discarded.
+
 - **Nouveau-driven NVIDIA cards are no longer hidden beside proprietary ones
   (Linux).** The NVML backend was returned as soon as one card on the
   proprietary driver was found, so a rig mixing `nvidia` and `nouveau` omitted
