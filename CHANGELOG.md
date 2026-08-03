@@ -22,6 +22,12 @@ and this project adheres to
 
 ### Fixed
 
+- **The power mini-spark no longer overflows on large replay values.** Its scale
+  maximum is derived from the data (a replay can carry arbitrary `power_w`), and
+  the level was computed as `value * 8` in `usize` before dividing — overflowing
+  on 64-bit for values above `u64::MAX / 8` and panicking in checked builds. The
+  scaling now happens in `u128`.
+
 - **A mainline-i915 dGPU's process rows no longer under-report memory on the
   first sweep.** Such a card proves itself discrete only once a sweep shows
   local-memory residency, which upgraded the `discrete` flag only after that

@@ -760,10 +760,10 @@ fn mini_spark(data: &[Option<u64>], max: u64, style: GraphStyle) -> String {
                     return ' ';
                 };
                 if style == GraphStyle::Block {
-                    let lvl = ((v as usize * 8).div_ceil(max as usize)).clamp(1, 8);
+                    let lvl = (u128::from(v) * 8 / u128::from(max)).clamp(1, 8) as usize;
                     EIGHTHS[lvl]
                 } else {
-                    let lvl = ((v as usize * 4).div_ceil(max as usize)).clamp(0, 4);
+                    let lvl = (u128::from(v) * 4 / u128::from(max)).clamp(0, 4) as usize;
                     ASCII_RAMP[lvl]
                 }
             })
@@ -780,7 +780,7 @@ fn mini_spark(data: &[Option<u64>], max: u64, style: GraphStyle) -> String {
             let Some(v) = windowed(data, c * 2 + s, n) else {
                 continue;
             };
-            let dots = ((v.min(max) as usize * 4).div_ceil(max as usize)).clamp(1, 4);
+            let dots = (u128::from(v) * 4 / u128::from(max)).clamp(1, 4) as usize;
             for d in 0..dots {
                 bits |= bit_col[3 - d];
             }
