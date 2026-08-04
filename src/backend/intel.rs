@@ -79,6 +79,10 @@ mod linux_impl {
         /// memory region is the evidence, and an idle dGPU must not fall back
         /// to looking integrated afterwards.
         discrete: bool,
+        /// Maximum supported PCIe link, fixed per device and resolved once at
+        /// scan rather than re-read every poll.
+        pcie_max_gen: Option<u8>,
+        pcie_max_width: Option<u32>,
     }
 
     struct IntelBackend {
@@ -146,8 +150,7 @@ mod linux_impl {
                 .map(|(i, d)| {
                     let h = d.hwmon.as_deref();
                     let power_w = powers[i];
-                    let (pcie_gen, pcie_width, pcie_max_gen, pcie_max_width) =
-                        linux::pcie_link(&d.dev);
+                    let (pcie_gen, pcie_width) = linux::pcie_current_link(&d.dev);
                     // Whether the sweep could see this device's clients at all;
                     // every sum below is meaningless without it.
                     let attributed = s.attributed.contains(&i);
@@ -183,8 +186,8 @@ mod linux_impl {
                         mem_clock_mhz: None,
                         pcie_gen,
                         pcie_width,
-                        pcie_max_gen,
-                        pcie_max_width,
+                        pcie_max_gen: d.pcie_max_gen,
+                        pcie_max_width: d.pcie_max_width,
                         // System-RAM-backed graphics memory. This is the only
                         // memory an iGPU has, and the UI renders it exactly
                         // like amdgpu's GTT pool.
@@ -434,6 +437,7 @@ mod linux_impl {
                 // publishes none even for an Arc, so the sweep upgrades this
                 // the first time a client shows local-memory residency.
                 let vram_total = vram_total(&card, &dev);
+                let (pcie_max_gen, pcie_max_width) = linux::pcie_max_link(&dev);
                 Some(IntelDevice {
                     name,
                     hwmon: first_dir(&dev.join("hwmon")),
@@ -443,6 +447,8 @@ mod linux_impl {
                     driver,
                     discrete: vram_total.is_some(),
                     vram_total,
+                    pcie_max_gen,
+                    pcie_max_width,
                 })
             })
             .collect()
@@ -561,6 +567,21 @@ mod linux_impl {
             // `dev.parent()` has to stay the DRM minor dir: i915's clock and
             // lmem files live there, not on the PCI device.
             assert!(devices[0].card.ends_with("card0"));
+        }
+
+        /// The max link is a fixed capability, so the scan resolves it once and
+        /// the device carries it rather than re-reading sysfs per poll.
+        #[test]
+        fn scan_caches_the_max_pcie_link() {
+            let root = testing::tri_vendor("intel-pcie-max");
+            let pci = root.join("pci/0000:00:02.0");
+            fs::write(pci.join("max_link_speed"), "8.0 GT/s PCIe\n").unwrap();
+            fs::write(pci.join("max_link_width"), "16\n").unwrap();
+            let devices = scan(&testing::drm(&root));
+            assert_eq!(devices[0].pcie_max_gen, Some(3));
+            assert_eq!(devices[0].pcie_max_width, Some(16));
+            // Each card reads its own files: the xe card has none.
+            assert_eq!(devices[1].pcie_max_gen, None);
         }
 
         /// Fake `cardN` + `cardN/device` pair. The sandbox *is* the card dir —
@@ -728,6 +749,8 @@ drm-resident-gtt:\t1024 KiB
                 driver: "i915".into(),
                 vram_total: None,
                 discrete: false,
+                pcie_max_gen: None,
+                pcie_max_width: None,
             };
             let mut b = IntelBackend {
                 devices: vec![dev],

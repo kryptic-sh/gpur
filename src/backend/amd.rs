@@ -82,6 +82,10 @@ mod linux_impl {
         /// hwmon channel numbers for the junction / memory temp sensors.
         temp_junction_ch: Option<u8>,
         temp_mem_ch: Option<u8>,
+        /// Maximum supported PCIe link, fixed per device and resolved once at
+        /// scan rather than re-read every poll.
+        pcie_max_gen: Option<u8>,
+        pcie_max_width: Option<u32>,
     }
 
     struct AmdBackend {
@@ -306,6 +310,7 @@ mod linux_impl {
                         }
                     }
                 }
+                let (pcie_max_gen, pcie_max_width) = linux::pcie_max_link(&dev);
                 AmdDevice {
                     integrated: is_apu(&dev),
                     name,
@@ -316,6 +321,8 @@ mod linux_impl {
                     temp_crit_c,
                     temp_junction_ch,
                     temp_mem_ch,
+                    pcie_max_gen,
+                    pcie_max_width,
                 }
             })
             .collect()
@@ -347,7 +354,7 @@ mod linux_impl {
             throttle_parts.push("power-limit");
         }
         let throttle = crate::backend::join_throttle(&throttle_parts);
-        let (pcie_gen, pcie_width, pcie_max_gen, pcie_max_width) = linux::pcie_link(&d.dev);
+        let (pcie_gen, pcie_width) = linux::pcie_current_link(&d.dev);
 
         GpuSnapshot {
             name: d.name.clone(),
@@ -387,8 +394,8 @@ mod linux_impl {
             mem_clock_mhz: clock_mhz(h, "freq2_input", &d.dev.join("pp_dpm_mclk")),
             pcie_gen,
             pcie_width,
-            pcie_max_gen,
-            pcie_max_width,
+            pcie_max_gen: d.pcie_max_gen,
+            pcie_max_width: d.pcie_max_width,
             // `pcie_bw` only exists where the ASIC implements
             // asic_funcs->get_pcie_usage (Vega10/20, Navi 1x/2x); the kernel
             // marks it unsupported on APUs and it is unimplemented on RDNA3.
@@ -526,6 +533,21 @@ mod linux_impl {
             // same card on every poll and every restart. Names stay distinct
             // whether or not this host has a pci.ids to resolve them against.
             assert_ne!(devices[0].name, devices[1].name);
+        }
+
+        /// The max link is a fixed capability, so the scan resolves it once and
+        /// the device carries it rather than re-reading sysfs per poll.
+        #[test]
+        fn scan_caches_the_max_pcie_link() {
+            let root = testing::tri_vendor("amd-pcie-max");
+            let pci = root.join("pci/0000:03:00.0");
+            std::fs::write(pci.join("max_link_speed"), "16.0 GT/s PCIe\n").unwrap();
+            std::fs::write(pci.join("max_link_width"), "16\n").unwrap();
+            let devices = scan(&testing::drm(&root));
+            assert_eq!(devices[0].pcie_max_gen, Some(4));
+            assert_eq!(devices[0].pcie_max_width, Some(16));
+            // Each card reads its own files: the radeon card has none.
+            assert_eq!(devices[1].pcie_max_gen, None);
         }
 
         /// A radeon card must not be handed to the amdgpu fdinfo sweep: the

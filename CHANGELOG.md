@@ -43,6 +43,10 @@ and this project adheres to
 
 ### Changed
 
+- **PCIe link maximums are read once at scan instead of every poll.** Max
+  gen/width are fixed capabilities, so each device now caches them at probe and
+  the per-poll read covers only the negotiated current pair — 2 sysfs reads per
+  GPU per tick instead of 4 (amdgpu, i915/xe, nouveau).
 - **Container ids are resolved once per process instead of on every poll.** The
   Linux backends' rows arrive without container attribution, so each poll read
   `/proc/<pid>/cgroup` again for every GPU process. The cgroup path is ~static

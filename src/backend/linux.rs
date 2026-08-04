@@ -742,20 +742,41 @@ pub fn gts_to_gen(speed: &str) -> Option<u8> {
     })
 }
 
-/// Current and maximum PCIe link as (gen, width, max gen, max width). These
-/// are PCI-core attributes (`drivers/pci/pci-sysfs.c`), identical for every
-/// vendor's endpoint, so one reader serves all sysfs backends. Each element is
-/// None when its file is missing or unparseable — e.g. on integrated devices,
+/// Current negotiated PCIe link as (gen, width). These are PCI-core
+/// attributes (`drivers/pci/pci-sysfs.c`), identical for every vendor's
+/// endpoint, so one reader serves all sysfs backends. Each element is None
+/// when its file is missing or unparseable — e.g. on integrated devices,
 /// which are not PCIe endpoints in any meaningful sense.
-pub fn pcie_link(dev: &Path) -> (Option<u8>, Option<u32>, Option<u8>, Option<u32>) {
+pub fn pcie_current_link(dev: &Path) -> (Option<u8>, Option<u32>) {
     let speed = |f: &str| read_trim(&dev.join(f)).as_deref().and_then(gts_to_gen);
     let width = |f: &str| read_trim(&dev.join(f)).and_then(|w| w.parse().ok());
-    (
-        speed("current_link_speed"),
-        width("current_link_width"),
-        speed("max_link_speed"),
-        width("max_link_width"),
-    )
+    (speed("current_link_speed"), width("current_link_width"))
+}
+
+/// Maximum supported PCIe link as (gen, width), from the same PCI-core
+/// attributes as the current link. Each element is None when its file is
+/// missing or unparseable — e.g. on integrated devices, which are not PCIe
+/// endpoints in any meaningful sense.
+///
+/// The maximum is a fixed capability, resolved once at scan time and cached
+/// per device rather than re-read every poll.
+pub fn pcie_max_link(dev: &Path) -> (Option<u8>, Option<u32>) {
+    let speed = |f: &str| read_trim(&dev.join(f)).as_deref().and_then(gts_to_gen);
+    let width = |f: &str| read_trim(&dev.join(f)).and_then(|w| w.parse().ok());
+    (speed("max_link_speed"), width("max_link_width"))
+}
+
+/// Current and maximum PCIe link as (gen, width, max gen, max width) — the
+/// four-field view for callers that want everything at once. These are
+/// PCI-core attributes (`drivers/pci/pci-sysfs.c`), identical for every
+/// vendor's endpoint, so one reader serves all sysfs backends. Each element
+/// is None when its file is missing or unparseable — e.g. on integrated
+/// devices, which are not PCIe endpoints in any meaningful sense.
+#[cfg(test)]
+pub fn pcie_link(dev: &Path) -> (Option<u8>, Option<u32>, Option<u8>, Option<u32>) {
+    let (cur_gen, cur_width) = pcie_current_link(dev);
+    let (max_gen, max_width) = pcie_max_link(dev);
+    (cur_gen, cur_width, max_gen, max_width)
 }
 
 /// The UI's driver line, "amdgpu · kernel 6.12.1-arch1-1". Every Linux backend
@@ -1165,6 +1186,22 @@ drm-resident-vram0:\t4096 KiB
         fs::write(dev.join("current_link_width"), "4\n").unwrap();
         fs::write(dev.join("max_link_speed"), "Unknown\n").unwrap();
         assert_eq!(pcie_link(&dev), (None, Some(4), None, None));
+    }
+
+    /// The link readers split by direction: current reads only the negotiated
+    /// pair, max only the capability — so a scan can cache the maxes and a poll
+    /// re-read only the currents.
+    #[test]
+    fn pcie_link_splits_current_from_max() {
+        let dev = scratch("pcie-halves");
+        fs::write(dev.join("current_link_speed"), "8.0 GT/s PCIe\n").unwrap();
+        fs::write(dev.join("current_link_width"), "8\n").unwrap();
+        assert_eq!(pcie_current_link(&dev), (Some(3), Some(8)));
+        assert_eq!(pcie_max_link(&dev), (None, None));
+        fs::write(dev.join("max_link_speed"), "16.0 GT/s PCIe\n").unwrap();
+        fs::write(dev.join("max_link_width"), "16\n").unwrap();
+        assert_eq!(pcie_max_link(&dev), (Some(4), Some(16)));
+        assert_eq!(pcie_link(&dev), (Some(3), Some(8), Some(4), Some(16)));
     }
 
     /// Every card's pwm is read against its own ceiling, and the ceiling is

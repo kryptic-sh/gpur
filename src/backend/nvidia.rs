@@ -326,7 +326,7 @@ impl GpuBackend for MergedNvidiaBackend {
 mod nouveau {
     use crate::backend::linux::{
         card_name, cards_with_driver, driver_line, fan_pct, first_dir, hwmon_u64, pci_device_id,
-        pcie_link, pdev_of,
+        pcie_current_link, pcie_max_link, pdev_of,
     };
     use crate::backend::{GpuBackend, GpuSnapshot};
     use anyhow::Result;
@@ -339,6 +339,10 @@ mod nouveau {
         dev: PathBuf,
         hwmon: Option<PathBuf>,
         pdev: Option<String>,
+        /// Maximum supported PCIe link, fixed per device and resolved once at
+        /// scan rather than re-read every poll.
+        pcie_max_gen: Option<u8>,
+        pcie_max_width: Option<u32>,
     }
 
     struct NouveauBackend {
@@ -353,11 +357,16 @@ mod nouveau {
     fn scan(drm: &str) -> Vec<NouveauDevice> {
         cards_with_driver(drm, NVIDIA_VENDOR, |d| d == "nouveau")
             .into_iter()
-            .map(|(idx, dev, _)| NouveauDevice {
-                name: card_name(&dev, idx, "10de", "NVIDIA"),
-                hwmon: first_dir(&dev.join("hwmon")),
-                pdev: pdev_of(&dev),
-                dev,
+            .map(|(idx, dev, _)| {
+                let (pcie_max_gen, pcie_max_width) = pcie_max_link(&dev);
+                NouveauDevice {
+                    name: card_name(&dev, idx, "10de", "NVIDIA"),
+                    hwmon: first_dir(&dev.join("hwmon")),
+                    pdev: pdev_of(&dev),
+                    dev,
+                    pcie_max_gen,
+                    pcie_max_width,
+                }
             })
             .collect()
     }
@@ -378,7 +387,7 @@ mod nouveau {
 
     fn sample(d: &NouveauDevice) -> GpuSnapshot {
         let h = d.hwmon.as_deref();
-        let (pcie_gen, pcie_width, pcie_max_gen, pcie_max_width) = pcie_link(&d.dev);
+        let (pcie_gen, pcie_width) = pcie_current_link(&d.dev);
         GpuSnapshot {
             name: d.name.clone(),
             device_id: pci_device_id(d.pdev.as_deref()),
@@ -396,8 +405,8 @@ mod nouveau {
             volt_mv: hwmon_u64(h, "in0_input"),
             pcie_gen,
             pcie_width,
-            pcie_max_gen,
-            pcie_max_width,
+            pcie_max_gen: d.pcie_max_gen,
+            pcie_max_width: d.pcie_max_width,
             // Everything else — utilization, VRAM, clocks — has no sysfs source
             // under nouveau. None keeps "unknown" distinct from "idle"/"empty".
             ..Default::default()
@@ -433,6 +442,19 @@ mod nouveau {
                 [Some("0000:04:00.0")],
                 "card2 is on the proprietary driver — NVML's, not ours"
             );
+        }
+
+        /// The max link is a fixed capability, so the scan resolves it once and
+        /// the device carries it rather than re-reading sysfs per poll.
+        #[test]
+        fn scan_caches_the_max_pcie_link() {
+            let root = testing::tri_vendor("nouveau-pcie-max");
+            let pci = root.join("pci/0000:04:00.0");
+            std::fs::write(pci.join("max_link_speed"), "16.0 GT/s PCIe\n").unwrap();
+            std::fs::write(pci.join("max_link_width"), "16\n").unwrap();
+            let devices = scan(&testing::drm(&root));
+            assert_eq!(devices[0].pcie_max_gen, Some(4));
+            assert_eq!(devices[0].pcie_max_width, Some(16));
         }
 
         /// Absent hwmon files must read as unknown, never as a cold, idle card.
