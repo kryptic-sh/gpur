@@ -1,213 +1,145 @@
 # Code Review
 
-Full-codebase review of the `main` tree at 0.12.0, 2026-08-04. Four parallel
-review passes (backend composition + Linux/mock/replay; vendor backends; app +
-main; ui + support + tests); every finding below was re-traced against the cited
-lines in this tree before publication. Severity is relative to a real user
-hitting it.
+Full-codebase review of the `main` tree at 0.12.0, 2026-08-04 (refresh of the
+review at the same tag). Working tree clean, so the scope is the whole codebase:
+every production module under `src/` read in full, both integration test files
+skimmed for what they pin, and the resolved dependency interfaces (nvml-wrapper
+0.12.1, sysinfo 0.39.5/0.39.6) spot-checked where a units or API claim was
+load-bearing. Every candidate below was traced against the cited lines in this
+tree before publication.
+
+This refresh is the tree that landed the fixes for every finding of the previous
+pass — the eight commits between the two reviews map one-to-one onto its eight
+findings, and each fix ships a regression test that I re-traced:
+
+- `ac7cde7` pidfd pin → closes the reused-PID signal race (`app.rs:1218`).
+- `d3664f7` replay `first` flag → closes the skipped-preload (`replay.rs:30`).
+- `9f35fdb` restore on setup errors → closes the terminal-teardown bypass
+  (`main.rs:119`).
+- `a32d18e` saturating tick clamp → closes the interval overflow
+  (`app.rs:1316`).
+- `c338a8a` MergedNvidiaBackend → closes the nouveau-hidden-by-NVML omission
+  (`nvidia.rs:26`).
+- `03e16a1` per-item `CStatus` check → closes the invalid-PDH-item leak
+  (`windows.rs:465`).
+- `4ac1121` `saw_local` charging → closes the first-sweep i915 dGPU memory
+  mischarge (`intel.rs:282`).
+- `005112a` u128 spark arithmetic → closes the mini-spark overflow
+  (`ui.rs:763`).
 
 ## Findings
 
-### High — process confirmation can signal a reused PID
-
-`src/app.rs:1167` compares second-resolution process start times, then
-`src/app.rs:1193` signals by numeric PID in a separate operation. A replacement
-created within the same second passes the identity check; any replacement
-between the check and signal also bypasses it.
-
-Repro: open kill confirmation for PID 500; the target exits; PID 500 is reused
-within the same second; press `y`
-
-Expect: replacement process remains untouched and gpur reports PID reuse
-
-Actual: the replacement passes the start-time check and receives the signal
-
-### Medium — replay skips its preloaded first record
-
-`src/backend/replay.rs:64` advances the input before returning the record loaded
-at startup. The first interactive poll therefore replaces record one with record
-two; headless mode advances twice and returns record three from a three-record
-log.
-
-Repro: replay JSONL records whose GPU names are `first`, then `second`
-
-Expect: the initial TUI frame shows `first`
-
-Actual: the initial TUI frame shows `second`; `first` is never displayed
-
-### Medium — partial terminal setup errors bypass teardown
-
-`src/main.rs:116` and `src/main.rs:117` can return after ratatui enabled raw
-mode and the alternate screen, but teardown runs only after the event loop. An
-error enabling Kitty keys or mouse capture can leave the invoking shell in
-altered terminal state.
-
-Repro: interactive TTY where `ratatui::try_init()` succeeds and
-`hjkl_kitty::enable()` returns `EIO`
-
-Expect: gpur returns the error after restoring cooked mode and the main screen
-
-Actual: gpur returns immediately without calling `restore_extras()` or
-`ratatui::restore()`
-
-### Medium — slowing an oversized interval overflows before capping
-
-`src/app.rs:1236` multiplies an unrestricted `u64` before applying the maximum.
-The CLI accepts values above `u64::MAX / 2` (`cli.rs:36`, floor-only clamp at
-`main.rs:60`), so release arithmetic can wrap to zero and debug arithmetic can
-panic.
-
-Repro: run `gpur --mock --no-splash --tick-ms 9223372036854775808`, then press
-`-`
-
-Expect: poll interval clamps to `10000ms`
-
-Actual: release builds store `0ms` (the event loop busy-spins, polling the
-backend every iteration); overflow-checked builds panic
-
-### Medium — NVML success hides nouveau-driven cards
-
-`src/backend/nvidia.rs:20` returns the NVML backend as soon as one proprietary
-NVIDIA card is found, so the nouveau scan never runs. Because detection asks for
-only one NVIDIA backend, a mixed-driver NVIDIA rig omits every nouveau-bound
-card.
-
-Repro: Linux host with card A bound to `nvidia`, card B bound to `nouveau`, and
-NVML reporting only card A
-
-Expect: snapshots for cards A and B
-
-Actual: only card A is returned
-
-### Medium — invalid PDH items are published as measurements
-
-`src/backend/windows.rs:463` reads every wildcard item's `doubleValue` without
-checking its per-item `FmtValue.CStatus`. PDH can return a successful array call
-containing invalid items, whose values then become utilization or memory
-measurements.
-
-Repro: PDH returns a valid GPU Engine instance name with
-`CStatus = PDH_CSTATUS_INVALID_DATA` and `doubleValue = 73.0`
-
-Expect: item is discarded and utilization remains unknown
-
-Actual: item contributes `73.0` utilization
-
-### Low — first Intel dGPU sweep reports system memory for processes
-
-`src/backend/intel.rs:278` chooses process memory using the device's pre-sweep
-`discrete` flag. Mainline i915 cards without a published VRAM total begin as
-integrated; local-memory evidence updates the flag only after that sweep's
-process rows are built.
-
-Repro: first readable i915 dGPU sweep with `local0 = 536870912`,
-`system0 = 2097152`, and no published VRAM total
-
-Expect: process `gpu_mem_bytes = Some(536870912)`
-
-Actual: process `gpu_mem_bytes = Some(2097152)` until the next sweep
-
-### Low — mini-spark scaling overflows on large replay values
-
-`src/ui.rs:763`, `src/ui.rs:766`, and `src/ui.rs:783` multiply a bounded `u64`
-sample after casting it to `usize`. The power spark's `max` (`ui.rs:581`) is
-unbounded data, and valid replay numbers can overflow that multiplication before
-division, producing the wrong glyph in release builds or a panic in
-overflow-checked builds.
-
-Repro: replay `power_w = 2305843009213693952` with `--graphs block`
-
-Expect: a sample equal to the scale maximum renders a full-height cell
-
-Actual: 64-bit release arithmetic wraps the level numerator to zero; checked
-arithmetic panics
+None. No correctness defect survived verification in the current tree: no logic
+error, broken edge case, swallowed error path, resource leak, or surprising
+behavior change was traced to a reachable failure.
 
 ## Cleared
 
-- Composite backend child failures preserve slot offsets and do not duplicate a
-  surviving device identity.
-- Replay/mock process rows cannot reach signaling because those backends remain
-  non-signalable across re-detection.
-- Replay rows whose `gpu_index` exceeds the frame are filtered before display.
-- Linux fdinfo duplicate descriptors and reused asynchronous snapshots are
-  deduplicated before attribution.
-- NVML process-utilization watermarks are per device, so one GPU does not starve
-  later devices' samples.
-- Empty GPU/process views, stale cursors, zero-height panes, and graph unknowns
-  stay within bounds and preserve unknown-versus-zero semantics.
-- State-file publication preserves the prior file when writing or renaming the
-  temporary file fails.
-- Package template artifact names and installed executable paths match the
-  release layout.
-- A stale `proc_visible` click cannot set `proc_sel` out of range: `run()` draws
-  at the top of every loop iteration (`main.rs:311`) and polls only at the
-  bottom (`main.rs:441`), so a shrink-poll is always followed by a draw that
-  recomputes `proc_visible` from the current row count (`ui.rs:1118`) before the
-  next event dispatch; `rebuild_proc_view` additionally clamps `proc_sel`
-  (`app.rs:1056`).
-- The kill path's start-time refresh is sound as far as sysinfo goes: it
-  re-reads `start_time` on every targeted refresh and rebuilds the entry when a
-  PID was recycled, so a recycled pid with a different start time fails the
-  check (the same-second case is the finding above).
-- `xe_ratio` on an engine new to a client's `cycles` map reports the counter's
-  lifetime average; the xe caller guards the client-level first sample and new
-  engines' counters are minted when the engine started, so the interval is the
-  correct one.
-- PDH `read_array` buffer sizing: the first call sizes in bytes, the item
-  allocation divides up (never down), and the second call re-sets `count` before
-  the read loop — no OOB, no truncation.
-- LUID keys meet across DXGI and PDH: DXGI formats `0x%08x`, PDH instance names
-  are lowercased, and `is_hex32` accepts either case.
-- Division-by-zero candidates are all guarded: intel `power_w` (`secs > 0` and
-  counter-reset), `pcie_kbs`/`ns_delta_util`, `fan_pct` (`pwm1_max > 0`),
-  `MemReadout::pct` (`total > 0`).
-- `le_int` bounds-checked (`bytes.len() <= 8` before copy); NVML
-  `field_values_for` chain matches the resolved nvml-wrapper 0.12.1 API.
-- Windows PDH query closes exactly once on the probe error path; IOKit iterator
-  is released on the normal path and zero on every early return.
-- Missing/unparseable sysfs reads become `None`, never a confident 0; the only
-  fabricated-zero paths are deliberate and tested.
-- Graph history is a `Vec` + `drain(..overflow)`, not a wrap-around ring — no
-  head/tail arithmetic, all vectors pushed in lockstep.
-- `proc_scroll..proc_scroll+visible` and card indices are clamped on every path
-  that can shrink the table; the ratatui scrollbar returns early on a
-  zero-height track.
-- Degenerate terminal sizes (1×1 resize storms, zero-height panes) trace to
-  early returns, never a panic; splash coordinates are compile-time range
-  checked.
-- CPU rationing aligns with sysinfo's internal 200 ms minimum update interval.
-- Panic/teardown ordering is correct: extras → raw-off/alt-leave → default hook;
-  the normal quit path saves state before restoring.
+The suspicious paths, each traced and disproved:
+
+- **Kill path (highest-risk code).** The pidfd fast path pins identity at
+  confirm time and re-reads `/proc/<pid>/stat` field 22 against the dialog-open
+  value, so a same-second reuse is caught; `ESRCH` from `pidfd_send_signal`
+  means the pinned original exited, never that a reused pid was hit. The
+  `kill_with(None)` fallback refuses rather than escalating to `Signal::Kill`
+  behind the user's back. `start_ticks` being `None` on both sides of the
+  comparison is the only pass-through, and the sysinfo start-time check plus
+  pidfd pin still guard it.
+- **`parse_start_ticks` field offset.** Field 22 is the 19th whitespace token
+  after the comm closer (field 3), so `nth(19)` after `rsplit_once(')')` is
+  right; comm names embedding spaces and `)` are handled by the last-`)` rule.
+  Tested with both shapes.
+- **Braille spark orientation.** `mini_spark` grows dots from `bit_col[3]` (dot
+  7/8, the bottom row) upward — a measured 0 draws `⣀` and 100 draws `⣿`, which
+  is what the tests assert. `DOT_BITS` columns match the Unicode braille dot
+  layout exactly.
+- **`windowed` bounds.** Every caller indexes below its window (`cx*2+s < n`,
+  `c < CELLS`, `cx < cols`), so neither the `data.len() >= window` nor the pad
+  branch can index out of range; the left pad is `None`, never a fabricated
+  zero.
+- **PDH `read_array` sizing.** `count ≤ n` is guaranteed by the status check: a
+  fill that would overflow returns `PDH_MORE_DATA` (non-zero) and the function
+  returns an empty table rather than reading past the allocation. `size` is
+  bytes on input, items on output, and `div_ceil` never under-allocates.
+- **`Instant::duration_since` panics.** Every delta pair (`ns_delta_util`,
+  `xe_ratio`'s callers, intel `power_w`, `pcie_kbs`) comes from two
+  monotonically increasing `Instant`s stamped by one clock — the scanner worker
+  for the fdinfo walks (which also guards `wall <= 0`), the same poll clock for
+  energy and pcie deltas (which guard `secs > 0`).
+- **Counter resets.** `pcie_kbs` saturates a reset to a 0 delta; intel `power_w`
+  treats `uj < prev_uj` as "no delta this poll" and re-seeds the baseline;
+  `ns_delta_util` saturates busy-time subtraction.
+- **Layout arithmetic.** `stacked_height`, `cards_that_fit`, `proc_pane_height`
+  all compute in `u32`/`u64` and are pinned by tests at the exact `u16::MAX`
+  wrap points; degenerate panes trace to early returns.
+- **The `attributed`/`video` invariant in the Intel backend.** Both
+  `utilization_pct` and `video_util_pct` are `Some` exactly when the sweep
+  attributed a client to the device: the only non-gated read is
+  `s.video_util.get(&i)`, which is empty for an unattributed device, so the
+  invariant the hardware test asserts holds by construction.
+- **Composite slot bookkeeping.** Placeholders inherit names/ids, vacated slots
+  stop claiming a live device, process indices rebase on the high-water mark,
+  `can_signal` is the AND of the children, and a partially failing poll keeps
+  the survivors' cards — all pinned by the Stub-driven suite, including the
+  tri-vendor and hotplug cases.
+- **Sweep state pruning.** `engine_state`/`i915_state`/`xe_state` are retained
+  against `sweep.seen` each walk, so short-lived DRM clients cannot grow the
+  maps unboundedly; `evict_absent_devices` bounds departed-GPU state; the
+  departed-pid sysinfo eviction sweeps only what left the table.
+- **State-file atomicity.** Temp file + same-filesystem rename, 0600 creation,
+  failure leaves the prior file intact — tested including the staged failure
+  (directory planted at the temp path).
+- **Unknown vs zero everywhere.** `MemReadout::pct` refuses a `total == 0` pool;
+  history records `None` for unreadable samples and renders it as a distinct
+  glyph in all three graph styles; `n/a`/`N/A`/`null`/`-` spellings per surface
+  are pinned by unit and smoke tests; PDH process memory is `None` only when
+  neither counter names the pid.
+- **`gts_to_gen` thresholds** match PCIe per-lane speeds (2.5/5/8/16/32/64/128
+  GT/s); `linux_major` matches glibc's `major()` encoding of `dev_t`.
+- **Windows LUID matching.** DXGI formats `0x%08x` lowercase, PDH instance names
+  are lowercased in `read_array`, `is_hex32` accepts either case, and the key is
+  matched structurally over `_`-tokens rather than by width.
+- **Mock safety.** `PID_BASE` sits above `pid_max`, `can_signal()` is false, and
+  the one real pid (gpur itself) is blocked by both the signalability gate and
+  the self-kill guard.
+- **`--once`/`--json` flow.** Two polls bracket the sleep, only the second is
+  logged (smoke test pins exactly one record), synchronous scan walks on the
+  calling thread so the deltas span the real interval.
+- **Replay framing.** The preloaded first record is handed back by the first
+  poll; EOF holds the final frame; out-of-frame rows are dropped; pre-`Option`
+  recordings still deserialize (`serde(default)` + explicit `null` handling
+  pinned by the double-round-trip smoke test).
 
 ## Hardening
 
-- Process identity is currently an observation rather than a pinned OS handle;
-  even a finer-grained timestamp would leave the check-to-signal race (the
-  finding above; a pidfd pin closes it on Linux).
-- Windows-only PDH item filtering has no platform-independent helper test, so
-  Linux CI cannot exercise that decision.
-- An engine that first appears mid-session in an xe client's `cycles` map gets a
-  one-poll lifetime-average ratio (`linux.rs:59`) — self-corrects, same as
-  nvtop-style tools.
-- intel `power_w` keeps a stale `(µJ, at)` baseline if `energy1_input` is
-  transiently unreadable, reporting average power over the outage window on the
-  next successful read.
+Correct today, fragile by convention rather than by type:
+
+- `--tick-ms` has no startup ceiling: `--tick-ms 99999999999` is floored but
+  never capped, so the event loop waits ~3 years for the first poll and gpur
+  reads as frozen. (Carried from the previous pass; `+`/`-` are capped.)
+- Intel `power_w` keeps its `(µJ, at)` baseline when `energy1_input` is
+  transiently unreadable, so the next successful read reports average power over
+  the outage window rather than over one interval.
+- NVML `pcie_throughput` returns decimal KB/s while the snapshot field and UI
+  label say KiB/s — a 2.4% drift on the PCIe readout.
+- Headless `--once`/`--json` on a mixed AMD+Intel box walks `/proc` once per
+  backend cursor per poll (the shared-walk dedup is lost in synchronous mode),
+  and the scanner worker thread stays alive through the one-shot run.
+- A re-detect whose child set changed (a driver appearing or disappearing)
+  renumbers child indices, changing every namespaced device id and resetting
+  graph/session history — the "survives a re-detect" guarantee holds only while
+  the child set is unchanged.
 - `first_dir` trusts sysfs `read_dir` order for a card with multiple hwmon
   children; amdgpu/i915 register one per device in practice.
-- `le_int` zero-extends sub-8-byte blobs, so a negative value in 1/2/4 bytes
-  decodes as a large positive; only positive device-tree props occur today.
-- NVML `pcie_throughput` reports KB/s (×1000) while the field and docs say KiB/s
-  (×1024) — a 2.4% drift if the UI labels it KiB/s.
-- One `PdhCollectQueryData` at probe: the first poll can read `PDH_NO_DATA` and
-  render a fully-`None` first frame on Windows.
-- `tick_ms` has no startup ceiling — `--tick-ms 99999999999` silently never
-  polls (same family as the overflow finding).
-- `--once`/`--json` synchronous mode does one `/proc` walk per backend cursor
-  per poll, defeating the shared-walk dedup; the worker thread also stays alive
-  through a one-shot run.
-- Re-detect with a changed child set renumbers child indices, so device ids
-  change and graph/session history resets despite the "survives re-detect"
-  comment — only holds while the child set is unchanged.
+- `le_int` zero-extends sub-8-byte blobs, so a negative 1/2/4-byte device-tree
+  value would decode as a large positive; only positive props occur today.
+- PDH `read_array` does not loop: if the instance count grows between the sizing
+  call and the fill, the second call returns `PDH_MORE_DATA` and that counter
+  reads as empty for one poll (all-None gauges for a tick) instead of retrying.
+  No overflow — just a lost tick.
+- Two `gpur --log` processes appending to one file can tear a record mid-line (a
+  flushed `BufWriter` record is not one atomic write); the replay reader skips
+  the malformed line, so the cost is one lost record.
 
 ## Coverage
 
@@ -216,14 +148,17 @@ rather than a pending diff.
 
 Reviewed: all Rust production modules under `src/` (backend composition,
 Linux/mock/replay, AMD/Intel/NVIDIA/Windows/Apple backends, app, main, ui, keys,
-config, theme, splash, cli) and both integration test files under `tests/`.
-Candidate findings were re-traced against the cited project lines and the
-resolved dependency versions (sysinfo 0.39.6, ratatui 0.30.2, nvml-wrapper
-0.12.1, hjkl-kitty).
+config, theme, splash, cli) read in full, line by line; both integration test
+files (`tests/smoke.rs` in full, `tests/tui.rs` via its test names and the
+harness) skimmed to confirm what invariants are pinned; installed sources of
+nvml-wrapper and sysinfo consulted for the API/units claims above.
 
-GAP: hardware behavior was not executed on AMD, Intel, NVIDIA, Apple, or Windows
-GPUs. macOS- and Windows-gated code was read but not compiled on this Linux
-host. Runtime package templates under `pkg/` were spot-checked only (the
-previous pass cleared their artifact/layout claims; no correctness changes
-landed in them since). Assets, prose documentation, and package metadata with no
-runtime behavior were not correctness-reviewed.
+GAP: hardware behavior was not executed on any GPU, and the macOS- and
+Windows-gated code (`apple.rs` IOKit, `windows.rs` PDH live paths) was read but
+not compiled on this Linux host — those paths are verified statically only, and
+their pure-function halves are what the test suite actually runs. GAP: `pkg/`
+templates, `assets/`, prose documentation, and the `CHANGELOG.md` were not
+correctness-reviewed (no runtime-code changes landed in them since the previous
+pass). GAP: dependency internals beyond the two spot-checks above
+(hjkl-keymap/kitty/splash dispatch, ratatui layout for overflowing constraints)
+were taken on trust rather than read.
