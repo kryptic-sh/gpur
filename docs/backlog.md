@@ -72,22 +72,7 @@ composition wiring are covered by unit tests. That DXGI's `VendorId` matches
 `0x10DE`/`0x1002`/`0x8086` on a real adapter, and that NVML and DXGI agree on
 which cards exist, rest on inspection.
 
-## 2. An NVIDIA card is still invisible when NVML is broken rather than absent
-
-**Severity: low.** `src/backend/nvidia.rs`.
-
-The nouveau case is covered: a card on the open driver is picked up from sysfs
-behind the NVML probe. What remains is a card bound to the _proprietary_ driver
-on a host where NVML cannot initialise — a container without `/dev/nvidiactl`, a
-mismatched driver/userspace pair. The card is in `/sys/class/drm` and no backend
-claims it.
-
-The reason it is not simply fixed the same way: an `nvidia`-bound card exposes
-essentially nothing in sysfs — no busy counter, no VRAM, no hwmon in the usual
-place — so listing it would add a name and a PCI address and nothing else.
-Whether a row of `n/a` beats an absent card is a product call, not a bug.
-
-## 3. Remaining test gaps
+## 2. Remaining test gaps
 
 - **The kill path's signal branch.** Unit tests in `app.rs` cover every refusal
   and one successful signal against a spawned `sleep`, but no PTY test reaches
@@ -190,7 +175,7 @@ Whether a row of `n/a` beats an absent card is a product call, not a bug.
   structurally (a 200 ms floor, `fe37c82`), which bounds the cost, but the
   numbers the review quoted are not measurements taken on this machine.
 
-## 4. NVIDIA temperature threshold unread
+## 3. NVIDIA temperature threshold unread
 
 **Severity: low.** `Device::temperature_threshold()` is available in
 `nvml-wrapper 0.12.1` (`device.rs:4048`) and would let each card carry its own
@@ -209,7 +194,7 @@ the only temperature field ids in `nvml-wrapper-sys 0.9.1` are
 `NVML_FI_DEV_MEMORY_TEMP` (wired up) and the four `*_TLIMIT` margins, which are
 thresholds, not a hotspot reading.
 
-## 5. Device naming differs per backend
+## 4. Device naming differs per backend
 
 **Severity: low, cosmetic.** `nvidia.rs` gives the marketing name
 (`NVIDIA GeForce RTX 4090`), the Linux backends the pci.ids codename
@@ -220,7 +205,7 @@ brand. Fallbacks differ too: `NVIDIA GPU 0` (index) against
 **Fix:** settle on a convention — prefer the marketing name, fall back to the
 codename, always suffix the card or index — and apply it uniformly.
 
-## 6. Intel memory totals could come from the DRM query ioctl
+## 5. Intel memory totals could come from the DRM query ioctl
 
 **Severity: low, accuracy.** The Intel backend reads its system-pool total from
 `/proc/meminfo` `MemTotal`, which is exactly what i915 reports for its system
@@ -239,7 +224,7 @@ processes this user happens to be able to read.
 sysfs reads, plus opening a device node. **Fix:** worth it only if the free-VRAM
 figure on discrete Arc is wanted; the iGPU totals would not change.
 
-## 7. Residual YAGNI
+## 6. Residual YAGNI
 
 - `src/theme.rs:89` `UiTheme::temp_ok` is `pub` but used only by `temp_style` at
   `:173` in the same file, unlike its peers `temp_warn` / `temp_crit`. Narrowing
@@ -248,7 +233,7 @@ figure on discrete Arc is wanted; the iGPU totals would not change.
   `Keymap<Action, Mode>`. Required by the `hjkl-keymap` API, so it cannot go,
   but no second mode is planned — filter and confirm bypass the keymap entirely.
 
-## 8. Noted upstream, not gpur's to fix
+## 7. Noted upstream, not gpur's to fix
 
 - **`hjkl-splash`'s changelog files a removal against the wrong release.** Its
   0.40.0 entry says the `ratatui` feature and `start_screen::render` were
@@ -263,7 +248,7 @@ figure on discrete Arc is wanted; the iGPU totals would not change.
   upgrade is safe — and it means the 0.33 series has no changelog at all. Fix
   belongs in the hjkl repo.
 
-## 9. A re-detect whose child set changed resets device-keyed state
+## 8. A re-detect whose child set changed resets device-keyed state
 
 **Severity: low.** `CompositeBackend` (`src/backend/mod.rs`) namespaces device
 ids by child index, so a re-detect (after five consecutive poll failures) whose
@@ -272,7 +257,7 @@ namespaced id and restarts graph/session history. The "survives a re-detect"
 guarantee holds only while the child set is unchanged. Fix: derive the id
 namespace from something stable across re-detects, or document the reset.
 
-## 10. Headless sync mode walks `/proc` once per backend cursor
+## 9. Headless sync mode walks `/proc` once per backend cursor
 
 **Severity: negligible.** `--once`/`--json` on a mixed AMD+Intel box walks twice
 per poll (one per cursor — the shared-walk dedup is lost in synchronous mode),
@@ -280,13 +265,13 @@ and the scanner worker thread stays alive through the one-shot run. A one-shot
 pays a few extra ms. Fix if it ever matters: share one synchronous walk per
 poll.
 
-## 11. `first_dir` trusts sysfs readdir order
+## 10. `first_dir` trusts sysfs readdir order
 
 **Severity: low.** `src/backend/linux.rs` `first_dir` picks the first hwmon
 child of a card; amdgpu/i915 register one per device in practice. Fix: if a card
 ever exposes several, filter for the one whose `name` identifies the device.
 
-## 12. Micro-optimisations declined as not worth the churn
+## 11. Micro-optimisations declined as not worth the churn
 
 From the 0.12.0 perf review's hardening list. All correct today; each is pure
 waste at the margin, and none was worth the churn when the finding was closed.
