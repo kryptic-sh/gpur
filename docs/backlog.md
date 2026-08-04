@@ -74,14 +74,6 @@ which cards exist, rest on inspection.
 
 ## 2. Remaining test gaps
 
-- **The kill path's signal branch.** Unit tests in `app.rs` cover every refusal
-  and one successful signal against a spawned `sleep`, but no PTY test reaches
-  it, because mock and replay now correctly refuse to signal. End-to-end
-  coverage needs a backend stub the test binary can inject — which would also
-  close the one mouse case left untested, the kill dialog as a modal. The filter
-  prompt covers the identical `input_mode != Normal` condition meanwhile. Note
-  the obvious shortcut, making the mock signalable, would weaken the guard that
-  exists to stop exactly that.
 - **Mouse kinds with no behaviour attached** — drag, middle and right button,
   and moves all fall to the `_ => None` arm. Untested because untested is what
   they are: there is nothing to assert yet.
@@ -107,11 +99,6 @@ which cards exist, rest on inspection.
   queue behind it follows from `App::poll` no longer walking, not from anything
   timed, and the pathological case that motivated the work (a 10k-process node
   at `--tick-ms 100`) has never been run.
-- **Nothing forces a refused thread spawn.** `ProcScanner::spawn_worker`
-  degrades to synchronous mode when the OS will not give it a thread, and that
-  degraded path is the one `synchronous_mode_walks_on_the_calling_thread` covers
-  — but the branch that chooses it is only reachable under thread exhaustion,
-  which no test creates.
 - **The hjkl 0.40 path re-home was read, not run, off Linux.** `hjkl-config`
   0.40 delegates config/cache resolution to the new `hjkl-xdg` crate instead of
   its own inline `xdg_base`. The two resolvers were compared side by side and
