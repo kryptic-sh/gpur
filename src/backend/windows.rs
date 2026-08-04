@@ -430,46 +430,57 @@ mod win {
 
     /// Read a wildcard counter into (instance_name, value) pairs.
     fn read_array(counter: PDH_HCOUNTER) -> Vec<(String, f64)> {
-        let mut size = 0u32;
-        let mut count = 0u32;
-        let status = unsafe {
-            PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &mut size, &mut count, None)
-        };
-        if status != PDH_MORE_DATA || size == 0 {
-            return Vec::new();
+        // PDH sizes and fills in two calls, and a counter's instance count can
+        // grow between them — the fill then returns PDH_MORE_DATA and the
+        // counter would read as empty for one poll. Retry on that, bounded so
+        // a misbehaving driver cannot spin the poll loop forever.
+        const MAX_ATTEMPTS: usize = 8;
+        for _ in 0..MAX_ATTEMPTS {
+            let mut size = 0u32;
+            let mut count = 0u32;
+            let status = unsafe {
+                PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &mut size, &mut count, None)
+            };
+            if status != PDH_MORE_DATA || size == 0 {
+                return Vec::new();
+            }
+            // PDH sizes the buffer in bytes but writes an array of items, so
+            // the allocation must carry the item's alignment — a `Vec<u8>`
+            // only promises 1. Capacity stays uninitialized; PDH fills it.
+            let n = (size as usize).div_ceil(size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>());
+            let mut buf: Vec<PDH_FMT_COUNTERVALUE_ITEM_W> = Vec::with_capacity(n);
+            let items = buf.as_mut_ptr();
+            let status = unsafe {
+                PdhGetFormattedCounterArrayW(
+                    counter,
+                    PDH_FMT_DOUBLE,
+                    &mut size,
+                    &mut count,
+                    Some(items),
+                )
+            };
+            if status == PDH_MORE_DATA {
+                continue; // the instance count grew between sizing and fill
+            }
+            if status != 0 {
+                return Vec::new();
+            }
+            return (0..count as usize)
+                .filter_map(|i| unsafe {
+                    let item = &*items.add(i);
+                    // PDH can report success while marking an item's data invalid
+                    // (e.g. a counter that has not collected twice yet); such an
+                    // item must not flow into the measurements as a real reading.
+                    (item.FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
+                        .then(|| {
+                            let name = item.szName.to_string().ok()?.to_lowercase();
+                            Some((name, item.FmtValue.Anonymous.doubleValue))
+                        })
+                        .flatten()
+                })
+                .collect();
         }
-        // PDH sizes the buffer in bytes but writes an array of items, so the
-        // allocation must carry the item's alignment — a `Vec<u8>` only
-        // promises 1. Capacity stays uninitialized; PDH fills it.
-        let n = (size as usize).div_ceil(size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>());
-        let mut buf: Vec<PDH_FMT_COUNTERVALUE_ITEM_W> = Vec::with_capacity(n);
-        let items = buf.as_mut_ptr();
-        let status = unsafe {
-            PdhGetFormattedCounterArrayW(
-                counter,
-                PDH_FMT_DOUBLE,
-                &mut size,
-                &mut count,
-                Some(items),
-            )
-        };
-        if status != 0 {
-            return Vec::new();
-        }
-        (0..count as usize)
-            .filter_map(|i| unsafe {
-                let item = &*items.add(i);
-                // PDH can report success while marking an item's data invalid
-                // (e.g. a counter that has not collected twice yet); such an
-                // item must not flow into the measurements as a real reading.
-                (item.FmtValue.CStatus == PDH_CSTATUS_VALID_DATA)
-                    .then(|| {
-                        let name = item.szName.to_string().ok()?.to_lowercase();
-                        Some((name, item.FmtValue.Anonymous.doubleValue))
-                    })
-                    .flatten()
-            })
-            .collect()
+        Vec::new()
     }
 }
 

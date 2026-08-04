@@ -10,6 +10,11 @@ and this project adheres to
 
 ### Fixed
 
+- **PDH counters no longer read empty for one poll when an instance appears
+  mid-read (Windows).** A counter's instance count could grow between the sizing
+  call and the fill, and the fill's `PDH_MORE_DATA` was treated as failure —
+  that counter's gauges went all-`None` for a tick. `read_array` now retries on
+  `PDH_MORE_DATA`, bounded to eight attempts.
 - **`--log` records no longer tear when two gpur instances share a file
   (unix).** A flushed `BufWriter` record is not one atomic write, so concurrent
   appenders could interleave mid-line and the replay reader would drop the
