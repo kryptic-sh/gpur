@@ -241,6 +241,59 @@ Revisit individually if the relevant path shows up in a profile.
   ~2 × meter width × cards spans/frame on a wide terminal. Idiomatic ratatui;
   revisit only if frame rate becomes a goal.
 
+## 12. `--once`/`--json` exit 0 with an empty snapshot when every poll fails
+
+**Severity: low-medium.** `main.rs` `snapshot()` (`src/main.rs:218-225`) polls
+twice and prints whatever came back; `App::poll_inner` (`src/app.rs:834-862`)
+keeps the previous snapshot on error, so when every poll fails — a driver reset
+after a successful probe, or the `GPUR_MOCK_FAIL=1` test hook (`mock.rs:43-54`)
+— `app.gpus` stays empty and `app.record()` (`src/app.rs:924-936`) emits
+`{"gpus":[],"processes":[]}` with exit 0; plain `--once` prints nothing at all.
+The empty record is a documented legitimate shape for "no GPUs"
+(`README.md:247`), but a total backend failure is indistinguishable from it: a
+script keying off `gpus: []` reports a healthy GPU-less box on a dead driver,
+and `--log` silently stops recording.
+
+```
+Repro: GPUR_MOCK_FAIL=1 gpur --json
+Expect: non-zero exit or an error signal
+Actual: exit 0, {"ts_ms":…,"backend":"mock","driver":"mock driver 1.0",
+        "gpus":[],"processes":[]}
+```
+
+Fix: exit non-zero (or print an error line) when every poll in the snapshot
+failed — `app.poll_error` is set (`src/app.rs:835`) and currently dropped.
+
+## 13. The scanner's seq counter can regress when worker and synchronous walk overlap
+
+**Severity: low.** `ProcScanner` has two producers of snapshot `seq`: the worker
+grabs `st.seq + 1` without committing (`src/backend/linux.rs:434`) and
+`scan_here` commits `st.seq += 1` before its walk
+(`src/backend/linux.rs:406-410`). The worker's publish then writes its stale
+reserved value back (`src/backend/linux.rs:440`). If the worker's startup walk
+(it begins with `wanted: true`, `src/backend/linux.rs:309`) finishes after two
+synchronous polls have minted higher seqs, the counter regresses and the next
+`scan_here` mints a seq the cursor already saw — `SweepCursor::next` is an
+equality check only (`src/backend/linux.rs:512-519`), so it returns `None` and
+one poll renders the previous figures despite having walked `/proc` fresh.
+Self-recovers next poll. Reachable in synchronous mode with the shared worker
+alive: the hardware tests pin the shared scanner synchronous (`amd.rs:831`,
+`intel.rs:826`) while `ProcScanner::shared()` keeps its worker.
+`--once`/`--json` poll exactly twice and are unaffected; the TUI's async path
+never calls `scan_here`.
+
+```
+Repro: no expressible input — an interleaving. Observable: in sync mode with
+       the worker's first walk landing between polls 2 and 3, poll 3 returns
+       poll 2's figures though it walked /proc.
+Expect: poll 3's fresh walk is attributed
+Actual: poll 3 is skipped (cursor returns None on the duplicate seq)
+```
+
+Fix: mint `seq` in one place under the lock — a `next_seq()` helper both
+producers call — so a publish can never write a value lower than what was
+already committed.
+
 ---
 
 ## Settled by review
@@ -308,6 +361,38 @@ verdicts, so a later pass does not re-derive them:
   map onto the hardware and profiling entries above.
 - **Out of scope of both reviews:** `pkg/` templates, `assets/`, prose docs, and
   dependency internals beyond the nvml-wrapper/sysinfo spot-checks.
+
+### The 2026-08-04 code review
+
+A full-codebase correctness review (all of `src/` plus `tests/tui.rs`, split
+across two read-only passes over disjoint file sets; depth low, high-confidence
+findings only). Two findings survived verification — items 12 and 13 above. What
+was traced and disproved, so a later pass does not re-derive it (these are the
+sub-agents' verdicts, each claiming full-file reads; the two findings themselves
+were re-traced by the orchestrator against the cited lines):
+
+- **The kill path, device-keyed state, record shape and rendering hold up.** The
+  pidfd pinning, `(pid, start_time)` identity, `(pid, drm-client-id)` fdinfo
+  dedup (sound against the kernel's file-scope global client-id counter), the
+  composite's slot bookkeeping, the serde record round-trip, and the PTY suite's
+  expectations all cleared.
+- **The one known PTY flake is test infrastructure, not product code.**
+  `kill_dialog_opens_for_a_real_process_and_cancels` (see the test-gap entry
+  above) is the only red seen, under parallel load only.
+- **Hardening notes (correct today, fragile by convention):** per-child poll
+  errors are dropped when a sibling child survives (`backend/mod.rs`) — the
+  "(unavailable)" placeholders remain but the reason text is unrecoverable; the
+  two `seq` producers are independent (same root as item 13); the fdinfo dedup
+  depends on the kernel keeping `drm_client_id` process-global; the pidfd
+  identity re-read precedes `pidfd_open` by a sub-microsecond window (standard
+  pidfd practice, fail-closed); holding a digit key delivers `Repeat` events
+  that toggle a fold on the selected card (visible flicker, no wrong end state,
+  `main.rs:334` filters only `Release`); a `start_ticks` unreadable-at-open /
+  readable-at-confirm transition refuses a same-process confirm (fail-closed);
+  signal-exit drops unsaved UI state (documented, intentional).
+- **Not reviewed:** `pkg/` templates, `assets/`, prose docs — the same exclusion
+  as the 0.12.0 reviews. The cleared claims above were not independently
+  re-traced line by line by the orchestrator; the two findings were.
 
 ## Decisions taken deliberately
 
