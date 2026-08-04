@@ -43,6 +43,10 @@ and this project adheres to
 
 ### Changed
 
+- **The footer hint line and the composite header driver line are computed once
+  instead of every frame.** Both are static for a session — the binding table is
+  const, and a re-detect builds a new composite — so the per-frame rebuilds were
+  pure waste.
 - **PCIe link maximums are read once at scan instead of every poll.** Max
   gen/width are fixed capabilities, so each device now caches them at probe and
   the per-poll read covers only the negotiated current pair — 2 sysfs reads per

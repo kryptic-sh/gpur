@@ -305,6 +305,10 @@ struct Child {
 /// whichever vendor came later in the chain.
 struct CompositeBackend {
     children: Vec<Child>,
+    /// Header driver line, computed once: the child set is fixed for this
+    /// composite's life (a re-detect builds a new one), so re-joining it
+    /// every frame is pure waste.
+    driver: std::sync::OnceLock<Option<String>>,
 }
 
 impl CompositeBackend {
@@ -319,6 +323,7 @@ impl CompositeBackend {
                     ids: Vec::new(),
                 })
                 .collect(),
+            driver: std::sync::OnceLock::new(),
         }
     }
 }
@@ -417,19 +422,23 @@ impl GpuBackend for CompositeBackend {
     /// already lead with their module name ("amdgpu · kernel 7.1"), so only
     /// prefix the ones that don't.
     fn driver_info(&self) -> Option<String> {
-        let parts: Vec<String> = self
-            .children
-            .iter()
-            .map(|c| {
-                let name = c.backend.name();
-                match c.backend.driver_info() {
-                    Some(d) if d.contains(name) => d,
-                    Some(d) => format!("{name} {d}"),
-                    None => name.to_string(),
-                }
+        self.driver
+            .get_or_init(|| {
+                let parts: Vec<String> = self
+                    .children
+                    .iter()
+                    .map(|c| {
+                        let name = c.backend.name();
+                        match c.backend.driver_info() {
+                            Some(d) if d.contains(name) => d,
+                            Some(d) => format!("{name} {d}"),
+                            None => name.to_string(),
+                        }
+                    })
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join(" · "))
             })
-            .collect();
-        (!parts.is_empty()).then(|| parts.join(" · "))
+            .clone()
     }
 
     /// One un-signalable child disables the kill path for every row: the
@@ -1200,6 +1209,11 @@ mod tests {
         assert_eq!(
             b.driver_info().as_deref(),
             Some("nvml driver 550.1 · amdgpu · kernel 7.1 · intel")
+        );
+        assert_eq!(
+            b.driver_info(),
+            b.driver_info(),
+            "the header driver line changed between calls"
         );
     }
 }

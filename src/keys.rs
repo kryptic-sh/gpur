@@ -1,6 +1,7 @@
 //! Keybindings via hjkl-keymap: vim chord notation, trie dispatch.
 
 use hjkl_keymap::{KeyResolve, Keymap};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -147,17 +148,21 @@ pub fn help_rows() -> Vec<(String, &'static str)> {
 }
 
 /// The persistent one-line footer, derived from [`BINDS`] so a new binding
-/// never has to be transcribed by hand.
-pub fn footer_hints() -> String {
-    let mut out = String::new();
-    for short in BINDS.iter().filter_map(|(_, _, _, s)| *s) {
+/// never has to be transcribed by hand. Built once: the binding table is
+/// const, so re-formatting the same string every frame is pure waste.
+pub fn footer_hints() -> &'static str {
+    static HINTS: OnceLock<String> = OnceLock::new();
+    HINTS.get_or_init(|| {
+        let mut out = String::new();
+        for short in BINDS.iter().filter_map(|(_, _, _, s)| *s) {
+            out.push(' ');
+            out.push_str(short);
+            out.push(' ');
+        }
         out.push(' ');
-        out.push_str(short);
-        out.push(' ');
-    }
-    out.push(' ');
-    out.push_str(DIGITS.2);
-    out
+        out.push_str(DIGITS.2);
+        out
+    })
 }
 
 pub fn default_keymap() -> Keymap<Action, Mode> {
@@ -218,6 +223,16 @@ mod tests {
                 "footer chunk {chunk:?} has no binding"
             );
         }
+    }
+
+    /// The footer is built once and handed back as the same static string — a
+    /// per-frame rebuild is the waste the cache exists to remove.
+    #[test]
+    fn the_footer_is_built_once() {
+        assert!(
+            std::ptr::eq(footer_hints(), footer_hints()),
+            "footer_hints() rebuilt its string"
+        );
     }
 
     #[test]
