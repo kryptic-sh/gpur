@@ -341,6 +341,13 @@ impl GpuBackend for CompositeBackend {
     fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
         let mut out = Vec::new();
         let mut errors = Vec::new();
+        // How many children share each backend name, so ids can be namespaced
+        // by name alone and the index is only needed when two collide on it.
+        let mut name_counts: std::collections::HashMap<&'static str, usize> =
+            std::collections::HashMap::new();
+        for c in &self.children {
+            *name_counts.entry(c.backend.name()).or_default() += 1;
+        }
         for (ci, c) in self.children.iter_mut().enumerate() {
             let mut snaps = match c.backend.poll() {
                 Ok(s) => s,
@@ -354,12 +361,22 @@ impl GpuBackend for CompositeBackend {
             };
             // Namespace every child's ids. Nothing in the trait stops two
             // children minting the same string, and two devices sharing one
-            // key would share one set of graphs. The child index is fixed for
-            // the session (and re-detect rebuilds the same probe order), so
-            // it also survives a re-detect.
+            // key would share one set of graphs. The namespace is the backend
+            // NAME, not the child index: a re-detect whose child set changed
+            // (one vendor's driver dropping out) renumbers the indices, and
+            // renumbering would reset every graph, peak and fold keyed on the
+            // old id. Names are unique among the children `detect()` builds, so
+            // the name is collision-free on its own; the index is appended only
+            // when two children share a name (unreachable in production, kept
+            // for the trait-level defensive test).
             for s in &mut snaps {
                 if let Some(id) = s.device_id.take() {
-                    s.device_id = Some(format!("{}#{ci}:{id}", c.backend.name()));
+                    let name = c.backend.name();
+                    s.device_id = Some(if name_counts[name] > 1 {
+                        format!("{name}#{ci}:{id}")
+                    } else {
+                        format!("{name}:{id}")
+                    });
                 }
             }
             c.slots = c.slots.max(snaps.len());
@@ -857,19 +874,17 @@ mod tests {
 
     /// Two children can mint the same id string — nothing in the trait stops
     /// them — and two devices sharing a key would share one set of graphs.
+    /// The namespace is the backend name, so distinct names need no index.
     #[test]
     fn device_ids_are_namespaced_per_child() {
         let mut b = CompositeBackend::new(vec![
             Box::new(Stub::new("nv", vec![Some(vec!["gpu0"])])),
             Box::new(Stub::new("amd", vec![Some(vec!["gpu0"])])),
         ]);
-        assert_eq!(
-            ids(&b.poll().unwrap()),
-            [Some("nv#0:gpu0"), Some("amd#1:gpu0")]
-        );
+        assert_eq!(ids(&b.poll().unwrap()), [Some("nv:gpu0"), Some("amd:gpu0")]);
 
-        // Even two children reporting the same backend name stay apart: the
-        // child index is part of the namespace.
+        // Two children reporting the SAME backend name stay apart: the index
+        // is appended only when names collide.
         let mut same = CompositeBackend::new(vec![
             Box::new(Stub::new("nv", vec![Some(vec!["gpu0"])])),
             Box::new(Stub::new("nv", vec![Some(vec!["gpu0"])])),
@@ -880,6 +895,33 @@ mod tests {
         );
     }
 
+    /// A re-detect that drops one vendor — `App::poll_inner` re-runs
+    /// `BackendSource::detect()` after 5 consecutive poll failures, and the
+    /// new composite holds only the probes that still succeed — renumbers the
+    /// children: amdgpu moves from index 1 to index 0. Ids are namespaced by
+    /// backend name, not child index, so the surviving device's id (and every
+    /// graph, peak and fold keyed on it) survives the rebuild.
+    #[test]
+    fn a_renumbered_child_keeps_its_device_ids() {
+        let mut with_nvidia = CompositeBackend::new(vec![
+            Box::new(Stub::new("nvml", vec![Some(vec!["4090"])])),
+            Box::new(Stub::new("amdgpu", vec![Some(vec!["780M"])])),
+        ]);
+        // The NVIDIA driver dropped out: the rebuilt composite is amdgpu only.
+        let mut amd_only = CompositeBackend::new(vec![Box::new(Stub::new(
+            "amdgpu",
+            vec![Some(vec!["780M"])],
+        ))]);
+
+        let with_nvidia_snaps = with_nvidia.poll().unwrap();
+        let amd_only_snaps = amd_only.poll().unwrap();
+
+        let amd_id = ids(&with_nvidia_snaps)[1];
+        let amd_only_id = ids(&amd_only_snaps)[0];
+        assert_eq!(amd_id, amd_only_id);
+        assert_eq!(amd_id, Some("amdgpu:780M"));
+    }
+
     /// A child that cannot identify its devices must not be handed a made-up
     /// id here — `App` falls back to position, and it has to know that.
     #[test]
@@ -888,7 +930,7 @@ mod tests {
             Box::new(Stub::new("nv", vec![Some(vec!["4090"])])),
             Box::new(Stub::new("pdh", vec![Some(vec!["iGPU"])]).no_ids()),
         ]);
-        assert_eq!(ids(&b.poll().unwrap()), [Some("nv#0:4090"), None]);
+        assert_eq!(ids(&b.poll().unwrap()), [Some("nv:4090"), None]);
     }
 
     /// The placeholder holding a vanished device's slot is that same device,
@@ -906,7 +948,7 @@ mod tests {
         b.poll().unwrap();
         assert_eq!(
             ids(&b.poll().unwrap()),
-            [Some("nv#0:4090"), Some("nv#0:4080"), Some("amd#1:APU")]
+            [Some("nv:4090"), Some("nv:4080"), Some("amd:APU")]
         );
     }
 
@@ -941,11 +983,11 @@ mod tests {
         assert_eq!(
             ids(&b.poll().unwrap()),
             [
-                Some("nvml#0:4090"),
-                Some("nvml#0:4080"),
-                Some("amdgpu#1:780M"),
-                Some("intel#2:UHD"),
-                Some("intel#2:Arc"),
+                Some("nvml:4090"),
+                Some("nvml:4080"),
+                Some("amdgpu:780M"),
+                Some("intel:UHD"),
+                Some("intel:Arc"),
             ]
         );
         let procs: Vec<(u32, usize)> = b.processes().iter().map(|p| (p.pid, p.gpu_index)).collect();
@@ -987,14 +1029,14 @@ mod tests {
             names(&snaps),
             ["4090", "W7900", "W7800 (unavailable)", "Arc"]
         );
-        assert_eq!(ids(&snaps)[2], Some("amdgpu#1:W7800"));
+        assert_eq!(ids(&snaps)[2], Some("amdgpu:W7800"));
         assert_eq!(last(&mut b), [(1, 0), (9, 3)]);
 
         // Grown past its high-water mark: Arc moves down one, and its process
         // row moves with it rather than staying on the new AMD card.
         let snaps = b.poll().unwrap();
         assert_eq!(names(&snaps), ["4090", "W7900", "W7800", "W7700", "Arc"]);
-        assert_eq!(ids(&snaps)[4], Some("intel#2:Arc"));
+        assert_eq!(ids(&snaps)[4], Some("intel:Arc"));
         assert_eq!(last(&mut b), [(1, 0), (9, 4)]);
     }
 
@@ -1025,7 +1067,7 @@ mod tests {
         ]);
         b.poll().unwrap();
         let snaps = b.poll().unwrap();
-        assert_eq!(ids(&snaps), [Some("nv#0:B"), None, Some("amd#1:APU")]);
+        assert_eq!(ids(&snaps), [Some("nv:B"), None, Some("amd:APU")]);
         // And the placeholder stops printing the name of a card that is on
         // screen one row above it.
         assert_eq!(names(&snaps), ["B", "nv GPU 1 (unavailable)", "APU"]);

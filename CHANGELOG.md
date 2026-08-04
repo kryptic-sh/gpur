@@ -49,6 +49,14 @@ and this project adheres to
 
 ### Changed
 
+- **Device ids are namespaced by backend name rather than child index.** A
+  re-detect after repeated poll failures rebuilds the composite from whichever
+  backends still probe, so a vendor's driver dropping out (or returning)
+  renumbered the surviving children and reset every graph, peak and fold keyed
+  on their ids. The namespace is now the backend name — stable across a
+  re-detect — and the index is appended only where two children share a name
+  (unreachable through `detect()`, kept as a trait-level guard). Persisted folds
+  keyed on the old `name#index:id` format reset once.
 - **The footer hint line and the composite header driver line are computed once
   instead of every frame.** Both are static for a session — the binding table is
   const, and a re-detect builds a new composite — so the per-frame rebuilds were
