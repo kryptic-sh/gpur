@@ -10,6 +10,12 @@ and this project adheres to
 
 ### Fixed
 
+- **Intel power no longer averages over a sensor-outage window.** When the hwmon
+  energy counter was transiently unreadable, the backend kept its `(µJ, at)`
+  baseline — so the next successful read reported average power over the whole
+  outage instead of one interval. The baseline is now dropped on a failed read,
+  so the next delta covers exactly one interval; the instantaneous
+  `power1_input` fallback, where present, is used meanwhile.
 - **A huge poll interval no longer freezes the monitor at startup.**
   `--tick-ms`, the persisted rate and the config value were floored at 50 ms but
   never capped, so `--tick-ms 99999999999` made the event loop wait ~3 years for

@@ -321,6 +321,12 @@ mod linux_impl {
                 }
                 return None; // first sample: no delta yet
             }
+            // The energy counter was unreadable this poll (a transient sensor
+            // outage). The stored baseline, if any, spans an unknown interval —
+            // keeping it would report average power over the whole outage on the next
+            // good read. Drop it so the next delta covers exactly one interval; the
+            // instantaneous fallback below, where present, is the honest figure.
+            self.energy_state.remove(&i);
             read_u64(&h.join("power1_input")).map(|v| v as f64 / 1e6)
         }
     }
@@ -704,6 +710,64 @@ drm-resident-gtt:\t1024 KiB
             assert_eq!(m.local, (1024 << 20) + (8 << 20));
             assert_eq!(m.system, 1 << 20);
             assert!(m.saw_local);
+        }
+
+        /// A transiently unreadable energy counter must not leave a baseline
+        /// that spans the outage: the next good read would report average
+        /// power over the whole window instead of one interval. The baseline
+        /// is dropped on a failed read, so the next reading restarts fresh.
+        #[test]
+        fn an_unreadable_energy_counter_drops_the_power_baseline() {
+            let h = testing::Sandbox::new("intel-power-outage");
+            let dev = IntelDevice {
+                name: "test".into(),
+                card: h.join("drm/card0"),
+                dev: h.join("pci/0000:00:02.0"),
+                hwmon: Some(h.to_path_buf()),
+                pdev: Some("0000:00:02.0".into()),
+                driver: "i915".into(),
+                vram_total: None,
+                discrete: false,
+            };
+            let mut b = IntelBackend {
+                devices: vec![dev],
+                sys_mem_total: None,
+                i915_state: HashMap::new(),
+                xe_state: HashMap::new(),
+                energy_state: HashMap::new(),
+                cursor: SweepCursor::on(Arc::clone(&ProcScanner::detached())),
+                buckets: IntelBuckets::default(),
+                last_procs: Vec::new(),
+            };
+            let t0 = Instant::now();
+
+            // First reading seeds the baseline: no delta yet.
+            fs::write(h.join("energy1_input"), "1000000\n").unwrap();
+            assert_eq!(b.power_w(0, t0), None);
+
+            // One second later, 0.5 J accumulated: 0.5 W.
+            fs::write(h.join("energy1_input"), "1500000\n").unwrap();
+            let w = b.power_w(0, t0 + Duration::from_secs(1)).unwrap();
+            assert!((w - 0.5).abs() < 1e-9, "expected 0.5 W, got {w}");
+
+            // The counter vanishes: the instantaneous fallback is present and
+            // wins, and the baseline is dropped.
+            fs::remove_file(h.join("energy1_input")).unwrap();
+            fs::write(h.join("power1_input"), "3000000\n").unwrap(); // 3 W
+            let w = b.power_w(0, t0 + Duration::from_secs(2)).unwrap();
+            assert!((w - 3.0).abs() < 1e-9, "expected the 3 W fallback, got {w}");
+
+            // The counter comes back. With the fix the baseline is gone, so
+            // this is a fresh first sample (None); without the fix it would
+            // report (2e6 - 1.5e6)/1e6/2s = 0.25 W averaged over the outage.
+            fs::write(h.join("energy1_input"), "2000000\n").unwrap();
+            assert_eq!(b.power_w(0, t0 + Duration::from_secs(3)), None);
+
+            // One more second: the delta now covers exactly one interval —
+            // 0.5 W.
+            fs::write(h.join("energy1_input"), "2500000\n").unwrap();
+            let w = b.power_w(0, t0 + Duration::from_secs(4)).unwrap();
+            assert!((w - 0.5).abs() < 1e-9, "expected 0.5 W, got {w}");
         }
     }
 
