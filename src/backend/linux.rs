@@ -330,6 +330,17 @@ impl ProcScanner {
             .name("gpur-proc-sweep".into())
             .spawn(move || scanner.run())
             .is_ok();
+        self.on_spawn_outcome(spawned);
+    }
+
+    /// The refused-spawn degradation, split out so a test can force the
+    /// branch that only thread exhaustion otherwise reaches. A worker the OS
+    /// refused means nothing will ever publish, so every `latest` would wait
+    /// out `FIRST_SCAN_WAIT` and return nothing — the process table would be
+    /// permanently empty behind a UI that stalls once per tick. Walking on
+    /// the calling thread is what this code did before the worker existed: a
+    /// UI that stutters beats one that hangs and shows nothing.
+    fn on_spawn_outcome(self: &Arc<Self>, spawned: bool) {
         if !spawned {
             self.set_synchronous(true);
         }
@@ -1618,6 +1629,27 @@ drm-resident-vram0:\t4096 KiB
         assert!(second.seq > first.seq, "the same walk was served twice");
         assert!(first.at >= asked, "served a walk older than the request");
         assert!(second.at > first.at);
+    }
+
+    /// The refused-spawn branch: an OS that will not give the worker a thread
+    /// must degrade to walking on the polling thread, not leave the process
+    /// table waiting out FIRST_SCAN_WAIT forever. Only reachable under real
+    /// thread exhaustion, so the decision is split out and driven here.
+    #[test]
+    fn a_refused_worker_spawn_degrades_to_synchronous_mode() {
+        let refused = ProcScanner::detached();
+        refused.on_spawn_outcome(false);
+        assert!(
+            refused.synchronous.load(Ordering::Relaxed),
+            "a refused spawn did not switch to synchronous mode"
+        );
+        // A successful spawn keeps the async worker.
+        let accepted = ProcScanner::detached();
+        accepted.on_spawn_outcome(true);
+        assert!(
+            !accepted.synchronous.load(Ordering::Relaxed),
+            "a successful spawn switched to synchronous mode"
+        );
     }
 
     /// The worker is paced: requests arriving faster than MIN_WALK_INTERVAL are
