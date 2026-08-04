@@ -77,22 +77,34 @@ which cards exist, rest on inspection.
 - **Mouse kinds with no behaviour attached** — drag, middle and right button,
   and moves all fall to the `_ => None` arm. Untested because untested is what
   they are: there is nothing to assert yet.
-- **The threaded sweep reaches a real card only through the AMD backend.**
-  `the_worker_thread_feeds_the_backend_on_real_hardware` in `amd.rs` gives a
-  backend a `ProcScanner` wired the production way and asserts its own render
-  node reaches a row; `intel.rs` has no counterpart, so on Intel the worker path
-  is proven only against hand-published walks. The other hardware tests pin the
-  shared scanner to synchronous through `amd()` / `intel()`, deliberately — a
-  test that opens a client and polls is asserting on that client, so the walk
-  has to happen after the open. Worth adding the Intel twin next time that
-  machine is available.
-- **One walk serving every vendor is unverified on a mixed-vendor box.** Both
-  backends take `SweepCursor::default()` (`amd.rs`, `intel.rs`), which is the
+- **The threaded sweep reaches a real card on both Linux backends.** AMD has
+  `the_worker_thread_feeds_the_backend_on_real_hardware` in `amd.rs` and Intel
+  gained its twin (same name, `intel.rs`) — each gives the backend a scanner
+  wired the production way and asserts its own render node reaches a row. The
+  other hardware tests pin the shared scanner to synchronous through `amd()` /
+  `intel()`, deliberately — a test that opens a client and polls is asserting on
+  that client, so the walk has to happen after the open. The Intel twin was
+  written against the machine this backlog is written on but only runs where
+  `GPUR_REQUIRE_INTEL` is set; it has not yet been run on real silicon.
+- **One walk serving every vendor: the count half is pinned, the live half is
+  not.** Both backends take `SweepCursor::default()` (`amd.rs`, `intel.rs`), the
   shared `ProcScanner`, so structurally an AMD + Intel machine takes one walk a
-  tick rather than one per backend. Nothing has observed it: the machine this
-  was written on has AMD cards only, and no test asserts a walk count across two
-  live backends. `a_cursor_attributes_each_walk_once` covers the half that is
-  checkable anywhere — two cursors over one scanner each receive the same walk.
+  tick rather than one per backend. `a_cursor_attributes_each_walk_once` shows
+  two cursors over one scanner each receive the same walk, and
+  `two_cursors_over_one_worker_share_each_walk` now pins the count: two cursors
+  polling one worker-backed scanner cost one paced walk, not two. What still has
+  no observation is the thing itself — two LIVE backends walking the shared
+  scanner on an actual mixed-vendor box (this one has AMD cards only). Next time
+  such a machine runs the suite with `GPUR_REQUIRE_AMD` and `GPUR_REQUIRE_INTEL`
+  set, a poll of both backends asserting their process rows land together would
+  close it.
+- **`kill_dialog_opens_for_a_real_process_and_cancels` (tests/tui.rs) is flaky
+  under parallel load.** It waits for the stub backend's `sleep 60` row and has
+  timed out twice (2026-08-04) while the suite ran other tests in the same
+  binary — the screen showed two rows whose COMMAND column did not name `sleep`,
+  as if sysinfo enrichment of the stub's child row raced. It passes in isolation
+  and in every other full run, and no change under test has been implicated.
+  Uninvestigated; run the tui binary serially if it bites again.
 - **No before/after measurement of the responsiveness this bought.** The 4.2 ms
   over 588 pids in the old entry measured the walk itself, and the walk's code
   is unchanged — what moved is which thread runs it. That keystrokes no longer
@@ -162,36 +174,6 @@ which cards exist, rest on inspection.
   structurally (a 200 ms floor, `fe37c82`), which bounds the cost, but the
   numbers the review quoted are not measurements taken on this machine.
 
-## 3. NVIDIA temperature threshold unread
-
-**Severity: low.** `Device::temperature_threshold()` is available in
-`nvml-wrapper 0.12.1` (`device.rs:4048`) and would let each card carry its own
-thermal limits.
-
-Note this is not a meter rescale: temperature has no meter. `src/ui.rs`
-`temp_span` colours the reading through `UiTheme::temp_style`, which thresholds
-at a fixed 75 °C and 90 °C for every device. So wiring this up changes **when a
-card reads as hot**, which differs by part — a laptop GPU throttling at 87 °C
-and a workstation card rated to 100 °C currently share one scale. Needs a new
-`GpuSnapshot` field and a `temp_style` that takes the card's own limits, and it
-is a product call rather than a mechanical change.
-
-Junction temperature is genuinely unavailable rather than merely unimplemented:
-the only temperature field ids in `nvml-wrapper-sys 0.9.1` are
-`NVML_FI_DEV_MEMORY_TEMP` (wired up) and the four `*_TLIMIT` margins, which are
-thresholds, not a hotspot reading.
-
-## 4. Device naming differs per backend
-
-**Severity: low, cosmetic.** `nvidia.rs` gives the marketing name
-(`NVIDIA GeForce RTX 4090`), the Linux backends the pci.ids codename
-(`Navi 31 [Radeon RX 7900 XT/...]`), Windows the DXGI description, Apple the SoC
-brand. Fallbacks differ too: `NVIDIA GPU 0` (index) against
-`AMD GPU 0x744c (card1)` (device id plus card).
-
-**Fix:** settle on a convention — prefer the marketing name, fall back to the
-codename, always suffix the card or index — and apply it uniformly.
-
 ## 5. Intel memory totals could come from the DRM query ioctl
 
 **Severity: low, accuracy.** The Intel backend reads its system-pool total from
@@ -235,15 +217,6 @@ figure on discrete Arc is wanted; the iGPU totals would not change.
   upgrade is safe — and it means the 0.33 series has no changelog at all. Fix
   belongs in the hjkl repo.
 
-## 8. A re-detect whose child set changed resets device-keyed state
-
-**Severity: low.** `CompositeBackend` (`src/backend/mod.rs`) namespaces device
-ids by child index, so a re-detect (after five consecutive poll failures) whose
-child set changed — a driver appearing or disappearing — renumbers every
-namespaced id and restarts graph/session history. The "survives a re-detect"
-guarantee holds only while the child set is unchanged. Fix: derive the id
-namespace from something stable across re-detects, or document the reset.
-
 ## 9. Headless sync mode walks `/proc` once per backend cursor
 
 **Severity: negligible.** `--once`/`--json` on a mixed AMD+Intel box walks twice
@@ -251,12 +224,6 @@ per poll (one per cursor — the shared-walk dedup is lost in synchronous mode),
 and the scanner worker thread stays alive through the one-shot run. A one-shot
 pays a few extra ms. Fix if it ever matters: share one synchronous walk per
 poll.
-
-## 10. `first_dir` trusts sysfs readdir order
-
-**Severity: low.** `src/backend/linux.rs` `first_dir` picks the first hwmon
-child of a card; amdgpu/i915 register one per device in practice. Fix: if a card
-ever exposes several, filter for the one whose `name` identifies the device.
 
 ## 11. Micro-optimisations declined as not worth the churn
 
@@ -287,8 +254,10 @@ They are recorded so a later pass does not spend time re-deriving them.
 
 - **Device identity is sound.** `device_keys` degrades a duplicate or absent
   `device_id` to a positional key, positional keys are never persisted, and
-  `CompositeBackend` namespaces every child's ids by child index so two backends
-  cannot mint the same key. The vacated-slot de-duplication is correct.
+  `CompositeBackend` namespaces every child's ids by backend name — the index
+  only where two children share a name, which `detect()` cannot produce — so two
+  backends cannot mint the same key, and the namespace survives a re-detect
+  whose child set changed. The vacated-slot de-duplication is correct.
 - **Process index rebasing is sound.** `CompositeBackend::processes` accumulates
   by `slots`, the high-water mark, rather than by the current poll's device
   count, and drops rows outside their own child's span. The three-child and
