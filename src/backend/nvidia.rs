@@ -216,11 +216,11 @@ impl GpuBackend for NvmlBackend {
                 pcie_rx_kbs: dev
                     .pcie_throughput(PcieUtilCounter::Receive)
                     .ok()
-                    .map(u64::from),
+                    .map(kb_to_kib),
                 pcie_tx_kbs: dev
                     .pcie_throughput(PcieUtilCounter::Send)
                     .ok()
-                    .map(u64::from),
+                    .map(kb_to_kib),
                 perf_level: dev.performance_state().ok().and_then(pstate_label),
                 ..Default::default()
             });
@@ -577,6 +577,13 @@ fn pstate_label(p: PerformanceState) -> Option<String> {
     (n <= 15).then(|| format!("P{n}"))
 }
 
+/// NVML's PCIe throughput counter counts decimal KB/s (`nvmlDeviceGetPcieThroughput`
+/// documents KB; nvidia-smi prints the same figure), while the snapshot field
+/// and the UI label say KiB/s. Convert so the number matches the label.
+fn kb_to_kib(kb: u32) -> u64 {
+    u64::from(kb) * 1000 / 1024
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,5 +692,15 @@ mod tests {
             mem_bytes(&UsedGpuMemory::Used(2 << 30)),
             Some(2_147_483_648)
         );
+    }
+
+    /// NVML counts PCIe throughput in decimal KB/s; the field and label say
+    /// KiB/s, so the value is converted — 1024 decimal KB is exactly 1000 KiB.
+    #[test]
+    fn pcie_throughput_converts_decimal_kb_to_kib() {
+        assert_eq!(kb_to_kib(0), 0);
+        assert_eq!(kb_to_kib(1024), 1000);
+        assert_eq!(kb_to_kib(1000), 976); // 1000 * 1000 / 1024
+        assert_eq!(kb_to_kib(u32::MAX), u64::from(u32::MAX) * 1000 / 1024);
     }
 }

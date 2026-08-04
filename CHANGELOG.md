@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Fixed
 
+- **NVML PCIe throughput now matches its label.** `nvmlDeviceGetPcieThroughput`
+  counts decimal KB/s while the snapshot field and the UI label say KiB/s, so
+  the readout was 2.4% high; the value is now converted to true KiB/s at the
+  read site.
 - **Apple device-tree scalars shorter than 8 bytes now sign-extend.** `le_int`
   zero-extended a 1/2/4-byte `CFData` blob, so a negative value decoded as a
   large positive; only positive properties occur today, so the signed cases are
