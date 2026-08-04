@@ -10,6 +10,14 @@ and this project adheres to
 
 ### Changed
 
+- **Container ids are resolved once per process instead of on every poll.** The
+  Linux backends' rows arrive without container attribution, so each poll read
+  `/proc/<pid>/cgroup` again for every GPU process. The cgroup path is ~static
+  per process, so it is now cached per (pid, start time) and re-read only when
+  the pid's identity changes; rows naming a pid sysinfo can't resolve still read
+  it directly, and the cache is pruned of pids that leave the GPU table. Command
+  lines still re-derive each poll from sysinfo's cached cmdline — an in-place
+  `exec` must not leave a stale COMMAND column.
 - **NVML session-static data is read once at probe.** The per-poll loop
   re-queried `name`, `bus_type` and the maximum PCIe link gen/width — values
   fixed for the life of the device — as driver round-trips on every poll, beside

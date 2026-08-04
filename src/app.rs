@@ -282,6 +282,18 @@ fn container_of_pid(_pid: u32) -> Option<String> {
     None
 }
 
+/// Resolve a pid's container id through a cache keyed on (pid, start time):
+/// the cgroup path is ~static per process, so a fresh `/proc/<pid>/cgroup`
+/// read per poll is wasted I/O. The resolver runs only on a miss.
+fn cached_container(
+    cache: &mut HashMap<(u32, u64), Option<String>>,
+    pid: u32,
+    start_time: u64,
+    read: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    cache.entry((pid, start_time)).or_insert_with(read).clone()
+}
+
 /// One row of the process table: GPU stats + host-side enrichment.
 #[derive(Clone, serde::Serialize)]
 pub struct ProcRow {
@@ -586,6 +598,12 @@ pub struct App {
     /// [`cpu_sample_due`]. `None` until the first poll.
     last_cpu_sample: Option<Instant>,
     users: Users,
+    /// Resolved container ids per (pid, start time). The cgroup path is ~static
+    /// per process, so re-reading `/proc/<pid>/cgroup` every poll for every row
+    /// the Linux backends emit is wasted I/O. Keyed on the same seconds-resolution
+    /// start time the kill path pins, so a recycled pid re-resolves; pruned each
+    /// poll to the pids still on a GPU.
+    proc_text: HashMap<(u32, u64), Option<String>>,
 }
 
 impl App {
@@ -644,6 +662,7 @@ impl App {
             sys: System::new(),
             last_cpu_sample: None,
             users: Users::new_with_refreshed_list(),
+            proc_text: HashMap::new(),
         }
     }
 
@@ -958,7 +977,21 @@ impl App {
                         .clone()
                         .or(p.map(command_of))
                         .unwrap_or_else(|| "?".into()),
-                    container: gp.container.clone().or_else(|| container_of_pid(gp.pid)),
+                    container: match (&gp.container, p) {
+                        // A backend that pre-enriches rows (replay) owns the
+                        // attribution.
+                        (Some(c), _) => Some(c.clone()),
+                        // Live row with a resolvable pid: cache on the pid's
+                        // identity.
+                        (None, Some(p)) => {
+                            cached_container(&mut self.proc_text, gp.pid, p.start_time(), || {
+                                container_of_pid(gp.pid)
+                            })
+                        }
+                        // Unresolvable pid: no identity to key on, read
+                        // directly as today.
+                        (None, None) => container_of_pid(gp.pid),
+                    },
                     pid: gp.pid,
                     gpu_index: gp.gpu_index,
                     kind: gp.kind,
@@ -984,6 +1017,11 @@ impl App {
                 .then(a.pid.cmp(&b.pid))
                 .then(a.gpu_index.cmp(&b.gpu_index))
         });
+        // Cache hygiene, same rule as `evict_departed_processes`: entries for
+        // pids no longer on a GPU would otherwise accumulate for the life of
+        // the session.
+        let live: HashSet<u32> = pids.iter().map(|p| p.as_u32()).collect();
+        self.proc_text.retain(|(pid, _), _| live.contains(pid));
         self.rebuild_proc_view();
     }
 
@@ -1837,6 +1875,88 @@ mod tests {
         assert!(
             app.sys.process(Pid::from_u32(pid)).is_none(),
             "a departed pid accumulated in the sysinfo cache"
+        );
+    }
+
+    /// The container cache resolves once per (pid, start time): a second row
+    /// for the same process must not re-read `/proc`, and a recycled pid (new
+    /// start time) must re-resolve rather than inherit the old process's
+    /// cgroup.
+    #[test]
+    fn cached_container_resolves_once_per_process_identity() {
+        let mut cache: HashMap<(u32, u64), Option<String>> = HashMap::new();
+        // Cell so the resolver closure can be passed by value (Copy) per call
+        // while the counter stays readable between calls.
+        let reads = std::cell::Cell::new(0);
+        let resolve = || {
+            reads.set(reads.get() + 1);
+            Some("docker:abcdef123456".into())
+        };
+        assert_eq!(
+            cached_container(&mut cache, 7, 100, resolve),
+            Some("docker:abcdef123456".into())
+        );
+        assert_eq!(
+            cached_container(&mut cache, 7, 100, resolve),
+            Some("docker:abcdef123456".into())
+        );
+        assert_eq!(
+            reads.get(),
+            1,
+            "the resolver ran again for the same process"
+        );
+        // Same pid, different start time: a different process.
+        assert_eq!(
+            cached_container(&mut cache, 7, 200, resolve),
+            Some("docker:abcdef123456".into())
+        );
+        assert_eq!(reads.get(), 2);
+        // A None reading is cached too — a containerless process stays a miss.
+        let mut cache2: HashMap<(u32, u64), Option<String>> = HashMap::new();
+        let reads2 = std::cell::Cell::new(0);
+        let none = || {
+            reads2.set(reads2.get() + 1);
+            None
+        };
+        assert_eq!(cached_container(&mut cache2, 9, 1, none), None);
+        assert_eq!(cached_container(&mut cache2, 9, 1, none), None);
+        assert_eq!(reads2.get(), 1);
+    }
+
+    /// The container cache is pruned alongside the sysinfo process cache:
+    /// a pid that leaves the GPU table must not leave its (pid, start time)
+    /// entry accumulating for the life of the session.
+    #[test]
+    #[cfg(unix)]
+    fn a_pid_that_leaves_the_gpu_table_is_pruned_from_the_container_cache() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let mut app = app_with(Box::new(ChurningBackend {
+            ticks: vec![vec![pid], vec![]],
+            tick: 0,
+        }));
+
+        app.poll();
+        // The entry exists whether or not the cgroup read succeeds
+        // (`or_insert_with` always inserts), so this holds on any machine.
+        assert_eq!(
+            app.proc_text.len(),
+            1,
+            "the poll never resolved the child's container"
+        );
+
+        child.kill().expect("kill child");
+        child.wait().expect("reap child");
+
+        // Second poll: the backend has stopped listing the pid, so the entry
+        // has no live process to belong to anymore.
+        app.poll();
+        assert!(
+            app.proc_text.is_empty(),
+            "a departed pid left a stale container entry in the cache"
         );
     }
 
