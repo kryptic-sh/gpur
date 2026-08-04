@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-04
+
 ### Fixed
 
 - **An NVIDIA card is no longer invisible when NVML cannot initialise (Linux).**
@@ -878,7 +880,8 @@ whose "Settled by review" section records what was checked and still holds.
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/kryptic-sh/gpur/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.12.0
 [0.11.1]: https://github.com/kryptic-sh/gpur/releases/tag/v0.11.1
 [0.11.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.11.0
