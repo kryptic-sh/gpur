@@ -240,6 +240,14 @@ fn scan_proc(seq: u64) -> ProcSnapshot {
 /// pathological `/proc` — costs one late frame rather than a frozen UI.
 const FIRST_SCAN_WAIT: Duration = Duration::from_secs(2);
 
+/// Walks requested more often than this are served the previous snapshot
+/// instead; the worker never starts one sooner. Bounds the sweep's CPU cost
+/// when the poll interval is shorter than the walk (a busy box at a fast tick
+/// would otherwise re-walk `/proc` at the poll rate forever), and only widens
+/// the measurement window — utilization is a counter delta over the actual
+/// walk-to-walk interval, so a slower walk rate never corrupts it.
+const MIN_WALK_INTERVAL: Duration = Duration::from_millis(200);
+
 /// The `/proc` walk, moved off the render thread.
 ///
 /// The scan is synchronous I/O over every process on the machine, and it used
@@ -271,6 +279,10 @@ struct ScanState {
     latest: Option<Arc<ProcSnapshot>>,
     /// A walk has been asked for and not yet started.
     wanted: bool,
+    /// The worker is mid-walk. Requests arriving while it is are absorbed
+    /// rather than queued, so a walk that outlasts the tick cannot make the
+    /// worker start another the moment it finishes.
+    walking: bool,
     /// Walks completed, which is also the last published snapshot's `seq`.
     seq: u64,
 }
@@ -351,8 +363,20 @@ impl ProcScanner {
             return Some(self.scan_here());
         }
         let mut st = self.lock();
-        st.wanted = true;
-        self.wanted.notify_one();
+        // Pace the worker: a walk younger than MIN_WALK_INTERVAL, or one still
+        // in flight, already covers this poll — requesting another would walk
+        // `/proc` at the poll rate, which on a busy box at a fast tick spends a
+        // whole core re-reading fds. The caller detects the unchanged seq and
+        // redraws the previous figures, as it does for any poll that finds no
+        // new walk.
+        let fresh = st
+            .latest
+            .as_ref()
+            .is_some_and(|s| Instant::now().saturating_duration_since(s.at) < MIN_WALK_INTERVAL);
+        if !st.walking && !fresh {
+            st.wanted = true;
+            self.wanted.notify_one();
+        }
         if st.latest.is_none() {
             // Nothing has ever been published: there is no stale answer to
             // fall back on, so this one call waits for the first walk.
@@ -395,6 +419,7 @@ impl ProcScanner {
                 st = self.wanted.wait(st).unwrap_or_else(|e| e.into_inner());
             }
             st.wanted = false;
+            st.walking = true;
             let seq = st.seq + 1;
             drop(st);
 
@@ -403,6 +428,7 @@ impl ProcScanner {
             let mut st = self.lock();
             st.seq = seq;
             st.latest = Some(snap);
+            st.walking = false;
             self.published.notify_all();
         }
     }
@@ -1554,6 +1580,34 @@ drm-resident-vram0:\t4096 KiB
         assert!(second.seq > first.seq, "the same walk was served twice");
         assert!(first.at >= asked, "served a walk older than the request");
         assert!(second.at > first.at);
+    }
+
+    /// The worker is paced: requests arriving faster than MIN_WALK_INTERVAL are
+    /// served the previous walk, never a fresh one — a poll hammering the scanner
+    /// must not walk `/proc` at the poll rate.
+    #[test]
+    fn the_worker_serves_paced_walks_not_one_per_request() {
+        let scanner = ProcScanner::detached_with_worker();
+        let mut cursor = SweepCursor::on(Arc::clone(&scanner));
+        let first = cursor.next().expect("a first walk");
+        // Request continuously for ~1.5 floors; a paced worker produces at most a
+        // couple more walks, an unpaced one produces dozens.
+        let deadline = Instant::now() + MIN_WALK_INTERVAL * 3 / 2;
+        let mut walks = vec![first];
+        while Instant::now() < deadline {
+            if let Some(s) = cursor.next() {
+                walks.push(s);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(walks.len() <= 4, "walked per request: {}", walks.len());
+        for w in walks.windows(2) {
+            let gap = w[1].at.saturating_duration_since(w[0].at);
+            assert!(
+                gap >= MIN_WALK_INTERVAL.saturating_sub(Duration::from_millis(100)),
+                "walks {gap:?} apart"
+            );
+        }
     }
 
     /// The fdinfo sweep sums regions it read, so its zero is a reading. Unlike

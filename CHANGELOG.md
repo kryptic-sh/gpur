@@ -10,6 +10,16 @@ and this project adheres to
 
 ### Changed
 
+- **The `/proc` fdinfo sweep no longer re-walks at the poll rate.** The Linux
+  backends' per-process scan was re-requested on every poll, so at a fast tick
+  on a busy box the worker could spend a whole core walking `/proc` (the walk is
+  ~4.2 ms over 588 pids and scales with the process count). Walks are now paced
+  to at most one every 200 ms and requests arriving mid-walk are absorbed, so
+  the sweep-fed figures (the process table, Intel's gauges, AMD's video%)
+  refresh at most every 200 ms on top of whatever the poll interval is — a
+  slower refresh, never a wrong one, since utilization is measured between the
+  walks' own timestamps.
+
 - **The `hjkl-*` dependencies moved from 0.33 to 0.40** — `hjkl-config`,
   `hjkl-keymap`, `hjkl-keymap-tui`, `hjkl-kitty`, `hjkl-splash` and
   `hjkl-theme`. No call site changed: every symbol gpur uses is unchanged, and
