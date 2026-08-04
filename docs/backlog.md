@@ -34,8 +34,8 @@ and Alpine jobs succeeded. Only `Publish AUR (gpur-bin)` failed, on
 Not a configuration fault. The same `git ls-remote` fails identically from a
 developer machine with a working AUR account, while `ssh aur@aur.archlinux.org`
 answers its greeter normally — the interactive shell is up and git-upload-pack
-is not. Re-run attempts at the time all hit the same banner, and a re-check the
-following day (2026-08-03) got the same one — so this is an outage measured in
+is not. Re-run attempts at the time all hit the same banner, and re-checks on
+2026-08-03 and 2026-08-04 got the same one — so this is an outage measured in
 days, not minutes.
 
 **To finish:** once `git ls-remote ssh://aur@aur.archlinux.org/gpur-bin.git`
@@ -213,10 +213,10 @@ figure on discrete Arc is wanted; the iGPU totals would not change.
 
 ## 6. Residual YAGNI
 
-- `src/theme.rs:89` `UiTheme::temp_ok` is `pub` but used only by `temp_style` at
-  `:173` in the same file, unlike its peers `temp_warn` / `temp_crit`. Narrowing
-  it alone would be asymmetric.
-- `src/keys.rs:7` `enum Mode { Normal }` has one variant threaded through
+- `UiTheme::temp_ok` (`src/theme.rs`) is `pub` but used only by `temp_style` in
+  the same file, unlike its peers `temp_warn` / `temp_crit`. Narrowing it alone
+  would be asymmetric.
+- `enum Mode { Normal }` (`src/keys.rs`) has one variant threaded through
   `Keymap<Action, Mode>`. Required by the `hjkl-keymap` API, so it cannot go,
   but no second mode is planned — filter and confirm bypass the keymap entirely.
 
@@ -483,3 +483,8 @@ Recorded so they are not re-opened as findings.
   session-static NVML values. It changes when the user moves the power cap;
   caching it would show a stale limit until restart. One query per poll keeps
   the displayed limit live.
+- **The kill-dialog PTY tests use a separate stub backend, never a signalable
+  mock.** `GPUR_STUB_BACKEND=1` (`src/backend/stub.rs`) reports one real local
+  process so the dialog is reachable from the harness; making the mock
+  signalable instead would weaken the guard that exists to stop exactly that —
+  fabricated pids must never be signalable.
