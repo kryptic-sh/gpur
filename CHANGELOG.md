@@ -49,6 +49,13 @@ and this project adheres to
 
 ### Changed
 
+- **Linux cards render their pci.ids marketing name, not the codename-first
+  entry.** pci.ids lists most modern parts as `codename [marketing name]`
+  (`Navi 31 [Radeon RX 7900 XT/7900 XTX/7900M]`), and the header showed that
+  verbatim — so AMD and Intel cards read as codenames while NVIDIA (NVML) cards
+  read as marketing names. The bracketed name is now extracted and preferred,
+  falling back to the whole entry when there is none, matching the NVML, Windows
+  and Apple naming.
 - **Device ids are namespaced by backend name rather than child index.** A
   re-detect after repeated poll failures rebuilds the composite from whichever
   backends still probe, so a vendor's driver dropping out (or returning)

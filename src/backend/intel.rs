@@ -1277,7 +1277,8 @@ drm-resident-gtt:\t1024 KiB
                 let device_id = device_id.trim().trim_start_matches("0x");
                 if let Some(marketing) = linux::pci_device_name(&ids, "8086", device_id) {
                     assert_eq!(
-                        d.name, marketing,
+                        d.name,
+                        linux::marketing_name(&marketing),
                         "card{idx} is listed in pci.ids but rendered as a fallback"
                     );
                 }

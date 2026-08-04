@@ -913,11 +913,26 @@ fn pci_ids() -> Option<&'static str> {
         .as_deref()
 }
 
+/// "Navi 31 [Radeon RX 7900 XT/7900 XTX/7900M]" -> "Radeon RX 7900 XT/7900 XTX/7900M".
+/// pci.ids lists most modern parts as "codename [marketing name]"; the bracketed
+/// name is what the user recognises, so prefer it and fall back to the whole
+/// entry (the codename) when there is no bracket.
+pub fn marketing_name(entry: &str) -> String {
+    entry
+        .rsplit_once('[')
+        .and_then(|(_, rest)| rest.strip_suffix(']'))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| entry.to_string())
+}
+
 /// Resolve a card's marketing name from pci.ids with a readable fallback.
 pub fn card_name(dev: &Path, idx: u32, vendor_hex: &str, fallback_brand: &str) -> String {
     let device_id = read_trim(&dev.join("device")).unwrap_or_default();
     pci_ids()
         .and_then(|ids| pci_device_name(ids, vendor_hex, device_id.trim_start_matches("0x")))
+        .map(|name| marketing_name(&name))
         .unwrap_or_else(|| format!("{fallback_brand} GPU {device_id} (card{idx})"))
 }
 
@@ -1498,6 +1513,33 @@ drm-resident-vram0:\t4096 KiB
             Some("DG2 [Arc A770]")
         );
         assert_eq!(pci_device_name(IDS, "1002", "0e3b"), None);
+    }
+
+    #[test]
+    fn marketing_name_prefers_the_bracketed_marketing_name() {
+        assert_eq!(
+            marketing_name("Navi 31 [Radeon RX 7900 XT/7900 XTX/7900M]"),
+            "Radeon RX 7900 XT/7900 XTX/7900M"
+        );
+        assert_eq!(marketing_name("DG2 [Arc A770]"), "Arc A770");
+        assert_eq!(
+            marketing_name("Vega 10 XT [Radeon RX Vega 64]"),
+            "Radeon RX Vega 64"
+        );
+    }
+
+    #[test]
+    fn marketing_name_falls_back_without_a_bracket() {
+        assert_eq!(
+            marketing_name("VGA compatible controller"),
+            "VGA compatible controller"
+        );
+        assert_eq!(marketing_name(""), "");
+    }
+
+    #[test]
+    fn marketing_name_keeps_an_empty_codename_out_of_the_result() {
+        assert_eq!(marketing_name("[Radeon RX 7900 XT]"), "Radeon RX 7900 XT");
     }
 
     /// A walk carrying `clients`, stamped now.
