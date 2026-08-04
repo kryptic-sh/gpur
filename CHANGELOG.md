@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Fixed
 
+- **Apple device-tree scalars shorter than 8 bytes now sign-extend.** `le_int`
+  zero-extended a 1/2/4-byte `CFData` blob, so a negative value decoded as a
+  large positive; only positive properties occur today, so the signed cases are
+  a decoding correction rather than a behavior change.
 - **Intel power no longer averages over a sensor-outage window.** When the hwmon
   energy counter was transiently unreadable, the backend kept its `(µJ, at)`
   baseline — so the next successful read reported average power over the whole

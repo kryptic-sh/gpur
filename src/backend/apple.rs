@@ -144,13 +144,24 @@ mod parse {
     /// Decode a device-tree `CFData` blob as a little-endian integer.
     /// Device-tree-backed properties (`gpu-core-count`) arrive as a raw blob,
     /// not a `CFNumber`; widths of 1/2/4/8 bytes all occur. Anything wider is
-    /// not a scalar and is rejected rather than truncated.
+    /// not a scalar and is rejected rather than truncated. A value shorter
+    /// than 8 bytes is signed: a set sign bit extends, so `0xff` decodes as
+    /// -1 rather than 255.
     pub fn le_int(bytes: &[u8]) -> Option<i64> {
         if bytes.is_empty() || bytes.len() > 8 {
             return None;
         }
         let mut buf = [0u8; 8];
         buf[..bytes.len()].copy_from_slice(bytes);
+        // Device-tree scalars shorter than 8 bytes are signed: a value with
+        // the width's sign bit set must sign-extend, or `0xff` would decode
+        // as 255 rather than -1. Only positive properties occur today, so
+        // this is a decoding correction, not a behavior change.
+        if bytes.last().is_some_and(|b| b & 0x80 != 0) {
+            for b in &mut buf[bytes.len()..] {
+                *b = 0xff;
+            }
+        }
         Some(i64::from_le_bytes(buf))
     }
 }
@@ -608,5 +619,11 @@ mod tests {
         // Not a scalar: reject rather than silently truncate.
         assert_eq!(le_int(&[]), None);
         assert_eq!(le_int(&[0; 9]), None);
+        // Signed scalars shorter than 8 bytes: the sign bit extends.
+        assert_eq!(le_int(&[0xff]), Some(-1));
+        assert_eq!(le_int(&[0xff, 0xff]), Some(-1));
+        assert_eq!(le_int(&[0x00, 0x80]), Some(-32768));
+        assert_eq!(le_int(&[0xff, 0x7f]), Some(32767));
+        assert_eq!(le_int(&[0x00, 0x00, 0x00, 0x80]), Some(-2147483648));
     }
 }
