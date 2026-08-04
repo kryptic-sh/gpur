@@ -8,6 +8,16 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--once`/`--json` no longer exit 0 with an empty snapshot when every poll
+  fails.** A driver reset after a successful probe left the headless paths
+  printing `{"gpus":[],"processes":[]}` (or nothing at all) with exit 0 —
+  indistinguishable from a genuinely GPU-less box to a script, and `--log`
+  silently stopped recording. When both polls fail, the paths now exit non-zero
+  with the poll error on stderr, keeping stdout clean; the empty record shape
+  remains reserved for a successful poll that found no devices.
+
 ## [0.13.0] - 2026-08-04
 
 ### Fixed

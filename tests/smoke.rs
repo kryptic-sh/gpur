@@ -285,6 +285,81 @@ fn json_snapshot_emits_valid_shape() {
     );
 }
 
+/// Positive control for the two fail-hook tests below: without the hook the
+/// mock's single card must render, so `json_exits_nonzero_when_every_poll_fails`
+/// cannot pass trivially (the mock's `GPUR_MOCK_FAIL=1` bails on every poll).
+#[test]
+fn json_snapshot_without_fail_hook_emits_nonempty_gpus() {
+    let sb = Sandbox::new("jsonok");
+    let out = sb
+        .cmd()
+        .args(["--mock", "1", "--json", "--tick-ms", "100"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "plain --mock --json failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("\"Mock GPU 0\""),
+        "mock card missing from the JSON snapshot: {s}"
+    );
+}
+
+/// The headless path must not read a total backend failure as a healthy
+/// GPU-less box: when every poll fails, the snapshot is empty only because
+/// nothing was ever measured, so exit non-zero with the poll error on stderr
+/// instead of printing `{"gpus":[],...}` with exit 0. stdout stays clean for
+/// the JSON consumer.
+#[test]
+fn json_exits_nonzero_when_every_poll_fails() {
+    let sb = Sandbox::new("jsonfail");
+    let out = sb
+        .cmd()
+        .args(["--mock", "1", "--json", "--tick-ms", "100"])
+        .env("GPUR_MOCK_FAIL", "1")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "all-failed polls printed a snapshot with exit 0"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("poll failed"),
+        "poll error not reported on stderr: {err}"
+    );
+    assert!(
+        err.contains("simulated driver reset"),
+        "mock's error not propagated: {err}"
+    );
+}
+
+/// The plain `--once` counterpart: with every poll failing there is nothing
+/// to print, and silence must not read as success to a script either.
+#[test]
+fn once_exits_nonzero_when_every_poll_fails() {
+    let sb = Sandbox::new("oncefail");
+    let out = sb
+        .cmd()
+        .args(["--mock", "1", "--once", "--tick-ms", "100"])
+        .env("GPUR_MOCK_FAIL", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "all-failed polls exited 0 on --once");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("poll failed"),
+        "poll error not reported on stderr: {err}"
+    );
+    assert!(
+        err.contains("simulated driver reset"),
+        "mock's error not propagated: {err}"
+    );
+}
+
 #[test]
 fn completions_flag_covers_all_shells() {
     // A shell-specific dispatch line, not just the binary name: every
