@@ -23,7 +23,7 @@ pub(crate) fn claimed_ids(drm: &str) -> Vec<String> {
 mod linux_impl {
     use crate::backend::linux::{
         self, ClientSample, FdClient, ProcSnapshot, SweepCursor, SweepDevice, card_name,
-        cards_with_driver, fan_pct, first_dir, hwmon_u64, pdev_of, read_trim, read_u64,
+        cards_with_driver, fan_pct, hwmon_u64, pdev_of, read_trim, read_u64,
     };
     use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, clamp_pct};
     use anyhow::Result;
@@ -292,7 +292,7 @@ mod linux_impl {
             .into_iter()
             .map(|(idx, dev, driver)| {
                 let name = card_name(&dev, idx, "1002", "AMD");
-                let hwmon = first_dir(&dev.join("hwmon"));
+                let hwmon = linux::hwmon_dir(&dev, &driver);
                 let pdev = pdev_of(&dev);
                 let temp_crit_c = hwmon
                     .as_deref()

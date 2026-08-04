@@ -27,7 +27,7 @@ pub(crate) fn claimed_ids(drm: &str) -> Vec<String> {
 mod linux_impl {
     use crate::backend::linux::{
         self, ClientSample, FdClient, ProcSnapshot, SweepCursor, SweepDevice, card_name,
-        cards_with_driver, first_dir, hwmon_u64, pdev_of, read_u64,
+        cards_with_driver, hwmon_u64, pdev_of, read_u64,
     };
     use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, clamp_pct};
     use anyhow::Result;
@@ -440,7 +440,7 @@ mod linux_impl {
                 let (pcie_max_gen, pcie_max_width) = linux::pcie_max_link(&dev);
                 Some(IntelDevice {
                     name,
-                    hwmon: first_dir(&dev.join("hwmon")),
+                    hwmon: linux::hwmon_dir(&dev, &driver),
                     pdev: pdev_of(&dev),
                     card,
                     dev,

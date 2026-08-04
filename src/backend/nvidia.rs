@@ -326,8 +326,8 @@ impl GpuBackend for MergedNvidiaBackend {
 #[cfg(target_os = "linux")]
 mod nouveau {
     use crate::backend::linux::{
-        card_name, cards_with_driver, driver_line_for, fan_pct, first_dir, hwmon_u64,
-        pci_device_id, pcie_current_link, pcie_max_link, pdev_of,
+        self, card_name, cards_with_driver, driver_line_for, fan_pct, hwmon_u64, pci_device_id,
+        pcie_current_link, pcie_max_link, pdev_of,
     };
     use crate::backend::{GpuBackend, GpuSnapshot};
     use anyhow::Result;
@@ -380,7 +380,7 @@ mod nouveau {
             let (pcie_max_gen, pcie_max_width) = pcie_max_link(&dev);
             NouveauDevice {
                 name: card_name(&dev, idx, "10de", "NVIDIA"),
-                hwmon: first_dir(&dev.join("hwmon")),
+                hwmon: linux::hwmon_dir(&dev, &driver),
                 pdev: pdev_of(&dev),
                 dev,
                 driver,

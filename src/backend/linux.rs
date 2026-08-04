@@ -674,12 +674,26 @@ pub fn read_trim(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
-pub fn first_dir(path: &Path) -> Option<PathBuf> {
-    fs::read_dir(path)
+/// The hwmon child directory of a card, preferring the one whose `name` file
+/// identifies the device's bound driver. amdgpu/i915/xe/nouveau register one
+/// hwmon per device in practice, so the first child in readdir order has never
+/// been the wrong one; a card that ever exposes several (a second chip, a
+/// backlight) must not have its sensors picked by directory order. Falls back
+/// to the first child when none names the driver.
+pub fn hwmon_dir(dev: &Path, driver: &str) -> Option<PathBuf> {
+    let dirs: Vec<PathBuf> = fs::read_dir(dev.join("hwmon"))
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .find(|p| p.is_dir())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.iter()
+        .find(|p| {
+            read_trim(&p.join("name"))
+                .is_some_and(|n| n == driver || n.starts_with(&format!("{driver}_")))
+        })
+        .cloned()
+        .or_else(|| dirs.into_iter().next())
 }
 
 /// "card1" -> Some(1); connectors ("card1-DP-1") and render nodes -> None.
@@ -1240,6 +1254,52 @@ drm-resident-vram0:\t4096 KiB
         fs::remove_file(h.join("pwm1")).unwrap();
         assert_eq!(fan_pct(Some(&h)), None);
         assert_eq!(fan_pct(None), None);
+    }
+
+    /// A card with several hwmon children (a second chip, a backlight) must
+    /// read its sensors from the child the driver itself registered, not from
+    /// whichever child readdir happens to list first.
+    #[test]
+    fn hwmon_dir_prefers_the_driver_named_child_over_readdir_order() {
+        let dev = scratch("hwmon-driver");
+        let hwmon = dev.join("hwmon");
+        fs::create_dir_all(hwmon.join("hwmon0")).unwrap();
+        fs::create_dir_all(hwmon.join("hwmon1")).unwrap();
+        // The foreign child is created first; the driver's own hwmon second.
+        fs::write(hwmon.join("hwmon0/name"), "backlight\n").unwrap();
+        fs::write(hwmon.join("hwmon1/name"), "amdgpu\n").unwrap();
+        assert_eq!(hwmon_dir(&dev, "amdgpu"), Some(hwmon.join("hwmon1")));
+    }
+
+    /// amdgpu on pre-GCN cards names its hwmon `amdgpu_legacy`; the `_`-suffix
+    /// rule is what keeps those cards on their sensors instead of the fallback.
+    #[test]
+    fn hwmon_dir_matches_the_legacy_driver_name() {
+        let dev = scratch("hwmon-legacy");
+        let hwmon = dev.join("hwmon");
+        fs::create_dir_all(hwmon.join("hwmon0")).unwrap();
+        fs::write(hwmon.join("hwmon0/name"), "amdgpu_legacy\n").unwrap();
+        assert_eq!(hwmon_dir(&dev, "amdgpu"), Some(hwmon.join("hwmon0")));
+    }
+
+    /// No child naming the driver is today's behaviour, pinned: the first
+    /// child in readdir order, not None — a card that merely lacks a `name`
+    /// file must still report its sensors.
+    #[test]
+    fn hwmon_dir_falls_back_to_the_first_child_when_none_names_the_driver() {
+        let dev = scratch("hwmon-fallback");
+        let hwmon = dev.join("hwmon");
+        fs::create_dir_all(hwmon.join("hwmon0")).unwrap();
+        fs::create_dir_all(hwmon.join("hwmon1")).unwrap();
+        fs::write(hwmon.join("hwmon0/name"), "backlight\n").unwrap();
+        fs::write(hwmon.join("hwmon1/name"), "another_chip\n").unwrap();
+        let first = fs::read_dir(&hwmon)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.is_dir())
+            .unwrap();
+        assert_eq!(hwmon_dir(&dev, "amdgpu"), Some(first));
     }
 
     /// A box running two of a vendor's drivers at once has to say so: the
