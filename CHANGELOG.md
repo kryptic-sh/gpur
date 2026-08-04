@@ -8,6 +8,14 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **A huge poll interval no longer freezes the monitor at startup.**
+  `--tick-ms`, the persisted rate and the config value were floored at 50 ms but
+  never capped, so `--tick-ms 99999999999` made the event loop wait ~3 years for
+  its first poll. The resolved interval is now clamped to the same 10 s ceiling
+  the `-` key uses (`MAX_TICK_MS`, shared by both).
+
 ### Changed
 
 - **Container ids are resolved once per process instead of on every poll.** The

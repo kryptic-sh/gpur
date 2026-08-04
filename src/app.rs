@@ -16,6 +16,17 @@ const STATUS_MS: u64 = 4000;
 /// *raised* the interval to 100 with no way back.
 pub const MIN_TICK_MS: u64 = 50;
 
+/// Poll-interval ceiling, shared by the CLI/config clamp and the `-` key. A
+/// huge interval reads as a frozen monitor — the loop waits that long for its
+/// first poll — so a value above this is clamped rather than honoured.
+pub const MAX_TICK_MS: u64 = 10_000;
+
+/// The startup poll-rate clamp: `--tick-ms`, the persisted rate and the config
+/// value are unbounded above, so a huge one is brought back into range here.
+pub fn clamp_tick_ms(v: u64) -> u64 {
+    v.clamp(MIN_TICK_MS, MAX_TICK_MS)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Gpus,
@@ -1351,7 +1362,7 @@ impl App {
                 self.tick_explicit = true;
             }
             Action::TickSlower => {
-                self.tick_ms = self.tick_ms.saturating_mul(2).min(10_000);
+                self.tick_ms = self.tick_ms.saturating_mul(2).min(MAX_TICK_MS);
                 self.tick_explicit = true;
             }
             Action::Digit(i) => {
@@ -1989,6 +2000,16 @@ mod tests {
         );
     }
 
+    /// `--tick-ms` and config values are unbounded above, so the startup clamp is
+    /// the only thing between a typo'd interval and a monitor that waits years for
+    /// its first poll.
+    #[test]
+    fn the_startup_tick_clamp_floors_and_caps() {
+        assert_eq!(clamp_tick_ms(0), MIN_TICK_MS);
+        assert_eq!(clamp_tick_ms(50), 50);
+        assert_eq!(clamp_tick_ms(9_999_999_999), MAX_TICK_MS);
+    }
+
     /// `+` must never *raise* the interval: the key floor and the CLI floor
     /// are one constant now.
     #[test]
@@ -2014,7 +2035,7 @@ mod tests {
         let mut app = app_with(Box::new(LocalBackend));
         app.tick_ms = 9_223_372_036_854_775_808;
         app.apply(Action::TickSlower);
-        assert_eq!(app.tick_ms, 10_000);
+        assert_eq!(app.tick_ms, MAX_TICK_MS);
         assert!(app.tick_explicit);
     }
 

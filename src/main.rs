@@ -53,11 +53,7 @@ fn main() -> Result<()> {
     // state file shadows config.toml forever after the first run.
     let state = app::load_state().filter(|_| !headless);
     let saved_tick = state.as_ref().and_then(app::UiState::sticky_tick_ms);
-    let tick_ms = cli
-        .tick_ms
-        .or(saved_tick)
-        .unwrap_or(cfg.tick_ms)
-        .max(app::MIN_TICK_MS);
+    let tick_ms = app::clamp_tick_ms(cli.tick_ms.or(saved_tick).unwrap_or(cfg.tick_ms));
     let theme_path = cli.theme.clone().or(cfg.theme.clone());
 
     let theme = theme::load(theme_path.as_deref(), theme::detect_color_mode())?;
