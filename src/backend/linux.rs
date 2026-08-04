@@ -283,7 +283,10 @@ struct ScanState {
     /// rather than queued, so a walk that outlasts the tick cannot make the
     /// worker start another the moment it finishes.
     walking: bool,
-    /// Walks completed, which is also the last published snapshot's `seq`.
+    /// The highest sequence number reserved for a walk. Minted under the lock
+    /// by `next_seq`; a snapshot can publish with a number below a later
+    /// reservation, so this is a reservation counter, not the newest published
+    /// seq.
     seq: u64,
 }
 
@@ -400,14 +403,21 @@ impl ProcScanner {
         st.latest.clone()
     }
 
+    /// The next walk's sequence number, minted under the lock so the worker and
+    /// the synchronous walk can never reserve the same number. A snapshot is
+    /// published with the number minted for it; nothing ever writes the counter
+    /// back, so a slow walk cannot regress it past what a sibling producer
+    /// already reserved.
+    fn next_seq(&self) -> u64 {
+        let mut st = self.lock();
+        st.seq += 1;
+        st.seq
+    }
+
     /// Walk on the calling thread and publish, advancing `seq` exactly as the
     /// worker does so a cursor cannot tell the two apart.
     fn scan_here(&self) -> Arc<ProcSnapshot> {
-        let seq = {
-            let mut st = self.lock();
-            st.seq += 1;
-            st.seq
-        };
+        let seq = self.next_seq();
         let snap = Arc::new(scan_proc(seq));
         self.lock().latest = Some(Arc::clone(&snap));
         snap
@@ -431,13 +441,12 @@ impl ProcScanner {
             }
             st.wanted = false;
             st.walking = true;
-            let seq = st.seq + 1;
             drop(st);
 
+            let seq = self.next_seq();
             let snap = Arc::new(scan_proc(seq));
 
             let mut st = self.lock();
-            st.seq = seq;
             st.latest = Some(snap);
             st.walking = false;
             self.published.notify_all();
@@ -1819,6 +1828,42 @@ drm-resident-vram0:\t4096 KiB
                 gap >= MIN_WALK_INTERVAL.saturating_sub(Duration::from_millis(100)),
                 "walks {gap:?} apart"
             );
+        }
+    }
+
+    /// The seq counter must never hand two walks the same number, even when the
+    /// worker and the synchronous path interleave: the worker reserves its number
+    /// at grab time and the publish never writes the counter back, so a slow
+    /// first walk cannot regress it. Before the fix the worker grabbed `st.seq+1`
+    /// without committing and wrote it back on publish, so a worker whose first
+    /// walk finished after two synchronous polls made the next poll mint a
+    /// duplicate seq — `SweepCursor::next`'s equality check saw a seq it had
+    /// already consumed and skipped a genuinely fresh walk (a synchronous poll
+    /// that returned `None`).
+    #[test]
+    fn the_seq_counter_never_regresses_across_worker_and_sync_walks() {
+        for _ in 0..25 {
+            let scanner = ProcScanner::detached();
+            scanner.spawn_worker();
+            // Let the worker's first, cold walk start before the polls do: it
+            // runs ~2x slower than a warm poll walk, so it spans two of the
+            // test's mints and its publish lands mid-sequence — the interleave
+            // that regressed the counter. Without the head start the worker's
+            // walk finishes just before the next mint and the bug never shows.
+            std::thread::sleep(Duration::from_millis(1));
+            scanner.set_synchronous(true);
+            let mut cursor = SweepCursor::on(Arc::clone(&scanner));
+
+            let mut last = 0u64;
+            for _ in 0..4 {
+                // In synchronous mode every call walks fresh, so None (a skipped
+                // walk) and a non-increasing seq are both the bug.
+                let snap = cursor
+                    .next()
+                    .expect("a synchronous poll always walks fresh");
+                assert!(snap.seq > last, "seq regressed: {last} -> {}", snap.seq);
+                last = snap.seq;
+            }
         }
     }
 
