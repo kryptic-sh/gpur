@@ -150,6 +150,10 @@ fn main() -> Result<()> {
 /// want: appending to a log the user already owns must not silently re-tighten
 /// permissions they may have relaxed on purpose. Windows has no equivalent
 /// knob here, so it simply opens as before.
+///
+/// On Windows the sink is documented single-writer: records are serialized
+/// with `flock` on unix (see `App::write_log`), and Windows has no equivalent
+/// without extra APIs, so two appenders there can interleave a record.
 fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);

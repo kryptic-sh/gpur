@@ -10,6 +10,12 @@ and this project adheres to
 
 ### Fixed
 
+- **`--log` records no longer tear when two gpur instances share a file
+  (unix).** A flushed `BufWriter` record is not one atomic write, so concurrent
+  appenders could interleave mid-line and the replay reader would drop the
+  record. Each record write now takes an exclusive `flock`, serializing
+  appenders; the lock is best-effort and never drops telemetry. Windows has no
+  `flock`, so the sink is documented single-writer there.
 - **NVML PCIe throughput now matches its label.** `nvmlDeviceGetPcieThroughput`
   counts decimal KB/s while the snapshot field and the UI label say KiB/s, so
   the readout was 2.4% high; the value is now converted to true KiB/s at the

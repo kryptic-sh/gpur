@@ -515,6 +515,23 @@ fn write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()>
     opts.open(path)?.write_all(contents)
 }
 
+/// Serialize one `--log` record against another `gpur --log` process appending
+/// to the same file. A flushed `BufWriter` record is not one atomic write, so
+/// without a lock two appenders can interleave mid-line; the replay reader
+/// would skip the torn record. Best-effort: a lock failure still writes the
+/// record rather than dropping telemetry.
+#[cfg(unix)]
+fn lock_log(file: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+}
+
+#[cfg(unix)]
+fn unlock_log(file: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+}
+
 /// Startup knobs for [`App::new`], resolved from CLI + config.
 pub struct AppOptions {
     pub tick_ms: u64,
@@ -927,9 +944,16 @@ impl App {
         }
         let rec = self.record();
         let Some(w) = self.log.as_mut() else { return };
+        // Serialize the record against concurrent appenders (unix only;
+        // see `lock_log`). The borrow of `w` here is sequential with the
+        // write below, so no conflict with `to_writer(&mut *w)`.
+        #[cfg(unix)]
+        lock_log(w.get_ref());
         let ok = serde_json::to_writer(&mut *w, &rec).is_ok()
             && writeln!(w).is_ok()
             && w.flush().is_ok();
+        #[cfg(unix)]
+        unlock_log(w.get_ref());
         if !ok {
             self.log = None;
             self.set_status("log write failed — logging disabled".into());
@@ -1614,6 +1638,43 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The `--log` record lock actually serializes: a second appender's
+    /// exclusive lock blocks while the first holds it, and succeeds once
+    /// released.
+    #[test]
+    #[cfg(unix)]
+    fn a_log_record_lock_serializes_appenders() {
+        use std::os::unix::io::AsRawFd;
+        let scratch = Scratch::new("log-lock");
+        let path = scratch.join("rec.jsonl");
+        let a = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        let b = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        lock_log(&a);
+        // A second appender's exclusive lock would block; the non-blocking
+        // probe must fail while the first holds it...
+        assert_eq!(
+            unsafe { libc::flock(b.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1
+        );
+        unlock_log(&a);
+        // ...and succeed once released.
+        assert_eq!(
+            unsafe { libc::flock(b.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        unsafe { libc::flock(b.as_raw_fd(), libc::LOCK_UN) };
     }
 
     fn app_with(backend: Box<dyn GpuBackend>) -> App {
