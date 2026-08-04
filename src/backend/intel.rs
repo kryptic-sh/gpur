@@ -814,7 +814,8 @@ drm-resident-gtt:\t1024 KiB
         use super::*;
         use crate::backend::ProcKind;
         use std::fs;
-        use std::time::Duration;
+        use std::sync::{Mutex, MutexGuard};
+        use std::time::{Duration, Instant};
 
         /// This machine's Intel backend, or `None` with a note saying why the
         /// caller is about to do nothing.
@@ -866,6 +867,120 @@ drm-resident-gtt:\t1024 KiB
                     d.card
                 );
                 assert!(d.dev.join("vendor").exists(), "{:?}", d.dev);
+            }
+        }
+
+        /// Open one card's render node read-only, so the sweep has a client of
+        /// that card to attribute. Without it these tests only run where a
+        /// compositor happens to be up: a headless box owns no DRM client at
+        /// all, and a rule about how a client's memory is charged that is only
+        /// ever exercised by someone's running desktop is one nothing checks.
+        ///
+        /// A bare open allocates a few KiB of VRAM and a couple of MiB of GTT,
+        /// and fdinfo reports the two separately — which is exactly the
+        /// asymmetry the per-class charging rule turns on. `None` where this
+        /// user cannot open the card's render node, a note rather than a
+        /// failure: it is a fact about the machine, not about this backend.
+        fn open_render_node(d: &IntelDevice) -> Option<fs::File> {
+            let target = fs::canonicalize(&d.dev).ok()?;
+            let node = fs::read_dir("/sys/class/drm")
+                .ok()?
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("renderD"))
+                .find(|n| {
+                    fs::canonicalize(format!("/sys/class/drm/{n}/device"))
+                        .ok()
+                        .as_ref()
+                        == Some(&target)
+                })?;
+            match fs::File::open(format!("/dev/dri/{node}")) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    eprintln!("note: cannot open /dev/dri/{node} for {}: {e}", d.name);
+                    None
+                }
+            }
+        }
+
+        /// The threaded path, against a real card.
+        ///
+        /// Every other hardware test pins the shared scanner to synchronous so
+        /// that a client it opened is in the very next walk — which means none
+        /// of them exercises the worker, and the worker is what ships. This one
+        /// gives the backend a scanner wired the production way and asserts the
+        /// rows arrive anyway: not on the first poll necessarily, since the
+        /// walk is off this thread, but within a bounded number of them.
+        #[test]
+        fn the_worker_thread_feeds_the_backend_on_real_hardware() {
+            let Some(mut b) = intel() else { return };
+            b.cursor = linux::SweepCursor::on(linux::ProcScanner::detached_with_worker());
+            let all: Vec<usize> = (0..b.devices.len()).collect();
+            let held = hold_clients(&b, &all);
+            if held.opened.is_empty() {
+                eprintln!("note: no render node could be opened on this machine");
+                return;
+            }
+
+            let me = std::process::id();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut polls = 0;
+            let mut mine: Vec<usize> = Vec::new();
+            while Instant::now() < deadline {
+                b.poll().unwrap();
+                polls += 1;
+                mine = b
+                    .processes()
+                    .iter()
+                    .filter(|p| p.pid == me)
+                    .map(|p| p.gpu_index)
+                    .collect();
+                mine.sort_unstable();
+                if mine == held.opened {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            assert_eq!(
+                mine, held.opened,
+                "after {polls} polls the worker had not delivered a walk \
+                 containing this test's own clients"
+            );
+        }
+
+        /// Serializes the tests that open render nodes against each other.
+        /// They run as threads of one test process, so a client another test
+        /// opened is a client of *this* test's pid: it lands in the same
+        /// process row and moves the very figures being checked.
+        static RENDER_NODES: Mutex<()> = Mutex::new(());
+
+        /// A render-node client of every card in `which`, held for as long as
+        /// this value lives, with the other render-node tests locked out.
+        struct Held {
+            _guard: MutexGuard<'static, ()>,
+            _files: Vec<fs::File>,
+            /// Device indices a client was actually opened for — what the
+            /// callers are entitled to assert on.
+            opened: Vec<usize>,
+        }
+
+        fn hold_clients(b: &IntelBackend, which: &[usize]) -> Held {
+            // A test that panicked while holding the lock poisoned it; its
+            // fds are closed all the same, so there is nothing to recover.
+            let guard = RENDER_NODES.lock().unwrap_or_else(|e| e.into_inner());
+            let mut files = Vec::new();
+            let mut opened = Vec::new();
+            for &i in which {
+                if let Some(f) = open_render_node(&b.devices[i]) {
+                    files.push(f);
+                    opened.push(i);
+                }
+            }
+            Held {
+                _guard: guard,
+                _files: files,
+                opened,
             }
         }
 
