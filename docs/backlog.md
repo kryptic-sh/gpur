@@ -2,11 +2,13 @@
 
 Open work from the review passes, the multi-vendor detection audit and the
 full-codebase review of v0.10.1, whose separate document was folded into this
-one once every finding it raised had shipped. Closed items are removed rather
-than struck through — what was fixed, and why, lives in `CHANGELOG.md`. Anything
-from a closed item that is still a live constraint on future work is kept below,
-either as a deliberate decision or in the settled-by-review list, rather than as
-a task.
+one once every finding it raised had shipped. The 0.12.0 code and performance
+reviews were folded in the same way: their open items are entries 9-18 below,
+and their verdicts and decisions live in the settled-by-review and decisions
+sections at the bottom. Closed items are removed rather than struck through —
+what was fixed, and why, lives in `CHANGELOG.md`. Anything from a closed item
+that is still a live constraint on future work is kept below, either as a
+deliberate decision or in the settled-by-review list, rather than as a task.
 
 Roughly ordered by what is worth doing first. Nothing open here is a correctness
 bug; the remainder is granularity, cost, coverage and polish. Every item that is
@@ -181,6 +183,12 @@ Whether a row of `n/a` beats an absent card is a product call, not a bug.
     make a card hit its cap, so the branch that produces a label is never taken
     on an idle box.
 
+- **The perf review's cost figures were never profiled.** The walk figure (4.2
+  ms over 588 pids) is the code's own comment, and NVML round-trip latency and
+  per-frame render time were never measured. The 0.12.0 perf pass paced the walk
+  structurally (a 200 ms floor, `fe37c82`), which bounds the cost, but the
+  numbers the review quoted are not measurements taken on this machine.
+
 ## 4. NVIDIA temperature threshold unread
 
 **Severity: low.** `Device::temperature_threshold()` is available in
@@ -254,6 +262,93 @@ figure on discrete Arc is wanted; the iGPU totals would not change.
   upgrade is safe — and it means the 0.33 series has no changelog at all. Fix
   belongs in the hjkl repo.
 
+## 9. `--tick-ms` has no startup ceiling
+
+**Severity: low.** `main.rs` clamps the resolved tick with `.max(MIN_TICK_MS)`
+only, so `--tick-ms 99999999999` is accepted and the event loop waits ~3 years
+for its first poll — gpur reads as frozen. `+`/`-` are capped (10 s); the CLI
+value is not. Fix: clamp to the same 10 s ceiling at startup. Carried from both
+the 0.10.1 and 0.12.0 review passes.
+
+## 10. A re-detect whose child set changed resets device-keyed state
+
+**Severity: low.** `CompositeBackend` (`src/backend/mod.rs`) namespaces device
+ids by child index, so a re-detect (after five consecutive poll failures) whose
+child set changed — a driver appearing or disappearing — renumbers every
+namespaced id and restarts graph/session history. The "survives a re-detect"
+guarantee holds only while the child set is unchanged. Fix: derive the id
+namespace from something stable across re-detects, or document the reset.
+
+## 11. PDH `read_array` does not retry on a growth race
+
+**Severity: low (Windows).** `src/backend/windows.rs`: if a counter's instance
+count grows between the sizing call and the fill, the second call returns
+`PDH_MORE_DATA` and that counter reads as empty (all-`None` gauges) for one
+poll. No overflow — just a lost tick. Fix: loop size+fill until the count
+stabilises.
+
+## 12. Two concurrent `--log` appenders can tear a record
+
+**Severity: low.** A flushed `BufWriter` record is not one atomic write, so two
+`gpur --log` processes appending to one file can interleave mid-line; the replay
+reader skips the malformed line, so the cost is one lost record. Fix: take an
+advisory lock around the record write, or document single-writer.
+
+## 13. `le_int` zero-extends sub-8-byte device-tree values
+
+**Severity: low (macOS).** `src/backend/apple.rs` decodes 1/2/4-byte `CFData`
+blobs by zero-extension, so a negative value would read as a large positive;
+only positive properties occur today. Fix: sign-extend.
+
+## 14. Intel `power_w` averages over a sensor-outage window
+
+**Severity: low.** `src/backend/intel.rs` keeps its `(µJ, at)` baseline when
+`energy1_input` is transiently unreadable, so the next successful read reports
+average power over the whole outage window rather than over one interval. Fix:
+drop the baseline on a failed read, or bound the window.
+
+## 15. NVML PCIe throughput units drift 2.4%
+
+**Severity: low.** `nvml_deviceGetPcieThroughput` returns decimal KB/s while the
+snapshot field and the UI label say KiB/s (`src/backend/nvidia.rs`,
+`src/ui.rs`). Fix: convert to KiB/s, or relabel.
+
+## 16. Headless sync mode walks `/proc` once per backend cursor
+
+**Severity: negligible.** `--once`/`--json` on a mixed AMD+Intel box walks twice
+per poll (one per cursor — the shared-walk dedup is lost in synchronous mode),
+and the scanner worker thread stays alive through the one-shot run. A one-shot
+pays a few extra ms. Fix if it ever matters: share one synchronous walk per
+poll.
+
+## 17. `first_dir` trusts sysfs readdir order
+
+**Severity: low.** `src/backend/linux.rs` `first_dir` picks the first hwmon
+child of a card; amdgpu/i915 register one per device in practice. Fix: if a card
+ever exposes several, filter for the one whose `name` identifies the device.
+
+## 18. Micro-optimisations declined as not worth the churn
+
+From the 0.12.0 perf review's hardening list. All correct today; each is pure
+waste at the margin, and none was worth the churn when the finding was closed.
+Revisit individually if the relevant path shows up in a profile.
+
+- **PCIe link maxes re-read every tick.** `src/backend/linux.rs` `pcie_link`
+  does 4 sysfs reads per GPU per tick (call sites: `amd.rs`, `intel.rs`, nouveau
+  in `nvidia.rs`) for values that are almost static: max gen/width never change,
+  current gen/width change on negotiation only. Cache the maxes at scan; re-read
+  the current pair on a slow schedule.
+- **History front-drain is an O(cap) memmove per poll** once the ring is full
+  (`src/app.rs` `poll_inner`, `drain(..overflow)` on four vecs). A `VecDeque`
+  makes it O(1); single-digit MB/s at real widths, so only worth it if the cap
+  grows with terminal width.
+- **`draw_meter` pushes one `Span` per meter column per frame** (`src/ui.rs`) —
+  ~2 × meter width × cards spans/frame on a wide terminal. Idiomatic ratatui;
+  revisit only if frame rate becomes a goal.
+- **`footer_hints()` and `driver_info()` rebuild static text every frame**
+  (`src/ui.rs` header and footer). Trivial to cache; noise at any realistic
+  frame rate.
+
 ---
 
 ## Settled by review
@@ -296,6 +391,29 @@ They are recorded so a later pass does not spend time re-deriving them.
 - **The PDH buffer handling is correct.** It allocates with the item type's
   alignment and sizes from the `PDH_MORE_DATA` byte count, and the `Vec`
   outlives the raw pointer derived from it.
+
+### The 0.12.0 reviews
+
+Both review documents from 2026-08-04 were folded into this file — their open
+items became entries 9-18 above, and the documents were deleted; the full texts
+are recoverable from git (`a285467` code review, `ad28ab8` perf review). Their
+verdicts, so a later pass does not re-derive them:
+
+- **The 0.12.0 code review found no open correctness findings.** Fourteen
+  suspicious paths were traced and disproved (kill/pidfd identity,
+  `parse_start_ticks`, braille dot orientation, `windowed` bounds, PDH sizing,
+  `Instant` deltas, counter resets, layout arithmetic, the Intel
+  attributed/video invariant, composite slot bookkeeping, sweep-state pruning,
+  state-file atomicity, unknown-vs-zero rendering, LUID matching, mock safety,
+  `--once`/replay framing), and the eight commits between the 0.12.0 review and
+  its predecessor close the predecessor's eight findings one-to-one, each with a
+  regression test.
+- **The 0.12.0 perf review's three findings were fixed the same day**: `fe37c82`
+  (paced sweep), `f5d76f0` (NVML static cache), `2d63c5e` (container-id cache).
+  Its hardening items are entry 18; its coverage gaps map onto the hardware and
+  profiling entries above.
+- **Out of scope of both reviews:** `pkg/` templates, `assets/`, prose docs, and
+  dependency internals beyond the nvml-wrapper/sysinfo spot-checks.
 
 ## Decisions taken deliberately
 
@@ -432,3 +550,13 @@ Recorded so they are not re-opened as findings.
 - **`MIN_TICK_MS` is 50, not 100.** The two floors disagreed (CLI 50, `+` key
   100); unifying upward would have silently removed `--tick-ms 50`, a capability
   users already had.
+- **The process command line is not cached** even though the container id is. A
+  pid's cgroup path is ~static, so caching the container on (pid, start time) is
+  safe; the command line re-derives each poll from sysinfo's already-cached
+  cmdline — an in-memory join with no I/O — so an in-place `exec`, which keeps
+  the pid and its start time, never leaves a stale COMMAND column. Cache it only
+  if the join ever shows up in a profile.
+- **`enforced_power_limit` is not cached at probe** with the other
+  session-static NVML values. It changes when the user moves the power cap;
+  caching it would show a stale limit until restart. One query per poll keeps
+  the displayed limit live.
