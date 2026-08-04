@@ -31,12 +31,13 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
             };
         }
         // NVML is the only source of NVIDIA telemetry, and it exists only with
-        // the proprietary driver. Without it the card is still sitting in
-        // /sys/class/drm, and no other backend will claim it — the AMD and
-        // Intel scans filter on their own PCI vendor — so leaving it there
-        // drops a card off a mixed rig entirely rather than showing it with
-        // fewer gauges.
-        nouveau::probe()
+        // the proprietary driver. Without it the cards are still sitting in
+        // /sys/class/drm, and no other backend will claim them — the AMD and
+        // Intel scans filter on their own PCI vendor. So claim the
+        // proprietary-driver cards from sysfs too: a card NVML cannot read is
+        // still listed — name, PCI id, link state, gauges n/a — rather than
+        // dropped off the rig.
+        nouveau::probe_without_nvml()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -325,8 +326,8 @@ impl GpuBackend for MergedNvidiaBackend {
 #[cfg(target_os = "linux")]
 mod nouveau {
     use crate::backend::linux::{
-        card_name, cards_with_driver, driver_line, fan_pct, first_dir, hwmon_u64, pci_device_id,
-        pcie_current_link, pcie_max_link, pdev_of,
+        card_name, cards_with_driver, driver_line_for, fan_pct, first_dir, hwmon_u64,
+        pci_device_id, pcie_current_link, pcie_max_link, pdev_of,
     };
     use crate::backend::{GpuBackend, GpuSnapshot};
     use anyhow::Result;
@@ -339,6 +340,9 @@ mod nouveau {
         dev: PathBuf,
         hwmon: Option<PathBuf>,
         pdev: Option<String>,
+        /// The DRM driver bound to the card ("nouveau" or, on the NVML-absent
+        /// fallback, "nvidia"), for the header line.
+        driver: String,
         /// Maximum supported PCIe link, fixed per device and resolved once at
         /// scan rather than re-read every poll.
         pcie_max_gen: Option<u8>,
@@ -350,25 +354,41 @@ mod nouveau {
     }
 
     pub fn probe() -> Option<Box<dyn GpuBackend>> {
-        let devices = scan("/sys/class/drm");
+        let devices = scan("/sys/class/drm", false);
         (!devices.is_empty()).then(|| Box::new(NouveauBackend { devices }) as Box<dyn GpuBackend>)
     }
 
-    fn scan(drm: &str) -> Vec<NouveauDevice> {
-        cards_with_driver(drm, NVIDIA_VENDOR, |d| d == "nouveau")
-            .into_iter()
-            .map(|(idx, dev, _)| {
-                let (pcie_max_gen, pcie_max_width) = pcie_max_link(&dev);
-                NouveauDevice {
-                    name: card_name(&dev, idx, "10de", "NVIDIA"),
-                    hwmon: first_dir(&dev.join("hwmon")),
-                    pdev: pdev_of(&dev),
-                    dev,
-                    pcie_max_gen,
-                    pcie_max_width,
-                }
-            })
-            .collect()
+    /// The NVML-absent fallback: claim cards bound to the proprietary `nvidia`
+    /// driver too, so a card NVML cannot initialise for is still listed — its
+    /// name, PCI id and link state, and every gauge `n/a` — rather than
+    /// invisible. Never used when NVML is alive: there those cards are NVML's.
+    pub fn probe_without_nvml() -> Option<Box<dyn GpuBackend>> {
+        let devices = scan("/sys/class/drm", true);
+        (!devices.is_empty()).then(|| Box::new(NouveauBackend { devices }) as Box<dyn GpuBackend>)
+    }
+
+    /// `include_nvidia` claims cards bound to the proprietary `nvidia` driver
+    /// as well as `nouveau` — only the NVML-absent fallback passes true; when
+    /// NVML is alive those cards are NVML's, and claiming them here too would
+    /// list them twice.
+    fn scan(drm: &str, include_nvidia: bool) -> Vec<NouveauDevice> {
+        cards_with_driver(drm, NVIDIA_VENDOR, |d| {
+            d == "nouveau" || (include_nvidia && d == "nvidia")
+        })
+        .into_iter()
+        .map(|(idx, dev, driver)| {
+            let (pcie_max_gen, pcie_max_width) = pcie_max_link(&dev);
+            NouveauDevice {
+                name: card_name(&dev, idx, "10de", "NVIDIA"),
+                hwmon: first_dir(&dev.join("hwmon")),
+                pdev: pdev_of(&dev),
+                dev,
+                driver,
+                pcie_max_gen,
+                pcie_max_width,
+            }
+        })
+        .collect()
     }
 
     impl GpuBackend for NouveauBackend {
@@ -381,7 +401,7 @@ mod nouveau {
         }
 
         fn driver_info(&self) -> Option<String> {
-            driver_line("nouveau")
+            driver_line_for(self.devices.iter().map(|d| d.driver.as_str()))
         }
     }
 
@@ -414,10 +434,11 @@ mod nouveau {
     }
 
     /// Cards this backend claims from a fake `/sys/class/drm`, for the shared
-    /// test that proves the Linux scans partition that directory.
+    /// test that proves the Linux scans partition that directory. The
+    /// NVML-present view: only `nouveau` cards, never the proprietary ones.
     #[cfg(test)]
     pub fn claimed_ids(drm: &str) -> Vec<String> {
-        scan(drm)
+        scan(drm, false)
             .iter()
             .filter_map(|d| pci_device_id(d.pdev.as_deref()))
             .collect()
@@ -429,11 +450,12 @@ mod nouveau {
         use crate::backend::linux::testing;
 
         /// The gap this backend exists to close: with nouveau bound, NVML never
-        /// initialises and nothing else claims vendor 0x10de.
+        /// initialises and nothing else claims vendor 0x10de. The NVML-present
+        /// view: the proprietary-driver card is NVML's and stays unclaimed.
         #[test]
         fn scan_claims_nouveau_cards_only() {
             let root = testing::tri_vendor("nouveau-scan");
-            let devices = scan(&testing::drm(&root));
+            let devices = scan(&testing::drm(&root), false);
             assert_eq!(
                 devices
                     .iter()
@@ -444,6 +466,31 @@ mod nouveau {
             );
         }
 
+        /// The NVML-absent fallback claims the proprietary-driver card too: a
+        /// card NVML cannot initialise for is listed (name, PCI id, link
+        /// state, gauges n/a) rather than invisible.
+        #[test]
+        fn the_nvml_absent_scan_claims_proprietary_cards() {
+            let root = testing::tri_vendor("nvidia-fallback");
+            let devices = scan(&testing::drm(&root), true);
+            // card2 (nvidia driver) and card3 (nouveau), in card-index order.
+            assert_eq!(
+                devices
+                    .iter()
+                    .map(|d| d.pdev.as_deref())
+                    .collect::<Vec<_>>(),
+                [Some("0000:01:00.0"), Some("0000:04:00.0")]
+            );
+            assert_eq!(devices[0].driver, "nvidia");
+            assert_eq!(devices[1].driver, "nouveau");
+            // The proprietary card's own attributes are read; its gauges are n/a.
+            let s = sample(&devices[0]);
+            assert_eq!(s.device_id.as_deref(), Some("pci:0000:01:00.0"));
+            assert!(s.utilization_pct.is_none());
+            assert!(s.vram_total_bytes.is_none());
+            assert!(!s.integrated);
+        }
+
         /// The max link is a fixed capability, so the scan resolves it once and
         /// the device carries it rather than re-reading sysfs per poll.
         #[test]
@@ -452,7 +499,7 @@ mod nouveau {
             let pci = root.join("pci/0000:04:00.0");
             std::fs::write(pci.join("max_link_speed"), "16.0 GT/s PCIe\n").unwrap();
             std::fs::write(pci.join("max_link_width"), "16\n").unwrap();
-            let devices = scan(&testing::drm(&root));
+            let devices = scan(&testing::drm(&root), false);
             assert_eq!(devices[0].pcie_max_gen, Some(4));
             assert_eq!(devices[0].pcie_max_width, Some(16));
         }
@@ -461,7 +508,7 @@ mod nouveau {
         #[test]
         fn missing_sysfs_reads_as_unknown_not_zero() {
             let root = testing::tri_vendor("nouveau-sample");
-            let d = &scan(&testing::drm(&root))[0];
+            let d = &scan(&testing::drm(&root), false)[0];
             let s = sample(d);
             assert_eq!(s.device_id.as_deref(), Some("pci:0000:04:00.0"));
             assert!(!s.integrated);

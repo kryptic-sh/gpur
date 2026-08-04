@@ -10,6 +10,12 @@ and this project adheres to
 
 ### Fixed
 
+- **An NVIDIA card is no longer invisible when NVML cannot initialise (Linux).**
+  NVML absent or broken left a card bound to the proprietary `nvidia` driver
+  unclaimed by any backend. The sysfs fallback now claims `nvidia`-driver cards
+  too, so the card appears in the list with its name, PCI id and link state and
+  the rest of its gauges `n/a` — a listed card with empty gauges beats no card
+  at all. When NVML is alive, its cards are still NVML's alone.
 - **PDH counters no longer read empty for one poll when an instance appears
   mid-read (Windows).** A counter's instance count could grow between the sizing
   call and the fill, and the fill's `PDH_MORE_DATA` was treated as failure —

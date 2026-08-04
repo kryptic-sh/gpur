@@ -1349,8 +1349,9 @@ drm-resident-vram0:\t4096 KiB
         let unique: HashSet<&&String> = all.iter().collect();
         assert_eq!(all.len(), 5);
         assert_eq!(unique.len(), all.len(), "a device claimed by two backends");
-        // The proprietary-driver card belongs to NVML, which is not scanned
-        // here — nothing else may pick it up.
+        // The proprietary-driver card belongs to NVML when NVML is alive —
+        // nothing else may pick it up. The NVML-absent fallback in nvidia.rs
+        // claims it.
         assert!(!all.iter().any(|id| id.ends_with("0000:01:00.0")));
     }
 
