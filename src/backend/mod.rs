@@ -8,6 +8,8 @@ mod linux;
 mod mock;
 mod nvidia;
 mod replay;
+#[cfg(unix)]
+mod stub;
 mod windows;
 
 use anyhow::Result;
@@ -514,6 +516,13 @@ pub fn detect(
         // The CLI range-validates `--mock`; this clamp only guards internal
         // callers (re-detect) from a count the mock backend can't render.
         return Ok(Box::new(mock::MockBackend::new(n.clamp(1, 16))));
+    }
+    // Test hook, mirroring GPUR_MOCK_FAIL: the PTY suite injects a signalable
+    // backend through the environment because mock and replay refuse to
+    // signal by design, so no other backend can ever open the kill dialog.
+    #[cfg(unix)]
+    if std::env::var_os("GPUR_STUB_BACKEND").is_some() {
+        return Ok(Box::new(stub::StubBackend::new()));
     }
     // The vendor backends are disjoint — each claims only its own PCI vendor's
     // devices — so every one that probes adds cards no other one reports, and

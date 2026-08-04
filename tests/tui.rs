@@ -336,9 +336,10 @@ fn selected_card(t: &mut Tui) -> Option<usize> {
         if cell.contents() != "╭" || cell.fgcolor() != vt100::Color::Rgb(0xcb, 0xa6, 0xf7) {
             return None;
         }
-        // `╭┐3·Mock GPU 3┌───…` — the index leads the card title.
+        // `╭┐3·Mock GPU 3┌───…` — the index leads the card title, whatever
+        // the card's name (the stub backend's "0·Stub GPU 0" among them).
         let text = row_text(screen, y);
-        let (before, _) = text.split_once("·Mock GPU")?;
+        let (before, _) = text.split_once('·')?;
         before
             .trim_start_matches(|c: char| !c.is_ascii_digit())
             .parse()
@@ -1228,6 +1229,103 @@ fn mouse_is_ignored_while_the_filter_prompt_is_open() {
     t.send("\x7f\r");
     t.wait_for("prompt closed", |s| !s.contains("filter>"));
     assert_eq!(wait_for_procs(&mut t, 7), rows);
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+// --- kill dialog ---------------------------------------------------------
+//
+// mock and replay refuse to signal by design, so no backend could open the
+// kill dialog under the PTY harness. `GPUR_STUB_BACKEND=1` injects a stub
+// backend that reports one real local process, reaching the dialog, its
+// modal guards, and the confirm path end to end.
+
+/// Spawn with the stub backend: no `--mock`, one real local `sleep` process.
+fn spawn_stub() -> Tui {
+    Tui::spawn_in(
+        &["--no-splash", "--tick-ms", "100"],
+        &[("GPUR_STUB_BACKEND", Some("1"))],
+        Sandbox::new(),
+    )
+}
+
+#[test]
+fn kill_dialog_opens_for_a_real_process_and_cancels() {
+    let mut t = spawn_stub();
+    t.wait_for("the stub's process row", |s| s.contains("sleep 60"));
+    t.send("p");
+    t.send("x");
+    t.wait_for("the kill dialog", |s| s.contains("send SIGTERM to"));
+    assert!(
+        t.screen_text().contains("sleep 60"),
+        "the dialog does not name the command:\n{}",
+        t.screen_text()
+    );
+    // Any key other than y cancels — nothing may be signalled.
+    t.send("n");
+    t.wait_for("dialog closed", |s| !s.contains("send SIGTERM to"));
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+#[test]
+fn mouse_is_ignored_while_the_kill_dialog_is_open() {
+    let mut t = spawn_stub();
+    t.wait_for("the stub's rows", |s| proc_pids(s).len() == 2);
+    let rows = wait_for_procs(&mut t, 2);
+    // The child (higher pid) is the second row; select it by click, which
+    // also focuses the process pane.
+    let child = *rows.last().expect("two rows");
+    t.click(10, child.0);
+    wait_for_selected_pid(&mut t, child.1, "the child row to be selected");
+    t.send("x");
+    t.wait_for("the kill dialog", |s| s.contains("send SIGTERM to"));
+
+    // Mouse events under the dialog: a click on the other row, wheel on the
+    // process pane, wheel on the GPU pane.
+    let own = rows[0];
+    t.click(10, own.0);
+    for _ in 0..3 {
+        t.mouse(WHEEL_DOWN, 10, child.0);
+    }
+    let gpu_y = row_y(&t, "0·Stub GPU 0") + 2;
+    t.mouse(WHEEL_DOWN, 10, gpu_y);
+    // Input is read in order, so once the dialog closes every event above
+    // has been consumed.
+    t.send("n");
+    t.wait_for("dialog closed", |s| !s.contains("send SIGTERM to"));
+
+    assert_eq!(
+        wait_for_procs(&mut t, 2),
+        rows,
+        "the table changed under the kill dialog"
+    );
+    assert_eq!(
+        wait_for_selection(&mut t),
+        child.1,
+        "the process cursor moved under the kill dialog"
+    );
+    assert_eq!(
+        wait_for_a_selected_card(&mut t),
+        0,
+        "the card selection moved under the kill dialog"
+    );
+    t.send("q");
+    assert!(t.wait_exit().success());
+}
+
+#[test]
+fn kill_confirm_sends_the_signal_and_reports_it() {
+    let mut t = spawn_stub();
+    t.wait_for("the stub's rows", |s| proc_pids(s).len() == 2);
+    let rows = wait_for_procs(&mut t, 2);
+    let child = *rows.last().expect("two rows");
+    t.click(10, child.0);
+    wait_for_selected_pid(&mut t, child.1, "the child row to be selected");
+    t.send("x");
+    t.wait_for("the kill dialog", |s| s.contains("send SIGTERM to"));
+    t.send("y");
+    t.wait_for("the status line", |s| s.contains("sent SIGTERM to"));
     t.send("q");
     assert!(t.wait_exit().success());
 }
