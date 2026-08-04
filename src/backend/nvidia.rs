@@ -7,7 +7,7 @@ use super::{GpuBackend, GpuProcess, GpuSnapshot, ProcKind};
 use anyhow::Result;
 use nvml_wrapper::bitmasks::device::ThrottleReasons;
 use nvml_wrapper::enum_wrappers::device::{
-    Clock, PcieUtilCounter, PerformanceState, TemperatureSensor,
+    Clock, PcieUtilCounter, PerformanceState, TemperatureSensor, TemperatureThreshold,
 };
 use nvml_wrapper::enums::device::{BusType, SampleValue, UsedGpuMemory};
 use nvml_wrapper::struct_wrappers::device::{ProcessInfo, ProcessUtilizationSample};
@@ -66,6 +66,7 @@ fn nvml_probe() -> Option<NvmlBackend> {
             let mut integrated = Vec::with_capacity(n as usize);
             let mut pcie_max_gen = Vec::with_capacity(n as usize);
             let mut pcie_max_width = Vec::with_capacity(n as usize);
+            let mut temp_slowdown = Vec::with_capacity(n as usize);
             for i in 0..n {
                 let Ok(d) = nvml.device_by_index(i) else {
                     uuids.push(None);
@@ -73,6 +74,7 @@ fn nvml_probe() -> Option<NvmlBackend> {
                     integrated.push(None);
                     pcie_max_gen.push(None);
                     pcie_max_width.push(None);
+                    temp_slowdown.push(None);
                     continue;
                 };
                 uuids.push(d.uuid().ok());
@@ -80,6 +82,7 @@ fn nvml_probe() -> Option<NvmlBackend> {
                 integrated.push(d.bus_type().ok().map(|b| matches!(b, BusType::Fpci)));
                 pcie_max_gen.push(d.max_pcie_link_gen().ok().map(|g| g as u8));
                 pcie_max_width.push(d.max_pcie_link_width().ok());
+                temp_slowdown.push(slowdown_threshold_c(&d));
             }
             Some(NvmlBackend {
                 nvml,
@@ -90,6 +93,7 @@ fn nvml_probe() -> Option<NvmlBackend> {
                 integrated,
                 pcie_max_gen,
                 pcie_max_width,
+                temp_slowdown,
                 last_util_ts: vec![0; n as usize],
             })
         }
@@ -113,6 +117,12 @@ struct NvmlBackend {
     integrated: Vec<Option<bool>>,
     pcie_max_gen: Vec<Option<u8>>,
     pcie_max_width: Vec<Option<u32>>,
+    /// Hardware-slowdown temperature threshold (°C) per device index, cached
+    /// at probe like `names`/`integrated`/`pcie_max_*`: it is fixed for the
+    /// life of the device and a per-poll query is a driver round-trip per
+    /// card. `None` marks a query the driver declined, and poll falls back to
+    /// asking again.
+    temp_slowdown: Vec<Option<f64>>,
     /// Microsecond timestamp of the newest process-utilization sample seen,
     /// **per device index**. `nvmlDeviceGetProcessUtilization` only returns
     /// samples strictly newer than the timestamp handed to it, and the
@@ -190,6 +200,12 @@ impl GpuBackend for NvmlBackend {
                     .temperature(TemperatureSensor::Gpu)
                     .ok()
                     .map(|t| t as f64),
+                temp_slowdown_c: self
+                    .temp_slowdown
+                    .get(i as usize)
+                    .copied()
+                    .flatten()
+                    .or_else(|| slowdown_threshold_c(&dev)),
                 // NVML exposes no core-hotspot/junction field id, so
                 // `temp_junction_c` stays None here (see `memory_temp_c`).
                 temp_mem_c: memory_temp_c(&dev),
@@ -612,6 +628,17 @@ fn field_temp_c(v: SampleValue) -> Option<f64> {
     };
     // 0 is NVML's "answered but no reading"; a powered GPU is never at 0 °C.
     (c > 0.0).then_some(c)
+}
+
+/// NVML's hardware-slowdown temperature threshold, or None when the driver
+/// declines to publish one. Unsupported queries return the sentinels 0 and -1
+/// (the latter wrapped into u32 as 4294967295) rather than erroring on every
+/// driver, so the value is filtered to a plausible range instead of trusted.
+fn slowdown_threshold_c(dev: &Device) -> Option<f64> {
+    dev.temperature_threshold(TemperatureThreshold::Slowdown)
+        .ok()
+        .filter(|t| (1..=200).contains(t))
+        .map(|t| t as f64)
 }
 
 /// Highest fan duty cycle and RPM across all fans on the board.

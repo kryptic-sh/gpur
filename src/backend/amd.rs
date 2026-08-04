@@ -377,6 +377,8 @@ mod linux_impl {
             // temp1 = edge sensor (millidegrees); power in microwatts with
             // the APU fallback and cap-of-0 handling done above.
             temperature_c,
+            // amdgpu sysfs publishes no hardware throttle threshold.
+            temp_slowdown_c: None,
             temp_junction_c: d
                 .temp_junction_ch
                 .and_then(|ch| hwmon_u64(h, &format!("temp{ch}_input")))

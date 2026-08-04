@@ -313,7 +313,7 @@ fn draw_gpu_folded(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, 
         }),
     ];
     if let Some(c) = gpu.temperature_c {
-        line.push(temp_span(t, c, "", "  "));
+        line.push(temp_span(t, c, "", "  ", gpu.temp_slowdown_c));
     }
     if let Some(w) = gpu.power_w {
         // Folded rows have no room for the limit.
@@ -374,9 +374,20 @@ fn mem_secondary_value(gpu: &GpuSnapshot) -> String {
     )
 }
 
-/// Temperature, colored by the warn/crit thresholds.
-fn temp_span(t: &UiTheme, c: f64, lead: &str, trail: &str) -> Span<'static> {
-    Span::styled(format!("{lead}{c:.0}°C{trail}"), t.temp_style(c))
+/// Temperature, colored by the warn/crit thresholds — the card's own
+/// throttle threshold when the backend publishes one, the fixed 75/90 °C
+/// scale otherwise.
+fn temp_span(
+    t: &UiTheme,
+    c: f64,
+    lead: &str,
+    trail: &str,
+    slowdown_c: Option<f64>,
+) -> Span<'static> {
+    Span::styled(
+        format!("{lead}{c:.0}°C{trail}"),
+        t.temp_style(c, slowdown_c),
+    )
 }
 
 /// Power draw, with the board limit when the backend reports one.
@@ -568,7 +579,7 @@ fn draw_gpu(frame: &mut Frame, area: Rect, app: &App, gpu: &GpuSnapshot, idx: us
                 t.dim,
             ));
         }
-        info.push(temp_span(t, c, " ", " "));
+        info.push(temp_span(t, c, " ", " ", gpu.temp_slowdown_c));
         if let Some(j) = gpu.temp_junction_c {
             info.push(Span::styled(format!("junc {j:.0}° "), t.dim));
         }

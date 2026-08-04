@@ -78,6 +78,9 @@ impl GpuBackend for MockBackend {
                     vram_used_bytes: (i > 0).then(|| (total as f64 * vram / 100.0) as u64),
                     vram_total_bytes: (i > 0).then_some(total),
                     temperature_c: Some(45.0 + util * 0.4),
+                    // Mock cards publish no throttle threshold; the demo keeps
+                    // the fixed 75/90 °C scale.
+                    temp_slowdown_c: None,
                     power_w: Some(60.0 + util * 2.4),
                     power_limit_w: Some(320.0),
                     fan_pct: Some((util * 0.9).min(100.0)),

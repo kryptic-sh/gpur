@@ -170,10 +170,16 @@ impl UiTheme {
         }
     }
 
-    pub fn temp_style(&self, c: f64) -> Style {
-        if c >= 90.0 {
+    /// Temperature style against a card's own throttle threshold where the
+    /// backend publishes one: warn 10 °C below it, crit at it (a card is hot
+    /// when it throttles). `None` keeps the fixed 75/90 °C scale, for cards
+    /// whose driver publishes no threshold.
+    pub fn temp_style(&self, c: f64, slowdown_c: Option<f64>) -> Style {
+        let warn = slowdown_c.map(|t| t - 10.0).unwrap_or(75.0);
+        let crit = slowdown_c.unwrap_or(90.0);
+        if c >= crit {
             self.temp_crit
-        } else if c >= 75.0 {
+        } else if c >= warn {
             self.temp_warn
         } else {
             self.temp_ok
@@ -265,5 +271,41 @@ mod tests {
             gradient(&stops, 1.0, ColorMode::Truecolor),
             RColor::Rgb(200, 200, 200)
         );
+    }
+
+    fn theme() -> UiTheme {
+        crate::theme::load(None, crate::theme::detect_color_mode()).unwrap()
+    }
+
+    /// A card whose driver publishes no throttle threshold keeps the fixed
+    /// 75/90 °C scale.
+    #[test]
+    fn temp_style_defaults_to_the_fixed_scale_without_a_threshold() {
+        let t = theme();
+        assert_eq!(t.temp_style(74.9, None), t.temp_ok);
+        assert_eq!(t.temp_style(75.0, None), t.temp_warn);
+        assert_eq!(t.temp_style(89.9, None), t.temp_warn);
+        assert_eq!(t.temp_style(90.0, None), t.temp_crit);
+    }
+
+    /// A laptop part that throttles at 87 °C reads as hot at its own limit,
+    /// not at the workstation scale: warn from 77, crit at 87.
+    #[test]
+    fn temp_style_keys_on_a_low_threshold() {
+        let t = theme();
+        assert_eq!(t.temp_style(76.9, Some(87.0)), t.temp_ok);
+        assert_eq!(t.temp_style(77.0, Some(87.0)), t.temp_warn);
+        assert_eq!(t.temp_style(86.9, Some(87.0)), t.temp_warn);
+        assert_eq!(t.temp_style(87.0, Some(87.0)), t.temp_crit);
+    }
+
+    /// A workstation card rated to 100 °C only warns where the fixed scale
+    /// already went critical — 90 °C is hot for it, not a red alert.
+    #[test]
+    fn temp_style_keys_on_a_high_threshold() {
+        let t = theme();
+        assert_eq!(t.temp_style(89.0, Some(100.0)), t.temp_ok);
+        assert_eq!(t.temp_style(90.0, Some(100.0)), t.temp_warn);
+        assert_eq!(t.temp_style(100.0, Some(100.0)), t.temp_crit);
     }
 }

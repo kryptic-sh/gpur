@@ -49,6 +49,12 @@ pub struct GpuSnapshot {
     pub vram_used_bytes: Option<u64>,
     pub vram_total_bytes: Option<u64>,
     pub temperature_c: Option<f64>,
+    /// Temperature at which the card begins hardware throttling, when the
+    /// driver publishes a threshold — what the TEMP meter's warn/crit scale keys
+    /// on, so a laptop GPU throttling at 87 °C and a workstation card rated to
+    /// 100 °C each read as hot at their own limits. `None` keeps the fixed
+    /// 75/90 °C scale.
+    pub temp_slowdown_c: Option<f64>,
     /// Hotspot / memory-junction temperatures where exposed (AMD temp2/3).
     pub temp_junction_c: Option<f64>,
     pub temp_mem_c: Option<f64>,

@@ -49,6 +49,12 @@ and this project adheres to
 
 ### Changed
 
+- **NVIDIA temperature colours use each card's own slowdown threshold.** A
+  laptop GPU throttling at 87 °C and a workstation card rated to 100 °C shared
+  the fixed 75/90 °C warn/crit scale, so "hot" meant different things per part.
+  Cards whose driver publishes a hardware-slowdown threshold now warn 10 °C
+  below it and go critical at it; cards without one keep the fixed scale. The
+  threshold is resolved once at probe and cached.
 - **Linux cards render their pci.ids marketing name, not the codename-first
   entry.** pci.ids lists most modern parts as `codename [marketing name]`
   (`Navi 31 [Radeon RX 7900 XT/7900 XTX/7900M]`), and the header showed that
