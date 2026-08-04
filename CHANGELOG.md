@@ -10,6 +10,12 @@ and this project adheres to
 
 ### Changed
 
+- **NVML session-static data is read once at probe.** The per-poll loop
+  re-queried `name`, `bus_type` and the maximum PCIe link gen/width — values
+  fixed for the life of the device — as driver round-trips on every poll, beside
+  the UUID it already cached. They are now resolved at probe like the UUID, with
+  a per-poll fallback only where the probe query failed. The enforced power
+  limit still re-reads per poll: it changes when the user moves the cap.
 - **The `/proc` fdinfo sweep no longer re-walks at the poll rate.** The Linux
   backends' per-process scan was re-requested on every poll, so at a fast tick
   on a busy box the worker could spend a whole core walking `/proc` (the walk is

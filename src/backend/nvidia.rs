@@ -56,16 +56,39 @@ fn nvml_probe() -> Option<NvmlBackend> {
     match nvml.device_count() {
         Ok(n) if n > 0 => {
             let driver = nvml.sys_driver_version().ok();
-            // Read once: a UUID is fixed for the life of the device and a
-            // per-poll query is a driver round-trip per card.
-            let uuids = (0..n)
-                .map(|i| nvml.device_by_index(i).ok().and_then(|d| d.uuid().ok()))
-                .collect();
+            // Read once: name, bus type and max link are fixed for the life of
+            // the device and a per-poll query is a driver round-trip per card.
+            // `None` marks a query the driver refused, and poll falls back to
+            // asking again rather than showing a hole.
+            let mut uuids = Vec::with_capacity(n as usize);
+            let mut names = Vec::with_capacity(n as usize);
+            let mut integrated = Vec::with_capacity(n as usize);
+            let mut pcie_max_gen = Vec::with_capacity(n as usize);
+            let mut pcie_max_width = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let Ok(d) = nvml.device_by_index(i) else {
+                    uuids.push(None);
+                    names.push(None);
+                    integrated.push(None);
+                    pcie_max_gen.push(None);
+                    pcie_max_width.push(None);
+                    continue;
+                };
+                uuids.push(d.uuid().ok());
+                names.push(d.name().ok());
+                integrated.push(d.bus_type().ok().map(|b| matches!(b, BusType::Fpci)));
+                pcie_max_gen.push(d.max_pcie_link_gen().ok().map(|g| g as u8));
+                pcie_max_width.push(d.max_pcie_link_width().ok());
+            }
             Some(NvmlBackend {
                 nvml,
                 count: n,
                 driver,
                 uuids,
+                names,
+                integrated,
+                pcie_max_gen,
+                pcie_max_width,
                 last_util_ts: vec![0; n as usize],
             })
         }
@@ -81,6 +104,14 @@ struct NvmlBackend {
     /// identity `App` keys its per-GPU state on; `None` for a device whose
     /// UUID the driver refused, which degrades to a positional key.
     uuids: Vec<Option<String>>,
+    /// Name, "is this a Tegra/on-SoC iGPU", and the maximum PCIe link, all
+    /// fixed for the life of the device and resolved once at probe — a
+    /// per-poll query is a driver round-trip per card. `None` means the probe
+    /// query failed and the poll falls back to asking again.
+    names: Vec<Option<String>>,
+    integrated: Vec<Option<bool>>,
+    pcie_max_gen: Vec<Option<u8>>,
+    pcie_max_width: Vec<Option<u32>>,
     /// Microsecond timestamp of the newest process-utilization sample seen,
     /// **per device index**. `nvmlDeviceGetProcessUtilization` only returns
     /// samples strictly newer than the timestamp handed to it, and the
@@ -123,13 +154,23 @@ impl GpuBackend for NvmlBackend {
             let util = dev.utilization_rates().ok();
             let (fan_pct, fan_rpm) = fan_speeds(&dev);
             gpus.push(GpuSnapshot {
-                name: dev.name().unwrap_or_else(|_| format!("NVIDIA GPU {i}")),
+                name: self
+                    .names
+                    .get(i as usize)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| dev.name().unwrap_or_else(|_| format!("NVIDIA GPU {i}"))),
                 device_id,
                 // NVML has no "is integrated" query. FPCI is Tegra's on-SoC host
                 // interface and the only bus type no discrete card reports, so it
                 // is the one signal that can flag a Jetson iGPU; anything else,
                 // including an unsupported/missing query, stays discrete.
-                integrated: dev.bus_type().is_ok_and(|b| matches!(b, BusType::Fpci)),
+                integrated: self
+                    .integrated
+                    .get(i as usize)
+                    .copied()
+                    .flatten()
+                    .unwrap_or_else(|| dev.bus_type().is_ok_and(|b| matches!(b, BusType::Fpci))),
                 utilization_pct: util.as_ref().map(|u| super::clamp_pct(u.gpu as f64)),
                 mem_util_pct: util.as_ref().map(|u| super::clamp_pct(u.memory as f64)),
                 video_util_pct: None,
@@ -160,8 +201,18 @@ impl GpuBackend for NvmlBackend {
                 mem_clock_mhz: dev.clock_info(Clock::Memory).ok().map(u64::from),
                 pcie_gen: dev.current_pcie_link_gen().ok().map(|g| g as u8),
                 pcie_width: dev.current_pcie_link_width().ok(),
-                pcie_max_gen: dev.max_pcie_link_gen().ok().map(|g| g as u8),
-                pcie_max_width: dev.max_pcie_link_width().ok(),
+                pcie_max_gen: self
+                    .pcie_max_gen
+                    .get(i as usize)
+                    .copied()
+                    .flatten()
+                    .or_else(|| dev.max_pcie_link_gen().ok().map(|g| g as u8)),
+                pcie_max_width: self
+                    .pcie_max_width
+                    .get(i as usize)
+                    .copied()
+                    .flatten()
+                    .or_else(|| dev.max_pcie_link_width().ok()),
                 pcie_rx_kbs: dev
                     .pcie_throughput(PcieUtilCounter::Receive)
                     .ok()
