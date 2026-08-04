@@ -1686,6 +1686,46 @@ drm-resident-vram0:\t4096 KiB
         assert_eq!(other.next().map(|s| s.seq), Some(second.seq));
     }
 
+    /// The walk-count half of "one walk serves every vendor": the amdgpu and
+    /// Intel backends each hold a `SweepCursor::default()` — the shared scanner —
+    /// so two consumers polling one worker must cost one walk per pacing interval,
+    /// not one per consumer. Sharing is what makes a mixed AMD+Intel box walk
+    /// `/proc` once a tick instead of twice; the two-LIVE-backends observation
+    /// still needs a mixed box, but the count property is checkable anywhere with
+    /// two cursors over one worker-backed scanner.
+    #[test]
+    fn two_cursors_over_one_worker_share_each_walk() {
+        let scanner = ProcScanner::detached_with_worker();
+        let mut a = SweepCursor::on(Arc::clone(&scanner));
+        let mut b = SweepCursor::on(Arc::clone(&scanner));
+        // Warm the first walk: the first request waits for it, and the loop below
+        // measures only the walks published after this one.
+        let _ = a.next();
+
+        let deadline = Instant::now() + MIN_WALK_INTERVAL * 3;
+        let mut walks: HashSet<u64> = HashSet::new();
+        while Instant::now() < deadline {
+            if let Some(s) = a.next() {
+                walks.insert(s.seq);
+            }
+            if let Some(s) = b.next() {
+                walks.insert(s.seq);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // One paced worker over ~3 intervals publishes at most ~4 walks total,
+        // and BOTH cursors share them (dedup by seq). Two workers — one per
+        // cursor, i.e. the sharing lost — would publish up to twice as many in
+        // the same window, so a bound of 5 sits between the shared maximum and
+        // the first non-shared value.
+        assert!(
+            walks.len() <= 5,
+            "{} distinct walks served to two cursors in ~3 pacing intervals",
+            walks.len()
+        );
+    }
+
     /// The worker path end to end: a thread does the walking, and successive
     /// requests come back as successively newer walks of the real `/proc`.
     #[test]
