@@ -297,7 +297,7 @@ jobs:
           RPM_FILE=$(ls target/${{ matrix.target }}/generate-rpm/gpur-*.rpm | head -1)
           cp "$RPM_FILE" .
           sha256sum "$(basename "$RPM_FILE")" > "$(basename "$RPM_FILE").sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gpur-${{ matrix.target }}
           path: |
@@ -320,7 +320,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: gpur-*
           merge-multiple: true
