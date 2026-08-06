@@ -116,14 +116,10 @@ fn main() -> Result<()> {
     // two paths the panic hook and signal teardown are not installed yet, so
     // restore explicitly before bailing (restore_extras is idempotent).
     if let Err(e) = hjkl_kitty::enable(&mut stdout()) {
-        restore_extras();
-        ratatui::restore();
-        return Err(e).context("enabling kitty keyboard protocol");
+        return Err(fail_setup(e, "enabling kitty keyboard protocol"));
     }
     if let Err(e) = crossterm::execute!(stdout(), EnableMouseCapture) {
-        restore_extras();
-        ratatui::restore();
-        return Err(e).context("enabling mouse capture");
+        return Err(fail_setup(e, "enabling mouse capture"));
     }
     {
         let prev = std::panic::take_hook();
@@ -139,6 +135,17 @@ fn main() -> Result<()> {
     restore_extras();
     ratatui::restore();
     result
+}
+
+/// Bail out of a setup step that failed after `ratatui::try_init` put the tty
+/// into raw mode and the alternate screen. The panic hook and signal teardown
+/// are not installed yet, so restore explicitly before returning — a panic or
+/// an external kill at this point must not leave the shell with mouse
+/// reporting on (both restores are idempotent).
+fn fail_setup(e: impl Into<anyhow::Error>, what: &'static str) -> anyhow::Error {
+    restore_extras();
+    ratatui::restore();
+    e.into().context(what)
 }
 
 /// Open the `--log` sink, readable only by its owner where the platform has
