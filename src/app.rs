@@ -639,6 +639,12 @@ pub struct App {
     /// [`cpu_sample_due`]. `None` until the first poll.
     last_cpu_sample: Option<Instant>,
     users: Users,
+    /// Resolved user name per uid. `get_user_by_id` is a linear scan over the
+    /// whole user list, and both it and the name are session-constant —
+    /// `users` is a startup snapshot, never refreshed — so the per-row scan
+    /// and allocation happen once per uid instead of once per row per poll. A
+    /// miss is cached too: an unresolvable uid can never resolve later.
+    user_names: HashMap<sysinfo::Uid, Option<String>>,
     /// Resolved container ids per (pid, start time). The cgroup path is ~static
     /// per process, so re-reading `/proc/<pid>/cgroup` every poll for every row
     /// the Linux backends emit is wasted I/O. Keyed on the same seconds-resolution
@@ -703,6 +709,7 @@ impl App {
             sys: System::new(),
             last_cpu_sample: None,
             users: Users::new_with_refreshed_list(),
+            user_names: HashMap::new(),
             proc_text: HashMap::new(),
         }
     }
@@ -1009,9 +1016,20 @@ impl App {
                         .user
                         .clone()
                         .or_else(|| {
-                            p.and_then(|p| p.user_id())
-                                .and_then(|uid| self.users.get_user_by_id(uid))
-                                .map(|u| u.name().to_string())
+                            p.and_then(|p| p.user_id()).and_then(|uid| {
+                                match self.user_names.entry(uid.clone()) {
+                                    std::collections::hash_map::Entry::Occupied(e) => {
+                                        e.get().clone()
+                                    }
+                                    std::collections::hash_map::Entry::Vacant(e) => {
+                                        let name = self
+                                            .users
+                                            .get_user_by_id(uid)
+                                            .map(|u| u.name().to_string());
+                                        e.insert(name).clone()
+                                    }
+                                }
+                            })
                         })
                         .unwrap_or_else(|| "-".into()),
                     // Left None when neither the backend nor sysinfo could
