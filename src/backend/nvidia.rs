@@ -16,6 +16,14 @@ use nvml_wrapper::sys_exports::field_id::NVML_FI_DEV_MEMORY_TEMP;
 use nvml_wrapper::{Device, Nvml};
 use std::collections::HashMap;
 
+/// One probe-cached slot, with the probe-query-refused fallback: the probe
+/// resolved session-static values once (`names`, `integrated`,
+/// `pcie_max_*`, `temp_slowdown`, `fan_count`), and `None` there means the
+/// probe query failed — the poll re-asks live rather than showing a hole.
+fn cached<T: Clone>(slot: &[Option<T>], i: usize) -> Option<T> {
+    slot.get(i).cloned().flatten()
+}
+
 pub fn probe() -> Option<Box<dyn GpuBackend>> {
     #[cfg(target_os = "linux")]
     {
@@ -161,7 +169,7 @@ impl GpuBackend for NvmlBackend {
     fn poll(&mut self) -> Result<Vec<GpuSnapshot>> {
         let mut gpus = Vec::with_capacity(self.count as usize);
         for i in 0..self.count {
-            let device_id = self.uuids.get(i as usize).cloned().flatten();
+            let device_id = cached(&self.uuids, i as usize);
             // A device can drop off the bus (e.g. driver reset). Push a degraded
             // placeholder instead of skipping, so the card keeps its place on
             // screen rather than every later card jumping up a row and back
@@ -178,25 +186,17 @@ impl GpuBackend for NvmlBackend {
             };
             let memory = dev.memory_info().ok();
             let util = dev.utilization_rates().ok();
-            let fans = self.fan_count.get(i as usize).copied().flatten();
+            let fans = cached(&self.fan_count, i as usize);
             let (fan_pct, fan_rpm) = fan_speeds(&dev, fans);
             gpus.push(GpuSnapshot {
-                name: self
-                    .names
-                    .get(i as usize)
-                    .cloned()
-                    .flatten()
+                name: cached(&self.names, i as usize)
                     .unwrap_or_else(|| dev.name().unwrap_or_else(|_| format!("NVIDIA GPU {i}"))),
                 device_id,
                 // NVML has no "is integrated" query. FPCI is Tegra's on-SoC host
                 // interface and the only bus type no discrete card reports, so it
                 // is the one signal that can flag a Jetson iGPU; anything else,
                 // including an unsupported/missing query, stays discrete.
-                integrated: self
-                    .integrated
-                    .get(i as usize)
-                    .copied()
-                    .flatten()
+                integrated: cached(&self.integrated, i as usize)
                     .unwrap_or_else(|| dev.bus_type().is_ok_and(|b| matches!(b, BusType::Fpci))),
                 utilization_pct: util.as_ref().map(|u| super::clamp_pct(u.gpu as f64)),
                 mem_util_pct: util.as_ref().map(|u| super::clamp_pct(u.memory as f64)),
@@ -216,11 +216,7 @@ impl GpuBackend for NvmlBackend {
                     .temperature(TemperatureSensor::Gpu)
                     .ok()
                     .map(|t| t as f64),
-                temp_slowdown_c: self
-                    .temp_slowdown
-                    .get(i as usize)
-                    .copied()
-                    .flatten()
+                temp_slowdown_c: cached(&self.temp_slowdown, i as usize)
                     .or_else(|| slowdown_threshold_c(&dev)),
                 // NVML exposes no core-hotspot/junction field id, so
                 // `temp_junction_c` stays None here (see `memory_temp_c`).
@@ -234,17 +230,9 @@ impl GpuBackend for NvmlBackend {
                 mem_clock_mhz: dev.clock_info(Clock::Memory).ok().map(u64::from),
                 pcie_gen: dev.current_pcie_link_gen().ok().map(|g| g as u8),
                 pcie_width: dev.current_pcie_link_width().ok(),
-                pcie_max_gen: self
-                    .pcie_max_gen
-                    .get(i as usize)
-                    .copied()
-                    .flatten()
+                pcie_max_gen: cached(&self.pcie_max_gen, i as usize)
                     .or_else(|| dev.max_pcie_link_gen().ok().map(|g| g as u8)),
-                pcie_max_width: self
-                    .pcie_max_width
-                    .get(i as usize)
-                    .copied()
-                    .flatten()
+                pcie_max_width: cached(&self.pcie_max_width, i as usize)
                     .or_else(|| dev.max_pcie_link_width().ok()),
                 pcie_rx_kbs: dev
                     .pcie_throughput(PcieUtilCounter::Receive)
