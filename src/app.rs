@@ -2061,26 +2061,24 @@ mod tests {
             "the first poll must run before the exec, saw {before:?}"
         );
 
-        // Wait for the in-place exec to land, then ask again.
+        // The script sleeps 0.3s before the in-place exec, so the polls
+        // between spawn and exec keep returning the shell's cmdline. Keep
+        // asking until the re-read picks up the new one — the whole point is
+        // that the column follows an in-place exec instead of keeping the
+        // first read. (No /proc reads here: macOS has none, and the app's own
+        // poll is the thing under test anyway.)
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let cmd = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
-                .unwrap_or_default()
-                .replace('\0', " ");
-            if cmd.contains("sleep 30") {
+            app.poll();
+            if app.all_procs[0].command == "/bin/sleep 30" {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "the stage script never completed its exec"
+                "the COMMAND column kept the pre-exec cmdline"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        app.poll();
-        assert_eq!(
-            app.all_procs[0].command, "/bin/sleep 30",
-            "the COMMAND column kept the pre-exec cmdline"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
