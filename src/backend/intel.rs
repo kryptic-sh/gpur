@@ -58,6 +58,7 @@ mod linux_impl {
             cursor: SweepCursor::default(),
             buckets: IntelBuckets::default(),
             last_procs: Vec::new(),
+            driver: std::sync::OnceLock::new(),
         })
     }
 
@@ -87,6 +88,10 @@ mod linux_impl {
 
     struct IntelBackend {
         devices: Vec<IntelDevice>,
+        /// Header driver line, computed once: the device set is fixed for the
+        /// backend's life (a re-detect builds a new one), so re-joining it
+        /// every frame is pure waste — see `CompositeBackend::driver`.
+        driver: std::sync::OnceLock<Option<String>>,
         /// Ceiling for system-backed (GTT) graphics memory; static per boot.
         sys_mem_total: Option<u64>,
         /// (pid, client-id) -> (total ns, video ns) (i915 accounting).
@@ -206,9 +211,14 @@ mod linux_impl {
 
         /// Names the drivers actually in use: a box can have an i915 iGPU beside
         /// an xe Arc card, and the two publish different telemetry, so a header
-        /// naming one of them misattributes what the other lacks.
+        /// naming one of them misattributes what the other lacks. Computed
+        /// once — see the `driver` field.
         fn driver_info(&self) -> Option<String> {
-            linux::driver_line_for(self.devices.iter().map(|d| d.driver.as_str()))
+            self.driver
+                .get_or_init(|| {
+                    linux::driver_line_for(self.devices.iter().map(|d| d.driver.as_str()))
+                })
+                .clone()
         }
     }
 
@@ -511,6 +521,7 @@ mod linux_impl {
                 cursor: SweepCursor::on(Arc::clone(&scanner)),
                 buckets: IntelBuckets::default(),
                 last_procs: Vec::new(),
+                driver: std::sync::OnceLock::new(),
             };
             let card = 0; // 00:02.0, the i915 card; 06:00.0 is the xe one
 
@@ -761,6 +772,7 @@ drm-resident-gtt:\t1024 KiB
                 cursor: SweepCursor::on(Arc::clone(&ProcScanner::detached())),
                 buckets: IntelBuckets::default(),
                 last_procs: Vec::new(),
+                driver: std::sync::OnceLock::new(),
             };
             let t0 = Instant::now();
 

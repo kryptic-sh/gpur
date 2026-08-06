@@ -62,6 +62,7 @@ mod linux_impl {
             cursor: SweepCursor::default(),
             media: HashMap::new(),
             last_procs: Vec::new(),
+            driver: std::sync::OnceLock::new(),
         })
     }
 
@@ -90,6 +91,10 @@ mod linux_impl {
 
     struct AmdBackend {
         devices: Vec<AmdDevice>,
+        /// Header driver line, computed once: the device set is fixed for the
+        /// backend's life (a re-detect builds a new one), so re-joining it
+        /// every frame is pure waste — see `CompositeBackend::driver`.
+        driver: std::sync::OnceLock<Option<String>>,
         /// (pid, drm-client-id) -> that client's engine counters at last scan.
         engine_state: HashMap<(u32, u64), EngineSample>,
         /// Per device: (rx count, tx count, sampled at) from `pcie_bw`.
@@ -179,8 +184,13 @@ mod linux_impl {
         /// Names the drivers actually in use, not the backend: a box with a
         /// pre-GCN card beside a modern one is running both, and a header
         /// reading "amdgpu" would misattribute the gauges the old card lacks.
+        /// Computed once — see the `driver` field.
         fn driver_info(&self) -> Option<String> {
-            linux::driver_line_for(self.devices.iter().map(|d| d.driver.as_str()))
+            self.driver
+                .get_or_init(|| {
+                    linux::driver_line_for(self.devices.iter().map(|d| d.driver.as_str()))
+                })
+                .clone()
         }
     }
 
@@ -605,6 +615,7 @@ mod linux_impl {
                 cursor: linux::SweepCursor::on(Arc::clone(scanner)),
                 media: HashMap::new(),
                 last_procs: Vec::new(),
+                driver: std::sync::OnceLock::new(),
             }
         }
 

@@ -24,9 +24,11 @@ pub fn probe() -> Option<Box<dyn GpuBackend>> {
             // mix it with nouveau, so merge the sysfs cards in rather than
             // dropping them from the listing.
             return match nouveau::probe() {
-                Some(nv) => {
-                    Some(Box::new(MergedNvidiaBackend { nvml, nouveau: nv }) as Box<dyn GpuBackend>)
-                }
+                Some(nv) => Some(Box::new(MergedNvidiaBackend {
+                    nvml,
+                    nouveau: nv,
+                    driver: std::sync::OnceLock::new(),
+                }) as Box<dyn GpuBackend>),
                 None => Some(Box::new(nvml) as Box<dyn GpuBackend>),
             };
         }
@@ -87,7 +89,9 @@ fn nvml_probe() -> Option<NvmlBackend> {
             Some(NvmlBackend {
                 nvml,
                 count: n,
-                driver,
+                // The header line is static per boot; format it once at probe
+                // rather than re-formatting it on every frame's driver_info().
+                driver: driver.map(|d| format!("driver {d}")),
                 uuids,
                 names,
                 integrated,
@@ -246,7 +250,7 @@ impl GpuBackend for NvmlBackend {
     }
 
     fn driver_info(&self) -> Option<String> {
-        self.driver.as_ref().map(|d| format!("driver {d}"))
+        self.driver.clone()
     }
 
     fn processes(&mut self) -> Vec<GpuProcess> {
@@ -295,6 +299,9 @@ impl GpuBackend for NvmlBackend {
 struct MergedNvidiaBackend {
     nvml: NvmlBackend,
     nouveau: Box<dyn GpuBackend>,
+    /// Header line, computed once: both children's lines are static for the
+    /// backend's life, so the per-frame join is pure waste.
+    driver: std::sync::OnceLock<Option<String>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -318,12 +325,16 @@ impl GpuBackend for MergedNvidiaBackend {
     }
 
     fn driver_info(&self) -> Option<String> {
-        let a = self.nvml.driver_info();
-        let b = self.nouveau.driver_info();
-        match (a, b) {
-            (Some(a), Some(b)) => Some(format!("{a} · {b}")),
-            (a, b) => a.or(b),
-        }
+        self.driver
+            .get_or_init(|| {
+                let a = self.nvml.driver_info();
+                let b = self.nouveau.driver_info();
+                match (a, b) {
+                    (Some(a), Some(b)) => Some(format!("{a} · {b}")),
+                    (a, b) => a.or(b),
+                }
+            })
+            .clone()
     }
 }
 
@@ -367,11 +378,20 @@ mod nouveau {
 
     struct NouveauBackend {
         devices: Vec<NouveauDevice>,
+        /// Header driver line, computed once: the device set is fixed for the
+        /// backend's life (a re-detect builds a new one), so re-joining it
+        /// every frame is pure waste — see `CompositeBackend::driver`.
+        driver: std::sync::OnceLock<Option<String>>,
     }
 
     pub fn probe() -> Option<Box<dyn GpuBackend>> {
         let devices = scan("/sys/class/drm", false);
-        (!devices.is_empty()).then(|| Box::new(NouveauBackend { devices }) as Box<dyn GpuBackend>)
+        (!devices.is_empty()).then(|| {
+            Box::new(NouveauBackend {
+                devices,
+                driver: std::sync::OnceLock::new(),
+            }) as Box<dyn GpuBackend>
+        })
     }
 
     /// The NVML-absent fallback: claim cards bound to the proprietary `nvidia`
@@ -380,7 +400,12 @@ mod nouveau {
     /// invisible. Never used when NVML is alive: there those cards are NVML's.
     pub fn probe_without_nvml() -> Option<Box<dyn GpuBackend>> {
         let devices = scan("/sys/class/drm", true);
-        (!devices.is_empty()).then(|| Box::new(NouveauBackend { devices }) as Box<dyn GpuBackend>)
+        (!devices.is_empty()).then(|| {
+            Box::new(NouveauBackend {
+                devices,
+                driver: std::sync::OnceLock::new(),
+            }) as Box<dyn GpuBackend>
+        })
     }
 
     /// `include_nvidia` claims cards bound to the proprietary `nvidia` driver
@@ -417,7 +442,9 @@ mod nouveau {
         }
 
         fn driver_info(&self) -> Option<String> {
-            driver_line_for(self.devices.iter().map(|d| d.driver.as_str()))
+            self.driver
+                .get_or_init(|| driver_line_for(self.devices.iter().map(|d| d.driver.as_str())))
+                .clone()
         }
     }
 
