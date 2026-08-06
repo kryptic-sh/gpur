@@ -972,6 +972,8 @@ pub fn card_name(dev: &Path, idx: u32, vendor_hex: &str, fallback_brand: &str) -
 pub mod testing {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::sync::MutexGuard;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A scratch directory for one test, wiped when the guard drops.
@@ -1088,6 +1090,77 @@ pub mod testing {
     /// The `drm` root to hand a `scan`, as the `&str` the scans take.
     pub fn drm(root: &Path) -> String {
         root.join("drm").to_string_lossy().into_owned()
+    }
+
+    /// Open one card's render node read-only, so the sweep has a client of
+    /// that card to attribute. Without it the hardware tests only run where a
+    /// compositor happens to be up: a headless box owns no DRM client at all,
+    /// and a rule about how a client's memory is charged that is only ever
+    /// exercised by someone's running desktop is one nothing checks.
+    ///
+    /// A bare open allocates a few KiB of VRAM and a couple of MiB of GTT,
+    /// and fdinfo reports the two separately — which is exactly the asymmetry
+    /// the per-class charging rule turns on. `None` where the card has no
+    /// render node or where this user cannot open it, a note rather than a
+    /// failure: it is a fact about the machine, not about this backend.
+    pub fn open_render_node(dev: &Path, name: &str) -> Option<fs::File> {
+        let target = fs::canonicalize(dev).ok()?;
+        let node = fs::read_dir("/sys/class/drm")
+            .ok()?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("renderD"))
+            .find(|n| {
+                fs::canonicalize(format!("/sys/class/drm/{n}/device"))
+                    .ok()
+                    .as_ref()
+                    == Some(&target)
+            })?;
+        match fs::File::open(format!("/dev/dri/{node}")) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("note: cannot open /dev/dri/{node} for {name}: {e}");
+                None
+            }
+        }
+    }
+
+    /// Serializes the render-node tests against each other — across both
+    /// backends now, since the lock is shared. They run as threads of one
+    /// test process, so a client another test opened is a client of *this*
+    /// test's pid: it lands in the same process row and moves the very
+    /// figures being checked.
+    static RENDER_NODES: Mutex<()> = Mutex::new(());
+
+    /// A render-node client of every card in `which`, held for as long as
+    /// this value lives, with the other render-node tests locked out.
+    pub struct Held {
+        _guard: MutexGuard<'static, ()>,
+        _files: Vec<fs::File>,
+        /// Device indices a client was actually opened for — what the
+        /// callers are entitled to assert on.
+        pub opened: Vec<usize>,
+    }
+
+    /// Open a render-node client of every card in `which`, through the
+    /// caller's per-index opener.
+    pub fn hold_clients(which: &[usize], open: impl Fn(usize) -> Option<fs::File>) -> Held {
+        // A test that panicked while holding the lock poisoned it; its
+        // fds are closed all the same, so there is nothing to recover.
+        let guard = RENDER_NODES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut files = Vec::new();
+        let mut opened = Vec::new();
+        for &i in which {
+            if let Some(f) = open(i) {
+                files.push(f);
+                opened.push(i);
+            }
+        }
+        Held {
+            _guard: guard,
+            _files: files,
+            opened,
+        }
     }
 }
 

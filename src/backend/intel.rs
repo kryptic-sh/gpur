@@ -824,8 +824,8 @@ drm-resident-gtt:\t1024 KiB
         use super::*;
         use crate::backend::ProcKind;
         use crate::backend::linux::hwmon_u64;
+        use crate::backend::linux::testing;
         use std::fs;
-        use std::sync::{Mutex, MutexGuard};
         use std::time::{Duration, Instant};
 
         /// This machine's Intel backend, or `None` with a note saying why the
@@ -881,37 +881,20 @@ drm-resident-gtt:\t1024 KiB
             }
         }
 
-        /// Open one card's render node read-only, so the sweep has a client of
-        /// that card to attribute. Without it these tests only run where a
-        /// compositor happens to be up: a headless box owns no DRM client at
-        /// all, and a rule about how a client's memory is charged that is only
-        /// ever exercised by someone's running desktop is one nothing checks.
-        ///
-        /// A bare open allocates a few KiB of VRAM and a couple of MiB of GTT,
-        /// and fdinfo reports the two separately — which is exactly the
-        /// asymmetry the per-class charging rule turns on. `None` where this
-        /// user cannot open the card's render node, a note rather than a
-        /// failure: it is a fact about the machine, not about this backend.
+        /// Open one card's render node read-only — the shared helper in
+        /// `linux::testing`; this is the device-typed call site. See its doc
+        /// for why the hardware tests need a client of their own.
         fn open_render_node(d: &IntelDevice) -> Option<fs::File> {
-            let target = fs::canonicalize(&d.dev).ok()?;
-            let node = fs::read_dir("/sys/class/drm")
-                .ok()?
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.starts_with("renderD"))
-                .find(|n| {
-                    fs::canonicalize(format!("/sys/class/drm/{n}/device"))
-                        .ok()
-                        .as_ref()
-                        == Some(&target)
-                })?;
-            match fs::File::open(format!("/dev/dri/{node}")) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    eprintln!("note: cannot open /dev/dri/{node} for {}: {e}", d.name);
-                    None
-                }
-            }
+            testing::open_render_node(&d.dev, &d.name)
+        }
+
+        /// Serializes the render-node tests against each other; the lock is
+        /// the shared one in `linux::testing`, so both backends' render-node
+        /// tests serialize against each other — safe, since a client another
+        /// test opened lands in this test's own process row and moves the
+        /// very figures being checked.
+        fn hold_clients(b: &IntelBackend, which: &[usize]) -> testing::Held {
+            testing::hold_clients(which, |i| open_render_node(&b.devices[i]))
         }
 
         /// The threaded path, against a real card.
@@ -960,40 +943,9 @@ drm-resident-gtt:\t1024 KiB
             );
         }
 
-        /// Serializes the tests that open render nodes against each other.
-        /// They run as threads of one test process, so a client another test
-        /// opened is a client of *this* test's pid: it lands in the same
-        /// process row and moves the very figures being checked.
-        static RENDER_NODES: Mutex<()> = Mutex::new(());
-
-        /// A render-node client of every card in `which`, held for as long as
-        /// this value lives, with the other render-node tests locked out.
-        struct Held {
-            _guard: MutexGuard<'static, ()>,
-            _files: Vec<fs::File>,
-            /// Device indices a client was actually opened for — what the
-            /// callers are entitled to assert on.
-            opened: Vec<usize>,
-        }
-
-        fn hold_clients(b: &IntelBackend, which: &[usize]) -> Held {
-            // A test that panicked while holding the lock poisoned it; its
-            // fds are closed all the same, so there is nothing to recover.
-            let guard = RENDER_NODES.lock().unwrap_or_else(|e| e.into_inner());
-            let mut files = Vec::new();
-            let mut opened = Vec::new();
-            for &i in which {
-                if let Some(f) = open_render_node(&b.devices[i]) {
-                    files.push(f);
-                    opened.push(i);
-                }
-            }
-            Held {
-                _guard: guard,
-                _files: files,
-                opened,
-            }
-        }
+        /// Serializes the tests that open render nodes against each other —
+        /// see the `hold_clients` wrapper above; the lock and holder type
+        /// live in `linux::testing`.
 
         #[test]
         fn a_live_poll_reports_only_values_this_hardware_can_produce() {
