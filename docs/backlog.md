@@ -101,18 +101,19 @@ which cards exist, rest on inspection.
   set, a poll of both backends asserting their process rows land together would
   close it.
 - **`kill_dialog_opens_for_a_real_process_and_cancels` (tests/tui.rs) is flaky
-  under parallel load.** It waits for the stub backend's `sleep 60` row and has
-  timed out twice (2026-08-04) while the suite ran other tests in the same
-  binary — the screen showed two rows whose COMMAND column did not name `sleep`,
-  as if sysinfo enrichment of the stub's child row raced. It passes in isolation
-  and in every other full run, and no change under test has been implicated.
-  Uninvestigated. **Escalated 2026-08-06:** failed 3 of 3 full gate runs under
-  default parallel load during the backlog work session (always as the last tui
-  test), each time with the same signature (both rows' COMMAND showing the gpur
-  binary path, no `sleep`), and passed every isolation and serial run (all 38
-  tui tests serially, and 310/310 with `--test-threads=1`). Nothing under test
-  was implicated. Still the documented workaround: run the tui binary serially
-  if it bites again; a real fix needs the enrichment race investigated.
+  under parallel load — root-caused and fixed 2026-08-06.** The wait for the
+  stub backend's `sleep 60` row timed out ~10-15% of parallel runs (twice in CI
+  on 2026-08-04/05, 3 of 3 during the 08-06 session), always with the same
+  signature: both rows' COMMAND showing the gpur binary, no `sleep`, while the
+  real `sleep` process was alive with a correct `/proc` cmdline. Root cause: the
+  first poll sampled the freshly-forked `sleep` during its fork→exec window,
+  when `/proc/<pid>/cmdline` still carries the parent's gpur cmdline, and
+  sysinfo's `with_cmd(OnlyIfNotSet)` cached that transient value forever.
+  Reproduced locally (same signature, ~15%), confirmed by instrumentation that
+  delayed the first poll and closed the race, and fixed by re-reading the
+  cmdline every poll (`with_cmd(Always)`) — 70/70 tui runs clean after.
+  Regression test: `an_in_place_exec_updates_the_command_column` (proven red on
+  `OnlyIfNotSet`).
 - **No before/after measurement of the responsiveness this bought.** The 4.2 ms
   over 588 pids in the old entry measured the walk itself, and the walk's code
   is unchanged — what moved is which thread runs it. That keystrokes no longer
@@ -486,12 +487,22 @@ Recorded so they are not re-opened as findings.
 - **`MIN_TICK_MS` is 50, not 100.** The two floors disagreed (CLI 50, `+` key
   100); unifying upward would have silently removed `--tick-ms 50`, a capability
   users already had.
-- **The process command line is not cached** even though the container id is. A
+- **The process command line is not cached even though the container id is.** A
   pid's cgroup path is ~static, so caching the container on (pid, start time) is
-  safe; the command line re-derives each poll from sysinfo's already-cached
-  cmdline — an in-memory join with no I/O — so an in-place `exec`, which keeps
-  the pid and its start time, never leaves a stale COMMAND column. Cache it only
-  if the join ever shows up in a profile.
+  safe; the command line is re-derived every poll by re-reading
+  `/proc/<pid>/cmdline` (sysinfo `with_cmd(Always)`, since 2026-08-06). The
+  re-read is what keeps the column honest: a pid sampled during its fork→exec
+  window carries its parent's cmdline, and an in-place `exec` changes the
+  cmdline without changing the pid — either one cached once would go stale
+  forever. This is the fix for the PTY-stub flake (`kill_dialog_…_and_cancels`),
+  whose first poll caught the freshly-forked `sleep` pre-exec and rendered it
+  under the gpur binary's command line for the whole run. The cost is one
+  `/proc/<pid>/cmdline` read per row per poll, the same cost class as the
+  statm/status reads the memory and user columns already pay. (The original
+  entry claimed the re-derive was an in-memory join over sysinfo's cache "with
+  no I/O"; sysinfo's `OnlyIfNotSet` never re-reads, so that premise was false —
+  the column was actually cached from the first read, and the exec-staleness the
+  decision promised to prevent was exactly the bug the flake exposed.)
 - **`enforced_power_limit` is not cached at probe** with the other
   session-static NVML values. It changes when the user moves the power cap;
   caching it would show a stale limit until restart. One query per poll keeps

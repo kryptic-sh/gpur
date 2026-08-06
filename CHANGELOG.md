@@ -73,6 +73,14 @@ and this project adheres to
   grow to, and the graphs only ever display the terminal width's worth, so a
   typo'd value was unbounded memory growth for zero display benefit. The value
   is now capped at construction the way `tick_ms` is at startup.
+- **A process row no longer keeps a command line read before its `exec`.**
+  sysinfo was asked for the COMMAND column with `OnlyIfNotSet`, so the first
+  poll to see a pid kept its cmdline forever: a pid sampled during its fork→exec
+  window still carries its parent's cmdline, and an in-place `exec` left the old
+  command up for the whole session. The cmdline is now re-read every poll (one
+  `/proc/<pid>/cmdline` read per row per poll, the same cost class as the memory
+  and user columns) — which is also what the recorded "command line re-derives
+  each poll" decision promised but did not deliver.
 
 ## [0.13.0] - 2026-08-04
 

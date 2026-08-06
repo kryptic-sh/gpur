@@ -997,11 +997,19 @@ impl App {
             self.last_cpu_sample = Some(now);
         }
         // The plain refresh_processes() kind omits user and cmd — ask for
-        // exactly what the table shows.
+        // exactly what the table shows. The cmdline is re-read every poll
+        // (`Always`, not `OnlyIfNotSet`): a pid sampled during its fork->exec
+        // window still carries its parent's cmdline, and sysinfo's
+        // OnlyIfNotSet would cache that transient value forever — the PTY
+        // suite's stub backend hit exactly that, a row stuck showing the gpur
+        // binary instead of `sleep`. Re-reading is also what keeps an
+        // in-place exec from leaving a stale COMMAND column; it costs one
+        // /proc/<pid>/cmdline read per row per poll, the same cost class as
+        // the statm/status reads the other columns already pay.
         let kind = ProcessRefreshKind::nothing()
             .with_memory()
             .with_user(UpdateKind::OnlyIfNotSet)
-            .with_cmd(UpdateKind::OnlyIfNotSet);
+            .with_cmd(UpdateKind::Always);
         let kind = if sample_cpu { kind.with_cpu() } else { kind };
         self.sys
             .refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, kind);
@@ -1996,6 +2004,84 @@ mod tests {
             app.sys.process(Pid::from_u32(pid)).is_none(),
             "a departed pid accumulated in the sysinfo cache"
         );
+    }
+
+    /// The COMMAND column is re-read every poll, never cached from the first
+    /// read. A pid sampled during its fork->exec window still shows the
+    /// parent's cmdline, and an in-place exec changes the cmdline without
+    /// changing the pid — either way a one-shot read goes stale forever, which
+    /// is exactly the PTY-stub flake: the freshly-forked `sleep` rendered with
+    /// the gpur binary's command line until the test timed out.
+    #[test]
+    #[cfg(unix)]
+    fn an_in_place_exec_updates_the_command_column() {
+        struct ExecBackend(u32);
+
+        impl GpuBackend for ExecBackend {
+            fn name(&self) -> &'static str {
+                "exec"
+            }
+            fn poll(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
+                Ok(Vec::new())
+            }
+            fn processes(&mut self) -> Vec<crate::backend::GpuProcess> {
+                vec![crate::backend::GpuProcess {
+                    pid: self.0,
+                    ..Default::default()
+                }]
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("gpur-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("stage.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 0.3\nexec /bin/sleep 30\n").unwrap();
+        let child = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .spawn()
+            .expect("spawn stage script");
+        let pid = child.id();
+        // Kills the stage process even when an assertion below panics.
+        struct Reaper(Option<std::process::Child>);
+        impl Drop for Reaper {
+            fn drop(&mut self) {
+                if let Some(mut c) = self.0.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+        }
+        let _child = Reaper(Some(child));
+
+        let mut app = app_with(Box::new(ExecBackend(pid)));
+        app.poll();
+        let before = app.all_procs[0].command.clone();
+        assert!(
+            before.contains("stage.sh"),
+            "the first poll must run before the exec, saw {before:?}"
+        );
+
+        // Wait for the in-place exec to land, then ask again.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let cmd = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+                .unwrap_or_default()
+                .replace('\0', " ");
+            if cmd.contains("sleep 30") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stage script never completed its exec"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        app.poll();
+        assert_eq!(
+            app.all_procs[0].command, "/bin/sleep 30",
+            "the COMMAND column kept the pre-exec cmdline"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The container cache resolves once per (pid, start time): a second row
