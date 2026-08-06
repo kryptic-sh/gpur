@@ -69,6 +69,7 @@ fn nvml_probe() -> Option<NvmlBackend> {
             let mut pcie_max_gen = Vec::with_capacity(n as usize);
             let mut pcie_max_width = Vec::with_capacity(n as usize);
             let mut temp_slowdown = Vec::with_capacity(n as usize);
+            let mut fan_count = Vec::with_capacity(n as usize);
             for i in 0..n {
                 let Ok(d) = nvml.device_by_index(i) else {
                     uuids.push(None);
@@ -77,6 +78,7 @@ fn nvml_probe() -> Option<NvmlBackend> {
                     pcie_max_gen.push(None);
                     pcie_max_width.push(None);
                     temp_slowdown.push(None);
+                    fan_count.push(None);
                     continue;
                 };
                 uuids.push(d.uuid().ok());
@@ -85,6 +87,9 @@ fn nvml_probe() -> Option<NvmlBackend> {
                 pcie_max_gen.push(d.max_pcie_link_gen().ok().map(|g| g as u8));
                 pcie_max_width.push(d.max_pcie_link_width().ok());
                 temp_slowdown.push(slowdown_threshold_c(&d));
+                // The fan COUNT is a board property, fixed for the device's
+                // life — only the speeds are per-poll data.
+                fan_count.push(d.num_fans().ok());
             }
             Some(NvmlBackend {
                 nvml,
@@ -98,6 +103,7 @@ fn nvml_probe() -> Option<NvmlBackend> {
                 pcie_max_gen,
                 pcie_max_width,
                 temp_slowdown,
+                fan_count,
                 last_util_ts: vec![0; n as usize],
             })
         }
@@ -127,6 +133,11 @@ struct NvmlBackend {
     /// card. `None` marks a query the driver declined, and poll falls back to
     /// asking again.
     temp_slowdown: Vec<Option<f64>>,
+    /// Fan count per device index, cached at probe like the fields above — a
+    /// board property, fixed for the device's life; only the speeds are
+    /// per-poll data. `None` marks a query the driver declined, and the poll
+    /// falls back to probing fan 0 the way it always has.
+    fan_count: Vec<Option<u32>>,
     /// Microsecond timestamp of the newest process-utilization sample seen,
     /// **per device index**. `nvmlDeviceGetProcessUtilization` only returns
     /// samples strictly newer than the timestamp handed to it, and the
@@ -167,7 +178,8 @@ impl GpuBackend for NvmlBackend {
             };
             let memory = dev.memory_info().ok();
             let util = dev.utilization_rates().ok();
-            let (fan_pct, fan_rpm) = fan_speeds(&dev);
+            let fans = self.fan_count.get(i as usize).copied().flatten();
+            let (fan_pct, fan_rpm) = fan_speeds(&dev, fans);
             gpus.push(GpuSnapshot {
                 name: self
                     .names
@@ -674,11 +686,12 @@ fn slowdown_threshold_c(dev: &Device) -> Option<f64> {
 /// different curves. Report the max, not the mean: the loudest, hardest-working
 /// fan is what explains audible noise and remaining thermal headroom, and a
 /// mean would dilute one pegged fan into a comfortable-looking number. On
-/// single-fan cards this is identical to the old behaviour. `num_fans` is
-/// `NotSupported` on fanless parts, in which case index 0 is probed once and
-/// also fails, leaving both values None rather than 0.
-fn fan_speeds(dev: &Device<'_>) -> (Option<f64>, Option<u64>) {
-    let fans = dev.num_fans().unwrap_or(1).max(1);
+/// single-fan cards this is identical to the old behaviour. `fans` is the
+/// count cached at probe; `None` means the driver declined the query (fanless
+/// parts), in which case index 0 is probed once and also fails, leaving both
+/// values None rather than 0.
+fn fan_speeds(dev: &Device<'_>, fans: Option<u32>) -> (Option<f64>, Option<u64>) {
+    let fans = fans.unwrap_or(1).max(1);
     let mut pct: Option<u32> = None;
     let mut rpm: Option<u32> = None;
     for f in 0..fans {
