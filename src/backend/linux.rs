@@ -776,28 +776,31 @@ pub fn gts_to_gen(speed: &str) -> Option<u8> {
     })
 }
 
-/// Current negotiated PCIe link as (gen, width). These are PCI-core
+/// Read one PCIe link pair — negotiated or maximum — from the PCI-core
 /// attributes (`drivers/pci/pci-sysfs.c`), identical for every vendor's
 /// endpoint, so one reader serves all sysfs backends. Each element is None
 /// when its file is missing or unparseable — e.g. on integrated devices,
 /// which are not PCIe endpoints in any meaningful sense.
-pub fn pcie_current_link(dev: &Path) -> (Option<u8>, Option<u32>) {
+fn link_pair(dev: &Path, speed_file: &str, width_file: &str) -> (Option<u8>, Option<u32>) {
     let speed = |f: &str| read_trim(&dev.join(f)).as_deref().and_then(gts_to_gen);
     let width = |f: &str| read_trim(&dev.join(f)).and_then(|w| w.parse().ok());
-    (speed("current_link_speed"), width("current_link_width"))
+    (speed(speed_file), width(width_file))
+}
+
+/// Current negotiated PCIe link as (gen, width). See [`link_pair`] for the
+/// file semantics; this is the pair read every poll, since the negotiated
+/// link moves with the workload.
+pub fn pcie_current_link(dev: &Path) -> (Option<u8>, Option<u32>) {
+    link_pair(dev, "current_link_speed", "current_link_width")
 }
 
 /// Maximum supported PCIe link as (gen, width), from the same PCI-core
-/// attributes as the current link. Each element is None when its file is
-/// missing or unparseable — e.g. on integrated devices, which are not PCIe
-/// endpoints in any meaningful sense.
+/// attributes as the current link. See [`link_pair`] for the file semantics.
 ///
 /// The maximum is a fixed capability, resolved once at scan time and cached
 /// per device rather than re-read every poll.
 pub fn pcie_max_link(dev: &Path) -> (Option<u8>, Option<u32>) {
-    let speed = |f: &str| read_trim(&dev.join(f)).as_deref().and_then(gts_to_gen);
-    let width = |f: &str| read_trim(&dev.join(f)).and_then(|w| w.parse().ok());
-    (speed("max_link_speed"), width("max_link_width"))
+    link_pair(dev, "max_link_speed", "max_link_width")
 }
 
 /// Current and maximum PCIe link as (gen, width, max gen, max width) — the
