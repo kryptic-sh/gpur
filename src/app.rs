@@ -27,6 +27,19 @@ pub fn clamp_tick_ms(v: u64) -> u64 {
     v.clamp(MIN_TICK_MS, MAX_TICK_MS)
 }
 
+/// Graph-history retention ceiling. Config `history_len` is a *minimum* the
+/// per-device history vectors grow to, and the graphs only ever display
+/// `history_need` samples (the terminal width — braille packs 2 per column),
+/// so a huge configured value is unbounded memory growth for zero display
+/// benefit: a typo'd `history_len` must not OOM the session the way a huge
+/// `tick_ms` must not freeze the monitor. The value is clamped at
+/// construction; 0 stays 0 ("no minimum", the display need decides).
+pub const MAX_HISTORY_LEN: usize = 100_000;
+
+pub fn clamp_history_len(v: usize) -> usize {
+    v.min(MAX_HISTORY_LEN)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Gpus,
@@ -658,7 +671,7 @@ impl App {
             session: HashMap::new(),
             last_seen: HashMap::new(),
             polls: 0,
-            history_len,
+            history_len: clamp_history_len(history_len),
             selected: 0,
             paused: false,
             tick_ms,
@@ -2069,6 +2082,38 @@ mod tests {
         assert_eq!(clamp_tick_ms(0), MIN_TICK_MS);
         assert_eq!(clamp_tick_ms(50), 50);
         assert_eq!(clamp_tick_ms(9_999_999_999), MAX_TICK_MS);
+    }
+
+    /// The config `history_len` is a minimum the per-device history vectors
+    /// grow to, so a typo'd value is unbounded growth for zero display
+    /// benefit — the graphs only ever show the terminal width's worth. The
+    /// same shape as the tick clamp above, ceiling only (0 means "no
+    /// minimum").
+    #[test]
+    fn the_startup_history_clamp_caps_a_huge_value() {
+        assert_eq!(clamp_history_len(0), 0);
+        assert_eq!(clamp_history_len(300), 300);
+        assert_eq!(clamp_history_len(usize::MAX), MAX_HISTORY_LEN);
+    }
+
+    /// The clamp is applied at construction, not at one call site, so a
+    /// future caller cannot hand `App::new` an unbounded retention.
+    #[test]
+    fn new_caps_an_absurd_configured_history_len() {
+        let app = App::new(
+            crate::backend::detect(Some(2), None).unwrap(),
+            crate::theme::load(None, crate::theme::detect_color_mode()).unwrap(),
+            AppOptions {
+                tick_ms: 1000,
+                tick_explicit: false,
+                history_len: usize::MAX / 2,
+                no_splash: true,
+                graph_style: GraphStyle::Ascii,
+                source: crate::backend::BackendSource::Live,
+                log: None,
+            },
+        );
+        assert_eq!(app.history_len, MAX_HISTORY_LEN);
     }
 
     /// `+` must never *raise* the interval: the key floor and the CLI floor

@@ -47,6 +47,11 @@ and this project adheres to
   read it as fresh, and `--once --log` wrote zero records beside a full
   snapshot. Any final-poll failure now exits non-zero with the error on stderr
   and no snapshot on stdout.
+- **A huge configured `history_len` no longer grows the graph history without
+  bound.** Config `history_len` is a _minimum_ the per-device history vectors
+  grow to, and the graphs only ever display the terminal width's worth, so a
+  typo'd value was unbounded memory growth for zero display benefit. The value
+  is now capped at construction the way `tick_ms` is at startup.
 
 ## [0.13.0] - 2026-08-04
 
