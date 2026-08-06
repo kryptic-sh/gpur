@@ -8,6 +8,13 @@ use anyhow::{Context, Result};
 use std::io::BufRead;
 use std::path::Path;
 
+/// Line cap for the replay reader. A recording is untrusted input, and a
+/// single oversized line (or a `gpus`/`processes` array with millions of
+/// entries) must not be materialized wholesale — that is how a crafted
+/// recording OOMs the process. Lines past the cap are dropped the way
+/// malformed ones are.
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(serde::Deserialize)]
 struct LogRecord {
     /// Attribution written since the record schema gained it; older
@@ -22,8 +29,88 @@ struct LogRecord {
     processes: Vec<GpuProcess>,
 }
 
+/// `BufRead::lines` with a per-line cap: reads in bounded chunks instead of
+/// allocating a whole line up front, so a multi-GB line costs no more than
+/// the cap. A line past the cap is drained and dropped, like a malformed
+/// one; a final line without a trailing newline is still returned.
+struct BoundedLines<R: BufRead> {
+    inner: R,
+    cap: usize,
+}
+
+impl<R: BufRead> BoundedLines<R> {
+    fn new(inner: R, cap: usize) -> Self {
+        BoundedLines { inner, cap }
+    }
+
+    /// Skip the rest of a line whose start already exceeded the cap, without
+    /// materializing any of it.
+    fn drain_to_newline(&mut self) {
+        loop {
+            let chunk = match self.inner.fill_buf() {
+                Ok([]) => return,
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            match chunk.iter().position(|&b| b == b'\n') {
+                Some(p) => {
+                    self.inner.consume(p + 1);
+                    return;
+                }
+                None => {
+                    let len = chunk.len();
+                    self.inner.consume(len);
+                }
+            }
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for BoundedLines<R> {
+    type Item = std::io::Result<String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let chunk = match self.inner.fill_buf() {
+                Ok([]) => {
+                    // EOF. A buffered tail without a trailing newline is a
+                    // real (final) line; an empty buffer is the end.
+                    return if buf.is_empty() {
+                        None
+                    } else {
+                        Some(Ok(String::from_utf8_lossy(&buf).into_owned()))
+                    };
+                }
+                Ok(c) => c,
+                Err(e) => return Some(Err(e)),
+            };
+            if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+                if buf.len() + pos <= self.cap {
+                    buf.extend_from_slice(&chunk[..pos]);
+                    self.inner.consume(pos + 1);
+                    return Some(Ok(String::from_utf8_lossy(&buf).into_owned()));
+                }
+                // Oversized: drop it and move on to the next line.
+                self.inner.consume(pos + 1);
+                buf.clear();
+                continue;
+            }
+            buf.extend_from_slice(chunk);
+            let len = chunk.len();
+            self.inner.consume(len);
+            if buf.len() > self.cap {
+                // The line's end is still ahead and it already exceeds the
+                // cap — drain the rest of it without allocating it.
+                self.drain_to_newline();
+                buf.clear();
+            }
+        }
+    }
+}
+
 pub struct ReplayBackend {
-    lines: std::io::Lines<std::io::BufReader<std::fs::File>>,
+    lines: BoundedLines<std::io::BufReader<std::fs::File>>,
     last: LogRecord,
     finished: bool,
     /// `load` already consumed the first record into `last` to validate the
@@ -34,7 +121,7 @@ pub struct ReplayBackend {
 pub fn load(path: &Path) -> Result<Box<dyn GpuBackend>> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("opening replay log {}", path.display()))?;
-    let mut lines = std::io::BufReader::new(file).lines();
+    let mut lines = BoundedLines::new(std::io::BufReader::new(file), MAX_LINE_BYTES);
     // Require at least one valid record up front so a wrong file errors
     // loudly at startup instead of showing an empty dashboard.
     let first = next_record(&mut lines)
@@ -47,8 +134,9 @@ pub fn load(path: &Path) -> Result<Box<dyn GpuBackend>> {
     }))
 }
 
-/// Next parseable record, skipping malformed lines (truncated tail writes).
-fn next_record(lines: &mut std::io::Lines<std::io::BufReader<std::fs::File>>) -> Option<LogRecord> {
+/// Next parseable record, skipping malformed lines (truncated tail writes)
+/// and oversized ones (the reader's line cap).
+fn next_record<R: BufRead>(lines: &mut BoundedLines<R>) -> Option<LogRecord> {
     for line in lines.by_ref() {
         let Ok(line) = line else { return None };
         if let Ok(rec) = serde_json::from_str::<LogRecord>(&line) {
@@ -237,6 +325,41 @@ mod tests {
         let path = write_log("legacy", "{\"gpus\":[],\"processes\":[]}\n");
         let b = load(&path).unwrap();
         assert_eq!(b.driver_info(), None);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// The line reader drops a line past its cap instead of materializing
+    /// it, keeps lines at or under the cap, and still returns a final line
+    /// without a trailing newline. A 4-byte `BufReader` forces every line to
+    /// span several chunks, so the accumulate and drain paths both run.
+    #[test]
+    fn bounded_lines_drops_oversized_lines_and_keeps_the_rest() {
+        let data = "123456789\n12345678\nabc\n123456789012345\nno-eol";
+        //       ^ 9 > 8            ^ 8 = 8   ^ 3 ok  ^ 15 > 8         ^ 6 ok
+        let lines = BoundedLines::new(
+            std::io::BufReader::with_capacity(4, std::io::Cursor::new(data)),
+            8,
+        );
+        let got: Vec<String> = lines.map(|l| l.unwrap()).collect();
+        assert_eq!(got, vec!["12345678", "abc", "no-eol"]);
+    }
+
+    /// End to end: a recording whose line exceeds `MAX_LINE_BYTES` plays
+    /// past the drop — `load` skips the giant record the way it skips a
+    /// malformed one, and the record after it replays. On the unbounded
+    /// reader the giant record was parsed and returned first.
+    #[test]
+    fn a_record_longer_than_the_line_cap_is_dropped() {
+        let giant = format!(
+            r#"{{"gpus":[{{"name":"{}"}}],"processes":[]}}"#,
+            "x".repeat(MAX_LINE_BYTES + 1)
+        );
+        let path = write_log(
+            "giant",
+            &format!("{giant}\n{{\"gpus\":[{{\"name\":\"ok\"}}],\"processes\":[]}}\n"),
+        );
+        let mut b = load(&path).unwrap();
+        assert_eq!(b.poll().unwrap()[0].name, "ok");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

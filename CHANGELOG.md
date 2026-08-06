@@ -17,6 +17,12 @@ and this project adheres to
   stripped it (ratatui filters control characters), the one-shot path did not.
   `--once` now drops control characters from the strings it prints, mirroring
   the TUI's guarantee; `--json` was never exposed (serde escapes them).
+- **The replay reader no longer allocates a whole line to find out it is huge.**
+  A crafted recording with one multi-GB line made `--replay` (and
+  `--once`/`--json` on top of it) materialize the entire line, OOMing the
+  process. Lines are now read in bounded chunks; a line past 8 MiB is drained
+  and dropped the way malformed ones are, so a giant record costs no more than
+  the cap.
 
 ### Fixed
 
