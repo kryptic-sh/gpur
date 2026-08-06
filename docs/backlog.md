@@ -106,7 +106,13 @@ which cards exist, rest on inspection.
   binary — the screen showed two rows whose COMMAND column did not name `sleep`,
   as if sysinfo enrichment of the stub's child row raced. It passes in isolation
   and in every other full run, and no change under test has been implicated.
-  Uninvestigated; run the tui binary serially if it bites again.
+  Uninvestigated. **Escalated 2026-08-06:** failed 3 of 3 full gate runs under
+  default parallel load during the backlog work session (always as the last tui
+  test), each time with the same signature (both rows' COMMAND showing the gpur
+  binary path, no `sleep`), and passed every isolation and serial run (all 38
+  tui tests serially, and 310/310 with `--test-threads=1`). Nothing under test
+  was implicated. Still the documented workaround: run the tui binary serially
+  if it bites again; a real fix needs the enrichment race investigated.
 - **No before/after measurement of the responsiveness this bought.** The 4.2 ms
   over 588 pids in the old entry measured the walk itself, and the walk's code
   is unchanged — what moved is which thread runs it. That keystrokes no longer
@@ -506,26 +512,11 @@ One finding; everything else traced held. Verdict: safe to ship as-is.
 
 ### Finding — a TUI invocation with redirected stdout writes one spurious
 
-`--log` record (and stalls up to 2 s) before failing the terminal check
-
-**Severity: low.** `src/main.rs:100` runs `app.poll()` before the
-`stdout().is_terminal()` guard at `src/main.rs:104`. `poll()` →
-`App::poll_inner(true)` (`src/app.rs:813`, `824`) and a successful poll appends
-one JSONL record via `write_log` (`src/app.rs:913-915`) when `--log` is set.
-
-```
-Repro: gpur --log /tmp/rec.jsonl > out.txt   (stdout redirected, no --once/--json)
-Expect: the invocation fails fast and writes nothing — the session never ran
-Actual: one record lands in the log from a session that then bails
-        "stdout is not a terminal" (exit non-zero), delayed on Linux by the
-        first-walk wait (FIRST_SCAN_WAIT, 2 s, src/backend/linux.rs:241)
-```
-
-A consumer of the log (`--replay`, a tailing script) sees a record from a run
-that never happened. **Fix:** move the `is_terminal` check ahead of `app.poll()`
-(nothing between them needs a prior poll — the check exists to protect
-`ratatui::try_init`, which is after it), or gate `write_log` on the check having
-passed.
+`--log` record (and stalls up to 2 s) before failing the terminal check —
+**shipped 2026-08-06** (`8de0e69`): the `is_terminal` check now runs before
+`open_log` and the first `app.poll()`, so a session that is about to bail
+creates no `--log` file, writes no record, and fails immediately. Smoke test
+proven red on the old code.
 
 ### Cleared
 
@@ -571,10 +562,10 @@ passed.
   siblings `power1_max`/`power1_cap` use (`amd.rs:337-340`, `intel.rs:181-183`).
   A chip that ever published a 0 would make the "thermal" throttle label
   unconditional (any `t >= -3`). Add `.filter(|v| *v > 0)` for symmetry.
-- **`main.rs:100` vs `104`** — even without `--log`, the first `app.poll()` (up
-  to `FIRST_SCAN_WAIT` on Linux) runs before the terminal is known to exist;
-  moving the `is_terminal` check earlier makes the failure fast and
-  side-effect-free.
+- **`main.rs:100` vs `104`** — the first `app.poll()` (up to `FIRST_SCAN_WAIT`
+  on Linux) ran before the terminal was known to exist; the check moved ahead of
+  `open_log` and the poll in `8de0e69`, so this half is closed with the finding
+  above.
 - **`nvidia.rs:258-265`** — a pid in both `running_compute_processes` and
   `running_graphics_processes` gets the graphics entry wholesale (kind _and_
   memory); if NVML ever reports different per-context memory, the compute figure
@@ -606,62 +597,16 @@ exactly as the backlog records them. Overall risk: low.
 
 ### 1. LOW — Terminal escape injection through the `--once` headless path via a
 
-crafted replay recording
+crafted replay recording — **shipped 2026-08-06** (`9c97d57`): `snapshot()` now
+strips control characters from recorded GPU names and commands with the same
+`char::is_control()` filter ratatui applies; end-to-end smoke test proven red on
+the old code.
 
-**`src/main.rs:249-299`** (raw `println!` of `g.name` at 251 and `p.command` at
-297), sink fed from **`src/backend/replay.rs:34-59`** (untrusted recording)
-through **`src/app.rs:1010-1014`** (`command: gp.command.clone().or(...)` — a
-recorded command is taken verbatim, never filtered).
+### 2. LOW — Unbounded allocation on replay input — **shipped 2026-08-06**
 
-The recording is the untrusted input, and the headless printer emits it raw.
-Verified end-to-end with a crafted recording: a `\u001b]2;…\u001b\` (OSC 2
-window-title) sequence inside a GPU name or command survives `--once` into the
-terminal. The TUI path is **not** exposed: the resolved ratatui-core 0.1.2
-filters `char::is_control()` in `set_stringn` (`src/buffer/buffer.rs:351`),
-which every widget render goes through — so the same string is stripped on
-screen and emitted raw by `--once`. (`--log` carries the same bytes to a file; a
-later `cat` is the log consumer's terminal. `--json` is safe — serde escapes
-control chars in JSON strings.)
-
-```
-Repro: printf '{"gpus":[{"name":"evil\u001b]2;HACKED\u001b\\ GPU","device_id":"x"}],\n
-        "processes":[{"pid":1,"gpu_index":0,"command":"run\u001b]0;PWNED\u001b\\me.sh","gpu_mem_bytes":0}]}\n'
-       > rec.jsonl; gpur --once --replay rec.jsonl | od -c
-Expect: ESC bytes never reach the terminal
-Actual: raw 033 ] 2 ; H A C K E D 033 \ … (and OSC 0) in the output
-```
-
-Exploit scenario: attacker posts a recording (the project already treats
-recordings from others as hostile for the kill path); victim runs
-`gpur --once --replay rec.jsonl` — the terminal receives attacker-controlled
-escape sequences: title/icon overwrite, scrollback injection, and on
-OSC-52-capable emulators a clipboard write. Actual code execution depends on a
-vulnerable terminal emulator, so low; it is a genuine asymmetry — sanitized in
-the TUI, raw one flag away. **Fix:** apply the same `char::is_control()` filter
-to the strings formatted into the `--once` lines (one small sanitize helper used
-at main.rs:249-299), mirroring the TUI's guarantee.
-
-### 2. LOW — Unbounded allocation on replay input: one oversized line OOMs the
-
-process
-
-**`src/backend/replay.rs:37`** (`BufReader::lines()` reads a whole line into a
-`String` with no length bound) and **`src/backend/replay.rs:54`**
-(`serde_json::from_str::<LogRecord>` deserializes unbounded `Vec<GpuSnapshot>` /
-`Vec<GpuProcess>` from that line, all `#[serde(default)]`, no
-`deny_unknown_fields`).
-
-```
-Repro: one multi-GB line (or a few million GPUs) in a --replay recording
-Expect: gpur survives or skips the oversized record
-Actual: the whole line is allocated, then fully materialized — OOM kills gpur
-```
-
-Severity: low — a self-directed local DoS (the victim must run gpur against the
-attacker's file; no privilege boundary crossed), and the standard cost of any
-JSONL consumer. **Fix, if wanted:** read lines through a capped `Read::take`
-(e.g. 8 MiB per line, skipping oversized lines the way malformed ones are
-skipped today) and/or bound record size after parse.
+(`dc927e6`): the replay reader now reads lines in bounded chunks and drops any
+line past 8 MiB like a malformed one; unit test at a small cap plus an e2e test
+at the real cap, proven red on the unbounded reader.
 
 ### Cleared
 
@@ -745,9 +690,10 @@ clean).
 **Summary:** 2 findings, both low, both on the `--replay` untrusted-recording
 surface: terminal escape injection in the `--once` printer (verified end-to-end
 — the TUI sanitizes, the headless path does not), and unbounded per-line
-allocation in the replay reader. Fix first: strip `char::is_control()` in the
-headless printers (main.rs `snapshot()`); optionally cap replay line length.
-Everything else can ship as-is.
+allocation in the replay reader. **Both shipped 2026-08-06** — `9c97d57`
+(`char::is_control()` filter in the headless printers, mirroring the TUI) and
+`dc927e6` (8 MiB per-line cap, oversized lines dropped). Everything else can
+ship as-is.
 
 ## Codebase tidy 2026-08-05
 
@@ -756,46 +702,26 @@ cleanups only. All files read in full; `cargo check --all-features --locked` is
 clean, so nothing rustc flags as dead. Four cleanups survive verification; no
 dead code in the tree. Nothing here blocks shipping.
 
-### 1. `src/backend/linux.rs:784-801` — duplicated PCIe link-pair reader
+### 1. `src/backend/linux.rs:784-801` — duplicated PCIe link-pair reader —
 
-(production code)
-
-`pcie_current_link` (784-788) and `pcie_max_link` (797-801) each define the
-identical `speed`/`width` closure pair, differing only in the two file names
-each reads (`current_link_*` vs `max_link_*`). **Action:** extract
-`fn link_pair(dev: &Path, speed_file: &str, width_file: &str)` containing the
-two closures and the read; both functions become one-line calls into it. Keep
-the two doc comments — they describe genuinely different semantics
-(negotiated-each-poll vs fixed-capability-cached) and should not be merged. Call
-sites (amd.rs:313/357, intel.rs:153/440, nvidia.rs:396/426, the `pcie_link` test
-helper) are unchanged.
+**shipped 2026-08-06** (`f0f7a7a`): `pcie_current_link` and `pcie_max_link` now
+call one shared `link_pair(dev, speed_file, width_file)`; the doc comments keep
+their distinct semantics.
 
 ### 2. `src/backend/amd.rs:897-998` + `src/backend/intel.rs:884-985` —
 
-byte-identical hardware-test helpers (~70 lines duplicated)
-
-`open_render_node` (amd 897-917 / intel 884-904), the `RENDER_NODES` static,
-`struct Held` and `hold_clients` are identical in the two files except the
-device type (`&AmdDevice` vs `&IntelDevice`); the bodies only touch `d.dev` and
-`d.name`. **Action:** move `open_render_node(dev: &Path, name: &str)` into
-`linux::testing` (the module that already exists to share fixture code across
-every Linux backend's tests) plus one shared holder type; each module keeps its
-own `which`-loop or the shared `hold_clients` takes an accessor closure. Net ~70
-lines → ~25. Caveat: the shared `RENDER_NODES` mutex would then serialize the
-two modules' render-node tests against each other — safe (that mutex exists
-precisely to serialize such tests). Test-only, so the lowest risk to shipped
-behavior, but the largest raw duplication in the tree.
+byte-identical hardware-test helpers — **shipped 2026-08-06** (`719184b`):
+`open_render_node`, the `RENDER_NODES` mutex, `Held` and `hold_clients` moved
+into `linux::testing` with thin device-typed wrappers at each call site; the
+shared mutex now serializes both backends' render-node tests against each other,
+which is safe and was already the per-module pattern. Net −24 lines.
 
 ### 3. `src/main.rs:115-124` — duplicated setup-failure teardown-and-bail
 
-blocks
-
-The two 3-line teardown sequences (kitty enable / mouse capture failures) are
-identical — `restore_extras(); ratatui::restore(); return Err(e).context(...)` —
-and both restores are idempotent (comment at 113-114). **Action:** extract
-`fn fail_setup(e: impl Into<anyhow::Error>, what: &str) -> anyhow::Error { restore_extras(); ratatui::restore(); e.into().context(what) }`
-and return `Err(fail_setup(e, "…"))` from both arms. Puts the "restore before
-bail" invariant in one place so a future third setup step can't forget it.
+blocks — **shipped 2026-08-06** (`fb2ab32`): both post-`try_init` failure arms
+now return `Err(fail_setup(e, "…"))`, putting the "restore before bail"
+invariant in one place (`fail_setup` takes `&'static str` because anyhow's
+context requires it).
 
 ### 4. `src/backend/mod.rs:352-356` — per-poll `name_counts` HashMap for a child
 
@@ -809,7 +735,9 @@ the `driver` OnceLock precedent. Behavior identical; the per-poll allocation
 disappears. Low severity — a ≤4-entry HashMap per poll — but the same shape as
 the `driver_info` caching deliberately done, so it reads as an oversight rather
 than a decision. Optional: if it sits inside the spirit of the declined "pure
-waste at the margin" category, leave it.
+waste at the margin" category, leave it. **Left 2026-08-06** under that optional
+note — a ≤4-entry HashMap per poll is squarely the declined "pure waste at the
+margin" class, and the review itself offered leaving it.
 
 ### Dropped after verification
 
@@ -847,59 +775,19 @@ worth taking in the next cleanup.
 
 ### 1. `rebuild_proc_view` clones every row and re-sorts the whole table every
 
-poll
-
-**`src/app.rs:1060`** — `refresh_processes` ends with `self.rebuild_proc_view()`
-and runs once per poll (`app.rs:912` in `poll_inner`; `poll()` per tick from the
-run loop, `src/main.rs:462-465`, and once at startup). **`src/app.rs:1124`** —
-`.cloned()` copies every surviving `ProcRow`, i.e. ~6 owned `String`s (user,
-command, container, …) per row per tick. **`src/app.rs:1128-1151`** —
-`rows.sort_by(...)` re-sorts the whole filtered table every tick.
-
-At the size the project itself names as pathological (10k processes, backlog
-item 2): ~10k × 6 String allocations and a 10k-element sort per tick — on the
-order of a few ms/s of allocation churn plus 1-2% CPU in the sort, all to
-rebuild a view whose membership and ordering keys barely moved. At ordinary
-500-row scale it's ~3k String allocs/tick — small but the largest allocation
-churn in the app layer. **Fix:** make `procs` a view — `Vec<usize>` indices into
-`all_procs` (or `Vec<&ProcRow>`) — sort the indices and slice at draw time. The
-sort must still run per tick (the util/mem values it orders do change), but the
-per-row String clones disappear. `draw_processes` (`src/ui.rs:1214`) and the
-mouse hit-test bound index through `app.procs` today; a view keeps the same API
-shape. Note this is the _middle_ copy of a row's strings per tick (backends
-clone `last_procs` at `amd.rs:176`, `intel.rs:204`; `refresh_processes`
-re-clones into `ProcRow` at `app.rs:995- 1029`) — removing this one is the
-cheapest of the three.
+poll — **shipped 2026-08-06** (`1cdca59`): `App.procs` is now `Vec<usize>`
+indices into `all_procs`; the filter and per-tick sort run over indices, and
+`draw_processes` dereferences the view at draw time. The per-row String clones
+disappear; sort order, filter semantics and cursor-keeping are byte-identical,
+pinned by a new unit test over a non-identity index mapping.
 
 ### 2. Linux vendor backends call `driver_info()` per frame — a fresh `uname()`
 
 syscall plus ~5 allocations per frame for a string constant for the backend's
-life
-
-**`src/ui.rs:41`** — `app.backend.driver_info()` runs in `draw()`, i.e. every
-frame (the run loop redraws per tick and per input event, `src/main.rs:332`),
-and again per tick from `record()` when `--log` is on (`src/app.rs:932`).
-**`src/backend/amd.rs:182-184`** / **`intel.rs:210-212`** — `driver_info()` →
-`linux::driver_line_for(...)`; **`linux.rs:833-836`** builds a `BTreeSet`, a
-`Vec` and a joined `String` per call; **`linux.rs:819-821`** — `driver_line`
-calls `sysinfo::System::kernel_version()`, which on Linux is an uncached
-`uname(2)` syscall (verified in the installed sysinfo 0.39.6 source). Same shape
-for `nouveau` (`nvidia.rs:419-421`); `MergedNvidiaBackend` joins two strings per
-frame (`nvidia.rs:320-327`); plain NVML re-`format!`s `"driver {d}"` per frame
-(`nvidia.rs:248-250`).
-
-Cost: one syscall + a handful of allocations per frame — microseconds — but on
-the render path at the app's fastest rate (20 Hz at `--tick-ms 50`), forever,
-producing a value that cannot change (device list fixed at probe; kernel version
-static per boot). The project already solved exactly this: `CompositeBackend`
-caches its joined line in a `OnceLock` (`src/backend/mod.rs:319`, `449-467`)
-with a comment saying it exists to avoid re-joining it every frame — the
-single-vendor backends (the common case, since `compose` returns the child
-unwrapped, `mod.rs:479-484`) never got the same treatment. **Fix:** give
-`AmdBackend`/`IntelBackend`/`NouveauBackend` a `OnceLock<Option<String>>` for
-the driver line computed on first `driver_info()` (or at probe), exactly like
-`CompositeBackend::driver`; the NVML side can pre-format its `"driver {d}"` once
-at probe. Zero behaviour change — the string is identical on every call.
+life — **shipped 2026-08-06** (`ab86308`): each sysfs backend (amd, intel,
+nouveau) caches its joined driver line in a `OnceLock`, the NVML side
+pre-formats `"driver {d}"` at probe, and `MergedNvidiaBackend` caches its join —
+mirroring `CompositeBackend::driver`. Identical string, zero behavior change.
 
 ### 3. Active process filter re-lowercases every row's command/user/container
 
@@ -915,19 +803,21 @@ tick; 10k rows ~30-40k/tick. **Fix:** cache a pre-lowercased search key per row
 identity (keyed on the same `(pid, start_time)` the container cache uses,
 `app.rs:634`), or store `command_lower`/`user_lower` fields on `ProcRow`
 computed when the row is built, so the per-poll filter pass only compares.
-Either keeps the "fresh after exec" property for the visible column.
+Either keeps the "fresh after exec" property for the visible column. **Left
+2026-08-06:** both proposed shapes are defective on inspection — a
+`command_lower` field on `ProcRow` saves nothing, because the rows are rebuilt
+from scratch every poll (the lowercase would be recomputed anyway); a
+`(pid, start_time)`-keyed cache reintroduces exactly the exec-staleness the
+recorded "command line is not cached" decision exists to prevent (an in-place
+exec keeps both keys, so the filter key would go stale while the visible column
+stays fresh). Below the review's own top-wins line; revisit only if a filtered
+session shows up in a profile.
 
 ### 4. NVML re-queries `num_fans()` every poll though the fan count is a fixed
 
-device property
-
-**`src/backend/nvidia.rs:653-666`** — `fan_speeds` calls `dev.num_fans()` once
-per poll, then `fan_speed(f)`/`fan_speed_rpm(f)` per fan. The per-fan speeds are
-genuinely per-poll data; the _count_ is a board property, the same class as
-`names`/`pcie_max_*`/`temp_slowdown`, which are explicitly cached at probe to
-avoid a per-poll driver round trip per card (`nvidia.rs:60-63`, `110-125`).
-**Fix:** read `num_fans` once at probe and store it per index (with the same
-`None`-means-query-refused fallback); fan speeds stay live per poll.
+device property — **shipped 2026-08-06** (`9bd30cf`): the count is read once at
+probe per device and stored beside the other probe-cached vecs; only the per-fan
+speeds stay live per poll.
 
 ### 5. Windows PDH re-parses and re-lowercases every counter instance name on
 
@@ -977,14 +867,14 @@ traceable frequencies; none claims a measured microsecond figure.
 
 ## Codebase review 2026-08-06
 
-The sweep's correctness pass, second run over the same tree. Tree clean, so
-this covered all of `src/` and `tests/` in full again; depth low
-(high-confidence findings only). **The standing 08-05 finding — the spurious
-`--log` record written by `app.poll()` at `src/main.rs:100` before the
-`is_terminal` guard at `:104` — was re-verified against the current tree and
-still holds exactly as recorded** (see the 08-05 section above): `poll()` →
-`poll_inner(true)` (`app.rs:813-815`, `:824`), a successful poll appends via
-`write_log` (`app.rs:913-915`, `:940-961`). Not re-reported.
+The sweep's correctness pass, second run over the same tree. Tree clean, so this
+covered all of `src/` and `tests/` in full again; depth low (high-confidence
+findings only). **The standing 08-05 finding — the spurious `--log` record
+written by `app.poll()` at `src/main.rs:100` before the `is_terminal` guard at
+`:104` — was re-verified against the current tree and still holds exactly as
+recorded** (see the 08-05 section above): `poll()` → `poll_inner(true)`
+(`app.rs:813-815`, `:824`), a successful poll appends via `write_log`
+(`app.rs:913-915`, `:940-961`). Not re-reported.
 
 Two new findings, both low, neither a regression of anything fixed since the
 last pass. Everything else traced held.
@@ -994,16 +884,17 @@ last pass. Everything else traced held.
 PDH engine instances, so it reads roughly double the real utilization
 
 **Severity: low (Windows only, one gauge, clamped at 100).**
-`src/backend/windows.rs:253` — `*engine.entry((luid.clone(), eng.clone())).or_default() += v;`
-sums **every** `GPU Engine` instance that parses to a `(luid, engtype)` pair,
-pid-scoped and adapter-scoped alike. The WDDM counter publishes both forms per
-engine — `pid_<pid>_luid_…_engtype_<type>` for each process and a
+`src/backend/windows.rs:253` —
+`*engine.entry((luid.clone(), eng.clone())).or_default() += v;` sums **every**
+`GPU Engine` instance that parses to a `(luid, engtype)` pair, pid-scoped and
+adapter-scoped alike. The WDDM counter publishes both forms per engine —
+`pid_<pid>_luid_…_engtype_<type>` for each process and a
 `luid_…_phys_…_eng_…_engtype_<type>` aggregate — and the aggregate already
-contains everything the pid instances sum to. `util_by_luid` then takes the
-max over engines of the inflated sum (`:274-275`, clamped at `:355`), so a GPU
-genuinely 40% busy renders ~80% and anything past ~50% renders a confident
-100%. The per-process column is unaffected — it is built only from pid
-instances (`:254-260`).
+contains everything the pid instances sum to. `util_by_luid` then takes the max
+over engines of the inflated sum (`:274-275`, clamped at `:355`), so a GPU
+genuinely 40% busy renders ~80% and anything past ~50% renders a confident 100%.
+The per-process column is unaffected — it is built only from pid instances
+(`:254-260`).
 
 The comment at `:243-244` says the map is "summed % **across processes**"; the
 implementation sums all instances instead, so intent and code disagree even
@@ -1023,39 +914,17 @@ tests never exercise (their fixtures are pid-scoped only, `windows.rs:491`). A
 Windows box running the binary against a known load settles it in minutes.
 **Fix, if confirmed:** skip instances without a `pid_` prefix in the `engine`
 loop (the aggregate then comes out of the pid sum, matching the comment), or
-take the adapter gauge from the non-pid instances alone.
+take the adapter gauge from the non-pid instances alone. **Deferred 2026-08-06:
+** the fix lives on the `#[cfg(windows)]` poll path, which is neither compiled
+nor executable on a Linux host — shipping it would be unverified platform code
+that CI's other runners would have to catch. Needs a Windows box running the
+binary against a known load to confirm the premise and validate the change.
 
 ### Finding 2 — headless `--once`/`--json` silently report the priming poll when
 
-only the final poll fails
-
-**Severity: low.** `src/main.rs:227-231` — `snapshot()` bails only when
-`app.gpus.is_empty()` **and** `poll_error` is set, i.e. the all-polls-failed
-case fixed in `89a4492`. When the priming poll succeeds and the final poll
-fails, `gpus` still holds the priming snapshots, the guard passes, and the
-output is the priming poll's data printed with exit 0 and no error anywhere —
-the `--once` promise ("two quick polls so utilization deltas are real") is
-silently broken, and a script keying on the exit code cannot tell the snapshot
-from a fresh one. The `--log` half fails the other way: the final poll's error
-path returns before `write_log`, so `--once --log` writes zero records while
-stdout prints a full snapshot.
-
-```
-Repro: GPUR_MOCK_FAIL=2 gpur --mock 1 --once
-       (tick 1 = priming poll succeeds, tick 2 = final poll fails)
-Expect: exit non-zero with "poll failed: simulated driver reset" on stderr,
-        like GPUR_MOCK_FAIL=1 (json_exits_nonzero_when_every_poll_fails)
-Actual: exit 0, the tick-1 snapshot printed, stderr empty
-```
-
-Traced end to end: `main.rs:219` `poll_priming()` → `poll_inner(false)` (tick
-1 OK); `main.rs:221` `app.poll()` → `poll_inner(true)` (tick 2 bails,
-`mock.rs:47-54`) → `poll_error = Some`, `gpus` unchanged (`app.rs:834-862`);
-the guard at `main.rs:227` sees non-empty `gpus` and lets it through.
-Reachable with any live backend that hiccups exactly once on the second poll
-(NVML under a driver reset is the realistic case). **Fix:** bail (or at least
-exit non-zero with the error on stderr) whenever `poll_error` is set after the
-final poll, not only when `gpus` is also empty.
+only the final poll fails — **shipped 2026-08-06** (`ce64036`): `snapshot()` now
+bails whenever `poll_error` is set after the final poll, not only when `gpus` is
+also empty; smoke test with `GPUR_MOCK_FAIL=2` proven red on the old code.
 
 ### Cleared
 
@@ -1063,10 +932,10 @@ Suspects raised and disproved this pass, so the next review does not re-tread
 them:
 
 - **Process-pane click/scroll bounds after a filter shrinks the table** — a
-  click can land past the new row count, but the next `draw_processes`
-  re-clamps `proc_sel` and `proc_scroll` before slicing (`ui.rs:1132-1138`),
-  and `visible == 0` yields the empty slice `[x..x]`, never an out-of-range
-  panic. Held.
+  click can land past the new row count, but the next `draw_processes` re-clamps
+  `proc_sel` and `proc_scroll` before slicing (`ui.rs:1132-1138`), and
+  `visible == 0` yields the empty slice `[x..x]`, never an out-of-range panic.
+  Held.
 - **Sort tie-break not following the arrow** — `rebuild_proc_view`'s
   `then(a.pid.cmp(&b.pid))` (`app.rs:1150`) orders equal-key rows by pid
   ascending in both directions. Deterministic and consistent with the record
@@ -1078,16 +947,17 @@ them:
   mock rows pre-supply the host columns and `can_signal()` is false
   (`mock.rs:162-164`), so nothing can act on a collided pid. Held.
 - **First-poll `FIRST_SCAN_WAIT` (2 s) blocking the terminal check** — that is
-  the standing finding's second half (08-05 hardening item 2), re-verified,
-  not new.
+  the standing finding's second half (08-05 hardening item 2), re-verified, not
+  new.
 - **Restored folds for never-present devices** — persist as "gone" entries
   capped by `MAX_FOLDS_PERSISTED` without ever affecting the UI; bounded and
   harmless.
-- **Composite slots / device keys / process rebasing** (`backend/mod.rs:388-443`),
-  **seq pacing and `SweepCursor`** (`linux.rs:375-404`, `411-415`, `521-528`),
-  **kill-path guards** (`app.rs:1222-1367`), **PDH buffer sizing and LUID
-  matching** (`windows.rs:432-484`, `397-400`), **AMD/Intel counter-delta
-  paths** — all re-read against the 08-05 cleared list and held.
+- **Composite slots / device keys / process rebasing**
+  (`backend/mod.rs:388-443`), **seq pacing and `SweepCursor`**
+  (`linux.rs:375-404`, `411-415`, `521-528`), **kill-path guards**
+  (`app.rs:1222-1367`), **PDH buffer sizing and LUID matching**
+  (`windows.rs:432-484`, `397-400`), **AMD/Intel counter-delta paths** — all
+  re-read against the 08-05 cleared list and held.
 - **Arithmetic bounds** — `stacked_height` / `cards_that_fit` /
   `proc_pane_height` in u32, `parse_size` saturation, `gradient` degenerate
   ramps, `windowed` padding, `le_int` sign extension — held with their tests.
@@ -1102,8 +972,8 @@ them:
   the panic cannot fire. The only live panicking path in `src/`; a
   fail-fast-at-startup is arguably the right behaviour anyway.
 - **`windows.rs:253`** — even if finding 1's premise fails (no adapter-
-  aggregate engine instances), the `engine` map's documented contract ("summed
-  % across processes") is enforced by nothing; a future counter-shape change
+  aggregate engine instances), the `engine` map's documented contract ("summed %
+  across processes") is enforced by nothing; a future counter-shape change
   silently changes the gauge. A `pid_`-prefix filter makes the code match its
   comment in either world.
 
@@ -1114,30 +984,30 @@ modules) plus `tests/smoke.rs` and `tests/tui.rs`. Gaps, honestly named: the
 verification gate was not run (read-only pass per this sweep's constraints; the
 orchestrator runs it); nothing behind `#[cfg(windows)]` (the PDH/DXGI `win`
 module — finding 1 rests on reading it, not executing it) or
-`cfg(target_os = "macos")` (the IOKit `macos` module) is compiled on this
-Linux host, and every NVML call is unexecuted — reviewed by reading only; the
+`cfg(target_os = "macos")` (the IOKit `macos` module) is compiled on this Linux
+host, and every NVML call is unexecuted — reviewed by reading only; the
 amd/intel hardware-test modules skip without a GPU; dependency internals
 (hjkl-\*, ratatui, sysinfo, nvml-wrapper, portable-pty) were not inspected
-beyond the call sites; `pkg/`, `assets/` and prose docs were out of scope, as
-in the 08-05 pass.
+beyond the call sites; `pkg/`, `assets/` and prose docs were out of scope, as in
+the 08-05 pass.
 
 ## Codebase audit 2026-08-06
 
-The sweep's security pass, run over the same tree the 08-05 audit and the
-08-06 review covered; `git status` shows only this backlog modified, and the
+The sweep's security pass, run over the same tree the 08-05 audit and the 08-06
+review covered; `git status` shows only this backlog modified, and the
 orchestrator verified the source tree is unchanged since 08-05 (only
 `.github/workflows/ci.yml` moved). Tree clean, so full-codebase; depth low
-(high-confidence findings only). Worked from the backlog: the two standing
-08-05 audit findings were re-verified against the current tree and hold
-exactly as recorded — terminal escape injection through `--once` via a crafted
-replay recording (`src/main.rs:249-299`, the sink fed verbatim from the
-recording at `src/app.rs:1010-1014`) and unbounded per-line allocation in the
-replay reader (`src/backend/replay.rs:37`, `:54`) — so they are not re-reported
-here (see the 08-05 section above). The two 08-06 review findings (Windows PDH
-adapter-gauge double-counting, `src/backend/windows.rs:253`; headless `--once`
-priming-poll silent success, `src/main.rs:227-231`) were re-verified and also
-hold as recorded. **Zero new findings at depth low** — the Cleared list below
-is the trail.
+(high-confidence findings only). Worked from the backlog: the two standing 08-05
+audit findings were re-verified against the current tree and hold exactly as
+recorded — terminal escape injection through `--once` via a crafted replay
+recording (`src/main.rs:249-299`, the sink fed verbatim from the recording at
+`src/app.rs:1010-1014`) and unbounded per-line allocation in the replay reader
+(`src/backend/replay.rs:37`, `:54`) — so they are not re-reported here (see the
+08-05 section above). The two 08-06 review findings (Windows PDH adapter-gauge
+double-counting, `src/backend/windows.rs:253`; headless `--once` priming-poll
+silent success, `src/main.rs:227-231`) were re-verified and also hold as
+recorded. **Zero new findings at depth low** — the Cleared list below is the
+trail.
 
 ### Findings
 
@@ -1159,15 +1029,15 @@ disproved by tracing, not by assertion:
 - **Kill-path TOCTOU in the `kill_with` fallback** (`app.rs:1333-1366`) — the
   seconds-resolution `start_time` re-check (fresh one-pid refresh) immediately
   precedes the signal; on Linux the pidfd fast path (field-22 re-read at pin
-  time, `app.rs:1293-1331`) is attempted first and only its refusal reaches
-  the fallback, matching the 08-04 review's cleared "standard pidfd practice,
+  time, `app.rs:1293-1331`) is attempted first and only its refusal reaches the
+  fallback, matching the 08-04 review's cleared "standard pidfd practice,
   fail-closed" item. A same-second reuse inside the fallback's microsecond
   window is the platform's best available, not a regression.
-- **Replay process rows vs frame size** — `gpu_index >= frame` rows are
-  dropped (`replay.rs:98-104`), the composite drops out-of-span rows
-  (`backend/mod.rs:435-437`), and the TUI prints `gpu_index` as text only,
-  never indexing with it, so a crafted recording cannot point a row at another
-  card. Held.
+- **Replay process rows vs frame size** — `gpu_index >= frame` rows are dropped
+  (`replay.rs:98-104`), the composite drops out-of-span rows
+  (`backend/mod.rs:435-437`), and the TUI prints `gpu_index` as text only, never
+  indexing with it, so a crafted recording cannot point a row at another card.
+  Held.
 - **`parse_fdinfo` engine/cycles pairing** (`linux.rs:587-626`) —
   `drm-engine-capacity-*` is skipped, `drm-total-cycles-*` and `drm-cycles-*`
   fill distinct fields of one entry in either line order, a failing
@@ -1178,10 +1048,10 @@ disproved by tracing, not by assertion:
   runs exactly one walk (the initial `wanted: true`), started at scanner init
   during probe and finished before any headless poll, so `ns_delta_util`'s
   `duration_since` never sees a regressed `at`. Held.
-- **Scanner concurrency** (`linux.rs:293-454`) — seq is minted under the lock
-  by both producers and publish never writes the counter back; a poisoned
-  mutex is recovered via `into_inner`; the `synchronous` flag is set once
-  before any poll reads it. Held.
+- **Scanner concurrency** (`linux.rs:293-454`) — seq is minted under the lock by
+  both producers and publish never writes the counter back; a poisoned mutex is
+  recovered via `into_inner`; the `synchronous` flag is set once before any poll
+  reads it. Held.
 - **`--json` sink from a crafted recording** — `serde_json::to_string_pretty`
   escapes control characters, so the same payload that reaches `--once` raw
   arrives at `--json` escaped; that asymmetry is exactly the 08-05 finding's
@@ -1191,9 +1061,9 @@ disproved by tracing, not by assertion:
   `sleep 60`, killed on drop; `GPUR_MOCK_FAIL` parses a u64 and a non-numeric
   value disables the hook; `NO_COLOR`/`TERM`/`COLORTERM` are string-compared;
   XDG vars feed hjkl-config. Held.
-- **No crypto, no RNG, no secret handling** — nothing exists in these classes
-  to audit; the only `Command::new` in production is the stub's `sleep 60`
-  (already a recorded hardening item).
+- **No crypto, no RNG, no secret handling** — nothing exists in these classes to
+  audit; the only `Command::new` in production is the stub's `sleep 60` (already
+  a recorded hardening item).
 - **Mock pids and signalability** — `PID_BASE` (1_000_000) sits above Linux
   pid_max; mock and replay return `can_signal() == false`; the composite ANDs
   its children; `confirm_kill` re-checks `can_signal()` after a failed-poll
@@ -1203,124 +1073,82 @@ disproved by tracing, not by assertion:
   pid-suffixed temp name, 0600; the pre-existing `O_CREAT`-without-`O_EXCL`
   symlink note remains the recorded hardening item, unchanged. Held.
 - **`--replay` re-serialization** — a recording replayed under `--log`/`--json`
-  is re-encoded into the same record shape; no new sink appears (log file
-  0600, json escaped). Held.
+  is re-encoded into the same record shape; no new sink appears (log file 0600,
+  json escaped). Held.
 
 ### Hardening (correct today, fragile — not vulnerabilities)
 
 - **`open_log` runs before the `is_terminal` check** (`main.rs:73-76` vs
-  `:104`): a TUI invocation with redirected stdout creates the `--log` file
-  (empty at open, then carrying one spurious record once `app.poll()` runs) —
-  the record half is the recorded 08-05 finding; the file-creation half
-  survives that finding's fix unless `open_log` moves with the check. Moving
-  the terminal check ahead of both is the single fix for the pair.
-- **`history_len` from `config.toml` is not clamped** the way `tick_ms` is:
-  the per-poll retention cap is `max(history_len, history_need + 8)`
-  (`app.rs:889`), so a large configured value grows the four history vectors
-  unboundedly over a long session. Self-inflicted (the user's own config, a
-  typo rather than an attacker), and the same class the startup `tick_ms`
-  clamp exists for — a matching clamp on `history_len` would make the two
-  inputs behave alike.
+  `:104`): closed with the 08-05 finding by `8de0e69` — the check moved ahead of
+  both `open_log` and `app.poll()`, so no file is created and no record lands
+  for a session that never ran.
+- **`history_len` from `config.toml` is not clamped** — **shipped 2026-08-06**
+  (`1abae14`): `App::new` now caps it at `MAX_HISTORY_LEN` (100_000) the way
+  `tick_ms` is clamped at startup, so a typo'd config value cannot grow the four
+  history vectors without bound; unit test proven red with the clamp removed.
 
 ### Coverage
 
 Walked in full, line by line: `src/` (all files, incl. unit and hardware-test
 modules) plus `tests/smoke.rs` and `tests/tui.rs`. Gaps, honestly named — the
-same standing ones as the two earlier passes: the verification gate was not
-run (read-only pass per this sweep's constraints; the orchestrator runs it);
-nothing behind `#[cfg(windows)]` (PDH/DXGI) or `#[cfg(target_os = "macos")]`
-(IOKit) is compiled or executed on this Linux host — reviewed by reading only;
-every NVML call is unexecuted; the amd/intel hardware-test modules skip
-without a GPU; dependency internals (hjkl-\*, ratatui, sysinfo, nvml-wrapper,
-portable-pty, signal-hook) were not inspected beyond the call sites; `pkg/`,
-`assets/` and prose docs were out of scope, as before.
+same standing ones as the two earlier passes: the verification gate was not run
+(read-only pass per this sweep's constraints; the orchestrator runs it); nothing
+behind `#[cfg(windows)]` (PDH/DXGI) or `#[cfg(target_os = "macos")]` (IOKit) is
+compiled or executed on this Linux host — reviewed by reading only; every NVML
+call is unexecuted; the amd/intel hardware-test modules skip without a GPU;
+dependency internals (hjkl-\*, ratatui, sysinfo, nvml-wrapper, portable-pty,
+signal-hook) were not inspected beyond the call sites; `pkg/`, `assets/` and
+prose docs were out of scope, as before.
 
 **Summary:** 0 new findings at depth low. The four standing low findings were
-re-verified against the unchanged tree and all hold: two from the 08-05 audit
-(replay→`--once` escape injection; unbounded replay line allocation) and two
-from the 08-06 review (PDH GPU% double-count; headless priming-poll silent
-success). Overall risk: low — unchanged since 08-05. Top fixes are still the
-two 08-05 items — a `char::is_control()` filter in the `--once` printers
-(main.rs `snapshot()`), and a bounded read for replay lines — with the 08-06
-review's two fixes (pid-prefix filter in the PDH `engine` loop; bail whenever
-`poll_error` is set after the final headless poll) next.
+re-verified against the tree at the time of the pass and all held: two from the
+08-05 audit (replay→`--once` escape injection; unbounded replay line allocation)
+and two from the 08-06 review (PDH GPU% double-count; headless priming-poll
+silent success). **Three of the four shipped 2026-08-06** — `9c97d57`,
+`dc927e6`, `ce64036` — leaving only the Windows-only PDH GPU% double-count,
+deferred pending a Windows box (see its finding above). Overall risk: low —
+unchanged since 08-05.
 
 ## Codebase tidy 2026-08-06
 
 The sweep's cleanup pass, second run over the same tree. Tree clean (only
 `docs/backlog.md` modified), so full-codebase; behavior-preserving cleanups
-only. All of `src/` and `tests/` read in full again; `cargo check
---all-features --locked` is clean, so nothing rustc flags as dead. The four
-standing 08-05 cleanups were re-verified against the current tree and all hold
-exactly as recorded (see the 08-05 section above): the duplicated PCIe
+only. All of `src/` and `tests/` read in full again;
+`cargo check --all-features --locked` is clean, so nothing rustc flags as dead.
+The four standing 08-05 cleanups were re-verified against the current tree and
+all hold exactly as recorded (see the 08-05 section above): the duplicated PCIe
 link-pair reader (`linux.rs:784-801`), the byte-identical amd/intel
 hardware-test helpers (`amd.rs:897-998` / `intel.rs:884-985`), the duplicated
 setup-failure teardown blocks (`main.rs:115-124`), and the per-poll
 `name_counts` HashMap (`backend/mod.rs:352-356`). Not re-reported.
 
-Four new cleanups survive verification, all small; nothing here blocks
-shipping.
+Four new cleanups survive verification, all small; nothing here blocks shipping.
 
 ### 1. `src/backend/nvidia.rs:149-232` — the cached-at-probe-with-live-fallback
 
-pattern repeated five times in `poll`
-
-`self.<field>.get(i as usize).cloned()/.copied().flatten().or_else(|| <fresh
-query>)` is the same skeleton at `:168-173` (name), `:179-184` (integrated),
-`:203-208` (temp_slowdown), `:221-226` (pcie_max_gen) and `:227-232`
-(pcie_max_width), plus the plain cache read at `:149` (device_id) — the exact
-shape the probe caches at `:60-63` / `:112-125` were built for, and each fresh
-query is a different one-liner the fallback comments depend on staying
-visible. **Action:** extract `fn cached<T: Clone>(slot: &[Option<T>], i:
-usize) -> Option<T> { slot.get(i).cloned().flatten() }` (or `cached_or` taking
-the fallback closure) and each site becomes one line, fallback queries intact.
-Behavior identical; six 3-4 line blocks become six one-liners.
+pattern repeated five times in `poll` — **shipped 2026-08-06** (`6e8db99`): a
+`cached(&slot, i)` helper now serves the two plain cache reads and all five
+cached-plus-fallback sites, fallback queries intact.
 
 ### 2. `src/backend/linux.rs` (new helpers) + `amd.rs:333`, `intel.rs:179`,
 
 `nvidia.rs:434` — hwmon temperature and power-limit readers duplicated across
-
-the three Linux backends
-
-Three byte-identical temperature expressions —
-`hwmon_u64(h, "temp1_input").map(|v| v as f64 / 1000.0)` — and the same
-`power1_max` power-limit reader twice (`intel.rs:181-183`, `nvidia.rs:436-438`
-— amd correctly reads `power1_cap` instead). `linux::fan_pct` (`linux.rs:674`)
-is the precedent: amdgpu/radeon/nouveau all drive the same hwmon attributes,
-so one reader serves them, and the hwmon-ABI facts ("temp1_input is
-millidegrees", "power1_max is microwatts") currently live in three copies.
-**Action:** add `linux::hwmon_temp_c(hwmon: Option<&Path>) -> Option<f64>` and
-`linux::hwmon_power_limit_w(hwmon: Option<&Path>) -> Option<f64>` beside
-`fan_pct` and call them from the three backends. Behavior identical.
+the three Linux backends — **shipped 2026-08-06** (`571ef55`):
+`linux::hwmon_temp_c` and `linux::hwmon_power_limit_w` sit beside `fan_pct`;
+amd's `power1_cap` reader stays bespoke (it reads the right attribute for
+amdgpu).
 
 ### 3. `src/main.rs:240-243` + `:284-287`, `src/ui.rs:1116-1119` — the
 
-bytes→"{}MiB" formatter triplicated
-
-`format!("{}MiB", b / 1024 / 1024)` appears twice inside `snapshot()` as the
-closures `mib` and `proc_mib`, which differ only in the fallback literal
-(`n/a` vs `-`), and `ui::proc_mib`'s body is a third copy with `N/A`. The three
-fallbacks are documented as deliberately different (main.rs:276-283, ui.rs
-:1114-1115) and should stay put. **Action:** extract one
-`fn mib(b: u64) -> String { format!("{}MiB", b / 1024 / 1024) }` — a private
-fn in `main.rs` covers the two snapshot closures, a `pub(crate)` one in `ui.rs`
-(which both modules already share) also covers `proc_mib` — and each site maps
-it with its own fallback. Behavior identical. (`human_bytes`' `{}M` at
-ui.rs:815 is the deliberate TUI divergence, not part of this.)
+bytes→"{}MiB" formatter triplicated — **shipped 2026-08-06** (`0c3c659`): one
+`pub(crate) ui::mib` serves the TUI table and both `--once` closures; the
+`n/a`/`-`/`N/A` fallbacks stay at their documented homes.
 
 ### 4. `src/splash.rs:104-105` — `render` re-scans the art every splash frame
 
-when the same numbers are already compile-time constants
-
-`render()` calls `art_dims()` per frame — a runtime scan of the whole `ART`
-string for its rows and longest line — during the ~25 splash frames, when
-`ART_BOUNDS` (`:66`, the `const fn` scan at `:30-64`) already holds exactly
-those numbers, built precisely because the runtime `str::lines` walk is not
-const. The drift test at `:150-153` pins `ART_BOUNDS == art_dims()`. **Action:**
-in `render`, take `(rows, cols)` from `ART_BOUNDS` as
-`(ART_BOUNDS.0 as u16, ART_BOUNDS.1 as u16)` — safe, since the const asserts
-both fit in `u8` — and drop the per-frame re-scan; keep `art_dims` for the
-drift test. Behavior identical.
+when the same numbers are already compile-time constants — **shipped
+2026-08-06** (`b39bf7f`): `render` reads `ART_BOUNDS` (both fit u8 per the const
+asserts); `art_dims` stays alive under `#[cfg(test)]` for the drift test.
 
 ### Dropped after verification
 
@@ -1328,36 +1156,37 @@ drift test. Behavior identical.
   `Shell` variant. Table-ifying needs a variant→`Shell` mapping to live
   somewhere anyway, and the match is the idiomatic form; net same line count.
   Held.
-- `app.rs:942-946` — `write_log`'s second guard (`let Some(w) =
-  self.log.as_mut() else { return }`) is provably always-Some after the
-  `is_none` guard — only `record()` runs between, taking `&self` — so its
-  else-arm is unreachable. But 08-05 already walked this exact code and kept
+- `app.rs:942-946` — `write_log`'s second guard
+  (`let Some(w) = self.log.as_mut() else { return }`) is provably always-Some
+  after the `is_none` guard — only `record()` runs between, taking `&self` — so
+  its else-arm is unreachable. But 08-05 already walked this exact code and kept
   the first guard for the `record()` cost; collapsing to one guard is a
   one-dead-branch diff with no behavior change. Held.
 - `ui.rs:334` `pct_or_na` vs `:1109` `proc_pct` — same shape as finding 3
   (`{v:>3.0}%` formatter, different fallbacks), but the `n/a` vs `N/A` split is
   explicitly documented house style (:1107-1108) and the shared part is one
   `format!`. Held.
-- `amd.rs:871` / `intel.rs:840` — identical `const GAP` in the two
-  hardware-test modules, plus the two `backend()`/test constructor literals.
-  Test-only, and the amd/intel twin structure is the documented deliberate
-  parallel the 08-05 dropped list already cites. Held.
+- `amd.rs:871` / `intel.rs:840` — identical `const GAP` in the two hardware-test
+  modules, plus the two `backend()`/test constructor literals. Test-only, and
+  the amd/intel twin structure is the documented deliberate parallel the 08-05
+  dropped list already cites. Held.
 - `windows.rs:476-479` — `.then(|| …).flatten()` inside the `filter_map`
   closure; a guard would read marginally better, but the module is Windows-only
   and uncompiled on this host, so nothing here verifies the change. Held.
 - `intel.rs:141-143` — the `powers` Vec pre-collection is a borrow-split
-  workaround (`power_w` takes `&mut self` while the device map borrows
-  `&self`), not avoidable duplication. Held.
+  workaround (`power_w` takes `&mut self` while the device map borrows `&self`),
+  not avoidable duplication. Held.
 
 ### Coverage
 
 Read in full: `src/` (all files, incl. unit and hardware-test modules) plus
-`tests/smoke.rs` and `tests/tui.rs`. Verification: `cargo check --all-features
---locked` clean; `rg` confirms the cited call sites and no rustc-detectable
-dead code. Gaps, as in the earlier passes: nothing behind `#[cfg(windows)]`
-(PDH/DXGI) or `cfg(target_os = "macos")` (IOKit) is compiled on this Linux
-host; the amd/intel hardware-test modules skip without a GPU; the verification
-gate was not run (per this sweep's constraints; the orchestrator runs it).
+`tests/smoke.rs` and `tests/tui.rs`. Verification:
+`cargo check --all-features --locked` clean; `rg` confirms the cited call sites
+and no rustc-detectable dead code. Gaps, as in the earlier passes: nothing
+behind `#[cfg(windows)]` (PDH/DXGI) or `cfg(target_os = "macos")` (IOKit) is
+compiled on this Linux host; the amd/intel hardware-test modules skip without a
+GPU; the verification gate was not run (per this sweep's constraints; the
+orchestrator runs it).
 
 ## Codebase perf 2026-08-06
 
@@ -1370,43 +1199,21 @@ and re-sort (`app.rs:1060`, `:1124`, `:1128-1151`), the per-frame
 `driver_info()` uname (`ui.rs:41`, `amd.rs:182-184`, `intel.rs:210-212`,
 `linux.rs:819-821`, `:833-836`), the filter's per-row re-lowercasing
 (`app.rs:1111-1123`), NVML's per-poll `num_fans()` (`nvidia.rs:653-666`), and
-the Windows PDH per-poll instance re-parse (`windows.rs:432-484`, five calls
-per poll at `:249`/`:284-290`) — so they are not re-reported here; see the
-08-05 section above. The 08-05 Coverage exclusions and the "Decisions taken
-deliberately" section were re-read against the code and still hold (confirmed
-in Coverage below). Verdict: no significant new hot-path problems — one new
-small finding survives verification; the top wins remain 08-05 findings 1 and 2.
+the Windows PDH per-poll instance re-parse (`windows.rs:432-484`, five calls per
+poll at `:249`/`:284-290`) — so they are not re-reported here; see the 08-05
+section above. The 08-05 Coverage exclusions and the "Decisions taken
+deliberately" section were re-read against the code and still hold (confirmed in
+Coverage below). Verdict: no significant new hot-path problems — one new small
+finding survives verification; the top wins remain 08-05 findings 1 and 2.
 
 ### 1. Every process row re-resolves its user name per poll — a linear scan
 
 over the whole user list plus a fresh String, for a mapping that is
-session-constant
-
-**`src/app.rs:999-1002`** — the `refresh_processes` closure runs once per row
-per poll (`app.rs:990`, on the per-tick poll path: `app.rs:912` in
-`poll_inner`, `poll()` per tick from the run loop, `main.rs:462-465`) and, for
-every live row (the mock/stub pre-supply `user`, the Linux backends do not),
-calls `p.user_id()` then `self.users.get_user_by_id(uid)` then
-`u.name().to_string()`. `get_user_by_id` is a **linear scan over every user**
-in the installed sysinfo 0.39.6 (`src/common/user.rs:348-350`,
-`self.users.iter().find(...)`), and the `.to_string()` allocates per row. At
-500 rows × ~50 users that is ~25k comparisons plus 500 String allocations per
-poll — on the unconditional path, unlike finding 3's filter-gated cost — and
-the whole answer cannot change: `self.users` is built once at startup
-(`app.rs:692`, `Users::new_with_refreshed_list()`) and never refreshed
-anywhere in `src/`, and `with_user(UpdateKind::OnlyIfNotSet)` (`app.rs:981`)
-means `p.user_id()` is set once. This is not the settled
-command-line-not-cached decision: that covers the command join
-(`app.rs:1010-1014`), which is deliberately re-derived for exec-freshness; the
-user name has no freshness argument — a uid→name change mid-session is
-invisible either way, because `Users` is a startup snapshot. **Fix:** cache the
-resolved name per uid in a small `HashMap<u32, String>` on `App`, filled
-lazily inside the closure (or keyed on `(pid, start_time)` like the container
-cache, `app.rs:299-306` — the pid's uid is fixed for its identity). After the
-first row per uid, each row is one hash lookup of an already-owned string.
-Trades a few dozen bytes of memory (one name per uid) for the per-row scan and
-alloc. Small, but the cheapest remaining win in finding 3's class, and the
-only unconditional one.
+session-constant — **shipped 2026-08-06** (`2872099`): resolved names are now
+cached per uid (misses included, since `Users` is a startup snapshot and can
+never resolve later) in a `HashMap<sysinfo::Uid, Option<String>>` — keyed on
+`Uid` because Windows wraps a `Sid`, not a `u32`. After the first row per uid,
+each row is one hash lookup.
 
 ### Coverage
 
@@ -1423,9 +1230,9 @@ cells), and the per-poll backend reads — amd ~22 sysfs reads/device/poll, inte
 nvidia ~17 NVML round trips/device/poll + 3 process queries, windows PDH (the
 per-poll `keys` clone and `procs` map assembly at `windows.rs:299-335` were
 traced and sit inside finding 5's umbrella, not separate), apple IOKit
-re-enumeration, mock/stub/replay. The /proc walk cost itself remains the
-code's own measured 4.2 ms/588 pids, worker-threaded and paced by
-`MIN_WALK_INTERVAL` — settled by the recorded design.
+re-enumeration, mock/stub/replay. The /proc walk cost itself remains the code's
+own measured 4.2 ms/588 pids, worker-threaded and paced by `MIN_WALK_INTERVAL` —
+settled by the recorded design.
 
 Traced and deliberately excluded, re-confirmed against the code: the 08-05
 Coverage list (history front-drain, `draw_meter` spans, command-line-not-cached,
@@ -1435,12 +1242,12 @@ sweeps) and every "Decisions taken deliberately" entry still holds as written.
 Also cross-referenced rather than re-reported: the splash's per-frame
 `art_dims()` re-scan (`splash.rs:104-105`) — the 08-06 tidy pass flagged it as
 cleanup #4, and I agree with that framing: it runs for ~25 frames once at
-startup over a ~40-line constant string, which is not a hot path by this
-pass's criteria (no frequency to speak of, negligible size).
+startup over a ~40-line constant string, which is not a hot path by this pass's
+criteria (no frequency to speak of, negligible size).
 
 Not settled without profiling (unchanged from 08-05): NVML round-trip latency
 per call, actual PDH instance counts on a busy Windows box, per-frame render
-time, the walk's cost at the 10k-process pathological scale, and — for finding
-1 — the real per-box user count that `get_user_by_id` scans. All findings are
+time, the walk's cost at the 10k-process pathological scale, and — for finding 1
+— the real per-box user count that `get_user_by_id` scans. All findings are
 stated at their traceable frequencies; none claims a measured microsecond
 figure.

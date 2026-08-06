@@ -8,6 +8,27 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **The process table is now a view of indices into the raw rows, not a clone of
+  them.** Rebuilding it every poll copied every surviving row's ~6 owned strings
+  and re-sorted the owned rows; the filter and sort now run over indices and the
+  rows are dereferenced at draw time, removing the app layer's largest per-tick
+  allocation churn. Sort order, filter semantics and cursor behaviour are
+  unchanged.
+- **The header driver line is computed once per backend instead of every
+  frame.** `driver_info()` ran in every draw and again per tick with `--log`,
+  rebuilding the joined driver string (a fresh `uname()` syscall plus a few
+  allocations) or re-formatting the NVML version each time; the Linux sysfs
+  backends now cache it in a `OnceLock` and NVML pre-formats it at probe.
+- **Process user names are resolved once per uid instead of once per row per
+  poll.** `sysinfo::Users::get_user_by_id` is a linear scan over the whole user
+  list, and the list is a startup snapshot that never changes, so the scan plus
+  a fresh String per row was pure repetition; names are now cached per uid.
+- **The NVML fan count is read once at probe.** The count is a board property
+  fixed for the device's life; only the per-fan speeds were live data, but the
+  count was re-queried on every poll.
+
 ### Security
 
 - **A crafted `--replay` recording can no longer write terminal escape sequences
