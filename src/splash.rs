@@ -9,6 +9,9 @@ use ratatui::widgets::Paragraph;
 
 pub const ART: &str = include_str!("art.txt");
 
+/// The runtime `str::lines` walk `ART_BOUNDS` is the compile-time copy of —
+/// kept alive by the drift test that pins the two to each other.
+#[cfg(test)]
 fn art_dims() -> (u16, u16) {
     let rows = ART.lines().count() as u16;
     let cols = ART.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
@@ -102,7 +105,10 @@ pub fn render(
     theme: &UiTheme,
 ) {
     let splash = Splash::new(ART, path).with_anchor(anchor);
-    let (rows, cols) = art_dims();
+    // Same numbers `art_dims()` would walk for — compile-time constants now,
+    // so the ~25 splash frames don't each re-scan the art. Safe to cast:
+    // the const asserts above bound both to u8.
+    let (rows, cols) = (ART_BOUNDS.0 as u16, ART_BOUNDS.1 as u16);
     let layout = Layout::centered(area.width, area.height, rows, cols);
 
     let buf = frame.buffer_mut();
