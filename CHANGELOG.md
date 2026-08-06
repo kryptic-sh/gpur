@@ -40,6 +40,13 @@ and this project adheres to
   silently stopped recording. When both polls fail, the paths now exit non-zero
   with the poll error on stderr, keeping stdout clean; the empty record shape
   remains reserved for a successful poll that found no devices.
+- **A headless snapshot whose _final_ poll fails now fails too.** The guard
+  above covered only the all-polls-failed case; when the priming poll succeeded
+  and the final one failed, `gpus` still held the priming snapshots and the
+  stale, tick-old data printed with exit 0 — a script keying on the exit code
+  read it as fresh, and `--once --log` wrote zero records beside a full
+  snapshot. Any final-poll failure now exits non-zero with the error on stderr
+  and no snapshot on stdout.
 
 ## [0.13.0] - 2026-08-04
 

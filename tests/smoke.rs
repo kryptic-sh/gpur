@@ -422,6 +422,38 @@ fn once_exits_nonzero_when_every_poll_fails() {
     );
 }
 
+/// The all-polls-failed guard must not be the only one: when the priming
+/// poll succeeds and the final poll fails, `gpus` still holds the priming
+/// snapshots, and the old guard (empty `gpus` AND an error) let that stale
+/// snapshot print with exit 0 — a script keying on the exit code reads a
+/// snapshot a tick old as fresh. Any final-poll failure exits non-zero with
+/// the error on stderr instead.
+#[test]
+fn once_exits_nonzero_when_only_the_final_poll_fails() {
+    let sb = Sandbox::new("onceprimfail");
+    let out = sb
+        .cmd()
+        .args(["--mock", "1", "--once", "--tick-ms", "100"])
+        .env("GPUR_MOCK_FAIL", "2") // tick 1 = priming poll, tick 2 = final
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "priming data printed with exit 0: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "stale snapshot printed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("poll failed") && err.contains("simulated driver reset"),
+        "final-poll error not reported on stderr: {err}"
+    );
+}
+
 #[test]
 fn completions_flag_covers_all_shells() {
     // A shell-specific dispatch line, not just the binary name: every

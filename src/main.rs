@@ -232,13 +232,14 @@ fn snapshot(app: &mut App, json: bool, tick_ms: u64) -> Result<()> {
     std::thread::sleep(Duration::from_millis(tick_ms.clamp(100, 1000)));
     app.poll();
 
-    // Both polls failed: nothing was ever measured, and an empty snapshot
-    // must not read as a healthy GPU-less box to a script. The empty record
-    // shape stays reserved for a successful poll that found no devices,
-    // which leaves `poll_error` None.
-    if app.gpus.is_empty()
-        && let Some(e) = &app.poll_error
-    {
+    // Any failed poll invalidates the snapshot. `--once`'s promise is two
+    // polls so the deltas are real; when the final poll fails, what would
+    // print is the priming poll's data (or nothing) with exit 0 — a script
+    // cannot tell a stale snapshot from a fresh one, and `--once --log`
+    // would have written zero records beside a full snapshot. The empty
+    // record shape stays reserved for a successful poll that found no
+    // devices, which leaves `poll_error` None.
+    if let Some(e) = &app.poll_error {
         anyhow::bail!("{e}");
     }
 
