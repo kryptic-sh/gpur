@@ -257,10 +257,7 @@ fn snapshot(app: &mut App, json: bool, tick_ms: u64) -> Result<()> {
 
     // `n/a` rather than a fabricated 0: a metric the backend cannot read must
     // not print as a confident "idle"/"empty" in a scriptable output either.
-    let mib = |b: Option<u64>| {
-        b.map(|b| format!("{}MiB", b / 1024 / 1024))
-            .unwrap_or_else(|| "n/a".to_string())
-    };
+    let mib = |b: Option<u64>| b.map(ui::mib).unwrap_or_else(|| "n/a".to_string());
     for (i, g) in app.gpus.iter().enumerate() {
         // The pool the card actually spends, marked when those bytes are
         // system RAM — an iGPU printing `vram n/a/n/a` reported nothing at
@@ -301,10 +298,7 @@ fn snapshot(app: &mut App, json: bool, tick_ms: u64) -> Result<()> {
     // one column of a row disagreeing with its neighbours is worse than the
     // two blocks of this output disagreeing with each other. The memory
     // column follows the utilization column beside it.
-    let proc_mib = |b: Option<u64>| {
-        b.map(|b| format!("{}MiB", b / 1024 / 1024))
-            .unwrap_or_else(|| "-".to_string())
-    };
+    let proc_mib = |b: Option<u64>| b.map(ui::mib).unwrap_or_else(|| "-".to_string());
     for p in &app.all_procs {
         println!(
             "  pid {:>7}  gpu {}  {:>4}  {:>8}  {}",

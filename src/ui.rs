@@ -1111,11 +1111,15 @@ fn proc_pct(v: Option<f64>) -> String {
         .unwrap_or_else(|| "N/A".into())
 }
 
+/// Whole-MiB formatting shared by the TUI table and the `--once` printer.
+pub(crate) fn mib(b: u64) -> String {
+    format!("{}MiB", b / 1024 / 1024)
+}
+
 /// A whole-MiB cell in the process table, `N/A` when unreadable. `0MiB` is
 /// reserved for a figure that was read and came back empty.
 fn proc_mib(v: Option<u64>) -> String {
-    v.map(|b| format!("{}MiB", b / 1024 / 1024))
-        .unwrap_or_else(|| "N/A".into())
+    v.map(mib).unwrap_or_else(|| "N/A".into())
 }
 
 fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
