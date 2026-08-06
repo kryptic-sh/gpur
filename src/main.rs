@@ -212,6 +212,15 @@ fn install_signal_teardown() {
 #[cfg(not(any(unix, windows)))]
 fn install_signal_teardown() {}
 
+/// A string out of a `--replay` recording is untrusted, and `--once` prints
+/// it raw — the TUI strips control characters (ratatui's `set_stringn`
+/// filters `char::is_control`), so the headless printer mirrors that
+/// guarantee instead of handing a crafted recording a terminal to write
+/// escape sequences to.
+fn strip_controls(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// Headless one-shot: a second poll after a short gap makes the delta-based
 /// utilizations (Intel, per-process) real instead of zero. The priming poll
 /// is not logged — `--once --log` must write exactly one record.
@@ -248,7 +257,7 @@ fn snapshot(app: &mut App, json: bool, tick_ms: u64) -> Result<()> {
         let mem = g.mem_primary();
         let mut line = format!(
             "{i}  {}  util {}  mem {}/{}{}",
-            g.name,
+            strip_controls(&g.name),
             g.utilization_pct
                 .map(|u| format!("{u:>3.0}%"))
                 .unwrap_or_else(|| "n/a".to_string()),
@@ -294,7 +303,7 @@ fn snapshot(app: &mut App, json: bool, tick_ms: u64) -> Result<()> {
                 .map(|u| format!("{u:.0}%"))
                 .unwrap_or_else(|| "-".into()),
             proc_mib(p.gpu_mem_bytes),
-            p.command,
+            strip_controls(&p.command),
         );
     }
     Ok(())

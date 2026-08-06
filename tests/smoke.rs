@@ -92,6 +92,41 @@ fn replay_round_trips_a_log_recording() {
     );
 }
 
+/// A crafted recording must not smuggle terminal escape sequences through
+/// `--once` into the caller's terminal. The TUI strips control characters
+/// (ratatui's `set_stringn` filters `char::is_control`); the headless
+/// printer mirrors that guarantee — the recording is the untrusted input
+/// and `--once` is a raw-printing sink (the audit's end-to-end repro:
+/// an OSC 2 window-title sequence inside a GPU name and an OSC 0 sequence
+/// inside a command).
+#[test]
+fn once_strips_control_characters_from_recorded_strings() {
+    let sb = Sandbox::new("esci");
+    let log = sb.path().join("rec.jsonl");
+    std::fs::write(
+        &log,
+        concat!(
+            r#"{"gpus":[{"name":"evil\u001b]2;HACKED\u001b\\ GPU"}],"#,
+            r#""processes":[{"pid":1,"gpu_index":0,"command":"run\u001b]0;PWNED\u001b\\me.sh"}]}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    let out = sb
+        .cmd()
+        .args(["--once", "--tick-ms", "100", "--replay"])
+        .arg(&log)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        !out.stdout.contains(&0x1b),
+        "escape bytes reached the terminal from a crafted recording: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// A metric the backend could not read is `null` in the record and `n/a` in
 /// the plain line — never a 0 that a consumer reads as a real idle sample.
 #[test]

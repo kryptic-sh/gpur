@@ -8,6 +8,16 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Security
+
+- **A crafted `--replay` recording can no longer write terminal escape sequences
+  through `--once`.** The recording is the untrusted input and the headless
+  printer emitted recorded GPU names and command lines raw, so a sequence like
+  an OSC 2 window-title or OSC 52 clipboard write reached the terminal — the TUI
+  stripped it (ratatui filters control characters), the one-shot path did not.
+  `--once` now drops control characters from the strings it prints, mirroring
+  the TUI's guarantee; `--json` was never exposed (serde escapes them).
+
 ### Fixed
 
 - **`--once`/`--json` no longer exit 0 with an empty snapshot when every poll
