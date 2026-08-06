@@ -353,8 +353,8 @@ impl GpuBackend for MergedNvidiaBackend {
 #[cfg(target_os = "linux")]
 mod nouveau {
     use crate::backend::linux::{
-        self, card_name, cards_with_driver, driver_line_for, fan_pct, hwmon_u64, pci_device_id,
-        pcie_current_link, pcie_max_link, pdev_of,
+        self, card_name, cards_with_driver, driver_line_for, fan_pct, hwmon_power_limit_w,
+        hwmon_temp_c, hwmon_u64, pci_device_id, pcie_current_link, pcie_max_link, pdev_of,
     };
     use crate::backend::{GpuBackend, GpuSnapshot};
     use anyhow::Result;
@@ -458,11 +458,9 @@ mod nouveau {
             // ones are not enumerated here at all.
             integrated: false,
             // nouveau_hwmon: millidegrees, microwatts, pwm 0..pwm1_max.
-            temperature_c: hwmon_u64(h, "temp1_input").map(|v| v as f64 / 1000.0),
+            temperature_c: hwmon_temp_c(h),
             power_w: hwmon_u64(h, "power1_input").map(|v| v as f64 / 1e6),
-            power_limit_w: hwmon_u64(h, "power1_max")
-                .filter(|v| *v > 0)
-                .map(|v| v as f64 / 1e6),
+            power_limit_w: hwmon_power_limit_w(h),
             fan_pct: fan_pct(h),
             fan_rpm: hwmon_u64(h, "fan1_input"),
             volt_mv: hwmon_u64(h, "in0_input"),

@@ -679,6 +679,22 @@ pub fn fan_pct(hwmon: Option<&Path>) -> Option<f64> {
     Some(pwm as f64 / max as f64 * 100.0)
 }
 
+/// hwmon temperature in °C from `temp1_input` — the hwmon ABI's
+/// millidegrees. amdgpu, i915/xe and nouveau all publish it the same way, so
+/// one reader serves them. None when the card exposes no hwmon temperature.
+pub fn hwmon_temp_c(hwmon: Option<&Path>) -> Option<f64> {
+    hwmon_u64(hwmon, "temp1_input").map(|v| v as f64 / 1000.0)
+}
+
+/// hwmon power-limit in watts from `power1_max` — the hwmon ABI's microwatts,
+/// with a published 0 filtered the way the amdgpu readers filter
+/// `power1_cap`. i915/xe and nouveau publish their cap the same way.
+pub fn hwmon_power_limit_w(hwmon: Option<&Path>) -> Option<f64> {
+    hwmon_u64(hwmon, "power1_max")
+        .filter(|v| *v > 0)
+        .map(|v| v as f64 / 1e6)
+}
+
 pub fn read_trim(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }

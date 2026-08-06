@@ -23,7 +23,7 @@ pub(crate) fn claimed_ids(drm: &str) -> Vec<String> {
 mod linux_impl {
     use crate::backend::linux::{
         self, ClientSample, FdClient, ProcSnapshot, SweepCursor, SweepDevice, card_name,
-        cards_with_driver, fan_pct, hwmon_u64, pdev_of, read_trim, read_u64,
+        cards_with_driver, fan_pct, hwmon_temp_c, hwmon_u64, pdev_of, read_trim, read_u64,
     };
     use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, clamp_pct};
     use anyhow::Result;
@@ -340,7 +340,7 @@ mod linux_impl {
 
     fn sample(d: &AmdDevice, media: Option<MediaUtil>, pcie_bw: Option<(u64, u64)>) -> GpuSnapshot {
         let h = d.hwmon.as_deref();
-        let temperature_c = hwmon_u64(h, "temp1_input").map(|v| v as f64 / 1000.0);
+        let temperature_c = hwmon_temp_c(h);
         let power_w = hwmon_u64(h, "power1_average")
             .or_else(|| hwmon_u64(h, "power1_input"))
             .map(|v| v as f64 / 1e6);

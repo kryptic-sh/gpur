@@ -27,7 +27,7 @@ pub(crate) fn claimed_ids(drm: &str) -> Vec<String> {
 mod linux_impl {
     use crate::backend::linux::{
         self, ClientSample, FdClient, ProcSnapshot, SweepCursor, SweepDevice, card_name,
-        cards_with_driver, hwmon_u64, pdev_of, read_u64,
+        cards_with_driver, hwmon_power_limit_w, hwmon_temp_c, pdev_of, read_u64,
     };
     use crate::backend::{GpuBackend, GpuProcess, GpuSnapshot, clamp_pct};
     use anyhow::Result;
@@ -181,11 +181,9 @@ mod linux_impl {
                             .and_then(|_| attributed_sum(attributed, s.local_mem.get(&i).copied())),
                         // None, never 0: mainline i915 publishes no total.
                         vram_total_bytes: d.vram_total,
-                        temperature_c: hwmon_u64(h, "temp1_input").map(|v| v as f64 / 1000.0),
+                        temperature_c: hwmon_temp_c(h),
                         power_w,
-                        power_limit_w: hwmon_u64(h, "power1_max")
-                            .filter(|v| *v > 0)
-                            .map(|v| v as f64 / 1e6),
+                        power_limit_w: hwmon_power_limit_w(h),
                         fan_pct: None,
                         clock_mhz: gt_cur_freq_mhz(d),
                         mem_clock_mhz: None,
@@ -825,6 +823,7 @@ drm-resident-gtt:\t1024 KiB
     mod hardware {
         use super::*;
         use crate::backend::ProcKind;
+        use crate::backend::linux::hwmon_u64;
         use std::fs;
         use std::sync::{Mutex, MutexGuard};
         use std::time::{Duration, Instant};
