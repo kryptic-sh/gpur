@@ -580,8 +580,10 @@ pub struct App {
     pub started: Instant,
     pub splash_path: Vec<(u8, u8, char)>,
     pub splash_skipped: bool,
-    /// Filtered + sorted view of the process rows.
-    pub procs: Vec<ProcRow>,
+    /// Filtered + sorted view of the process rows: indices into `all_procs`.
+    /// Building and re-sorting this view every poll touches no row Strings —
+    /// the rows themselves live (and are refreshed) only in `all_procs`.
+    pub procs: Vec<usize>,
     /// GPUs folded to a one-line summary (digit keys toggle).
     folded: HashSet<DeviceKey>,
     /// First visible GPU card when the card list overflows (clamped in draw).
@@ -1137,13 +1139,20 @@ impl App {
     /// Re-apply filter + sort to the raw rows, keeping the cursor on the
     /// same (pid, gpu) when it survives the rebuild.
     pub fn rebuild_proc_view(&mut self) {
-        let cursor_key = self.procs.get(self.proc_sel).map(|p| (p.pid, p.gpu_index));
+        let cursor_key = self
+            .procs
+            .get(self.proc_sel)
+            .and_then(|&i| self.all_procs.get(i))
+            .map(|p| (p.pid, p.gpu_index));
 
         let needle = self.filter.to_lowercase();
-        let mut rows: Vec<ProcRow> = self
+        // The view holds indices, not cloned rows: the filter reads through
+        // `all_procs` and the surviving row's Strings are never copied.
+        let mut rows: Vec<usize> = self
             .all_procs
             .iter()
-            .filter(|p| {
+            .enumerate()
+            .filter(|(_, p)| {
                 needle.is_empty()
                     || p.command.to_lowercase().contains(&needle)
                     || p.user.to_lowercase().contains(&needle)
@@ -1152,11 +1161,13 @@ impl App {
                         .as_deref()
                         .is_some_and(|c| c.to_lowercase().contains(&needle))
             })
-            .cloned()
+            .map(|(i, _)| i)
             .collect();
 
         let by = self.sort_by;
-        rows.sort_by(|a, b| {
+        rows.sort_by(|&a, &b| {
+            let a = &self.all_procs[a];
+            let b = &self.all_procs[b];
             // Returned ahead of the direction flip below, so the rule holds
             // in BOTH directions for every sortable column.
             if let Some(ord) = unmeasured_last(a.is_unmeasured(by), b.is_unmeasured(by)) {
@@ -1183,7 +1194,12 @@ impl App {
         self.procs = rows;
 
         self.proc_sel = cursor_key
-            .and_then(|key| self.procs.iter().position(|p| (p.pid, p.gpu_index) == key))
+            .and_then(|key| {
+                self.procs.iter().position(|&i| {
+                    let p = &self.all_procs[i];
+                    (p.pid, p.gpu_index) == key
+                })
+            })
             .unwrap_or_else(|| self.proc_sel.min(self.procs.len().saturating_sub(1)));
     }
 
@@ -1226,9 +1242,10 @@ impl App {
             self.set_status("kill: focus the process pane first (p)".into());
             return;
         }
-        let Some(row) = self.procs.get(self.proc_sel) else {
+        let Some(&idx) = self.procs.get(self.proc_sel) else {
             return;
         };
+        let row = &self.all_procs[idx];
         let pid = row.pid;
         let command: String = row.command.chars().take(40).collect();
         let Some(start_time) = self.sys.process(Pid::from_u32(pid)).map(|p| p.start_time()) else {
@@ -2349,7 +2366,10 @@ mod tests {
         app.sort_desc = true;
         app.rebuild_proc_view();
         assert_eq!(
-            app.procs.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            app.procs
+                .iter()
+                .map(|&i| app.all_procs[i].pid)
+                .collect::<Vec<_>>(),
             vec![3, 1, 2],
             "{sort_by:?} descending did not sink the unmeasured row"
         );
@@ -2357,7 +2377,10 @@ mod tests {
         app.sort_desc = false;
         app.rebuild_proc_view();
         assert_eq!(
-            app.procs.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            app.procs
+                .iter()
+                .map(|&i| app.all_procs[i].pid)
+                .collect::<Vec<_>>(),
             vec![1, 3, 2],
             "{sort_by:?} ascending sorted the unmeasured row as if it were 0"
         );
@@ -2393,6 +2416,76 @@ mod tests {
         assert_unknown_sinks(SortBy::HostMem, |r, v| {
             r.host_mem_bytes = v.map(|v| v as u64 * 1024 * 1024)
         });
+    }
+
+    /// Perf finding 1: `procs` is a view — indices into `all_procs`, not
+    /// cloned rows. The indices must point at exactly the rows the filter and
+    /// sort select, in sorted order, even when that order differs from
+    /// `all_procs`' own; a naive identity mapping (`procs[i] == i`) must fail
+    /// this test, as must any index that lands on the wrong row.
+    #[test]
+    fn procs_view_maps_to_the_filtered_and_sorted_rows() {
+        let mut app = app_with(Box::new(LocalBackend));
+        let row = |pid: u32, command: &str, mem: Option<u64>| ProcRow {
+            pid,
+            gpu_index: 0,
+            kind: ProcKind::Compute,
+            gpu_util_pct: Some(0.0),
+            gpu_mem_bytes: mem,
+            user: "me".into(),
+            cpu_pct: Some(0.0),
+            host_mem_bytes: Some(0),
+            command: command.into(),
+            container: None,
+        };
+        // all_procs order (index -> pid): 0:1, 1:2, 2:3, 3:4.
+        app.all_procs = vec![
+            row(1, "alpha", Some(10 << 20)),
+            row(2, "beta", None), // filtered out below
+            row(3, "alpha", Some(90 << 20)),
+            row(4, "gamma", Some(50 << 20)), // filtered out below
+        ];
+        app.filter = "alpha".into();
+        app.sort_by = SortBy::GpuMem;
+        app.sort_desc = true;
+        app.rebuild_proc_view();
+
+        // Survivors are all_procs indices 0 and 2, ordered by gpu mem
+        // descending (90 > 10), so the view is [2, 0].
+        assert_eq!(
+            app.procs
+                .iter()
+                .map(|&i| app.all_procs[i].pid)
+                .collect::<Vec<_>>(),
+            vec![3, 1],
+            "view indices do not map to the expected filtered+sorted rows"
+        );
+        assert_eq!(app.procs, vec![2, 0]);
+
+        // Re-sorting the same view still lands on the right rows.
+        app.sort_desc = false;
+        app.rebuild_proc_view();
+        assert_eq!(
+            app.procs
+                .iter()
+                .map(|&i| app.all_procs[i].pid)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "ascending rebuild left the view pointing at the wrong rows"
+        );
+
+        // The cursor follows its (pid, gpu) across a rebuild, not a position.
+        app.proc_sel = app
+            .procs
+            .iter()
+            .position(|&i| app.all_procs[i].pid == 3)
+            .unwrap();
+        app.sort_desc = true;
+        app.rebuild_proc_view();
+        assert_eq!(
+            app.all_procs[app.procs[app.proc_sel]].pid, 3,
+            "rebuild lost the cursor row"
+        );
     }
 
     /// Backlog 6: the history ring has to carry the same distinction the

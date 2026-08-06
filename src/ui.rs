@@ -1196,7 +1196,10 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
     };
     use crate::app::SortBy;
     // CONTAINER column only when any visible row is containerized.
-    let show_container = app.procs.iter().any(|p| p.container.is_some());
+    let show_container = app
+        .procs
+        .iter()
+        .any(|&i| app.all_procs[i].container.is_some());
     let mut header_cells = vec![
         mark("PID", app.sort_by == SortBy::Pid),
         "USER".into(),
@@ -1218,7 +1221,8 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &mut App) {
     let rows = app.procs[app.proc_scroll..app.proc_scroll + visible]
         .iter()
         .enumerate()
-        .map(|(vi, p)| {
+        .map(|(vi, &i)| {
+            let p = &app.all_procs[i];
             let row_style = if app.proc_scroll + vi == proc_sel {
                 selection
             } else {
@@ -1301,7 +1305,8 @@ mod tests {
     }
 
     /// A backend the process-table test never polls: `draw_processes` reads
-    /// `app.procs`, which the test populates directly.
+    /// `app.procs` (a view of indices into `app.all_procs`), which the test
+    /// populates directly.
     struct NoBackend;
 
     impl crate::backend::GpuBackend for NoBackend {
@@ -1330,8 +1335,8 @@ mod tests {
                 log: None,
             },
         );
-        app.all_procs = rows.clone();
-        app.procs = rows;
+        app.all_procs = rows;
+        app.procs = (0..app.all_procs.len()).collect();
         let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
         term.draw(|f| draw_processes(f, f.area(), &mut app))
             .unwrap();
