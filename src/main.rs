@@ -70,6 +70,14 @@ fn main() -> Result<()> {
             )
         })?,
     };
+    // A pipe, a cron job or a CI runner has no terminal to put into raw
+    // mode; ratatui::init() would unwrap the error into a panic backtrace.
+    // The check runs before `open_log` and the first `app.poll()`: a session
+    // that is about to bail must not create the `--log` file or write a
+    // spurious record for a run that never happened.
+    if !headless && !stdout().is_terminal() {
+        anyhow::bail!("stdout is not a terminal — use --once or --json for non-interactive output");
+    }
     let log = match &cli.log {
         Some(path) => Some(std::io::BufWriter::new(open_log(path)?)),
         None => None,
@@ -99,11 +107,6 @@ fn main() -> Result<()> {
     }
     app.poll();
 
-    // A pipe, a cron job or a CI runner has no terminal to put into raw
-    // mode; ratatui::init() would unwrap the error into a panic backtrace.
-    if !stdout().is_terminal() {
-        anyhow::bail!("stdout is not a terminal — use --once or --json for non-interactive output");
-    }
     // ratatui::init installs a panic hook restoring raw mode + alt screen;
     // it knows nothing about mouse capture or the kitty protocol, so chain
     // our teardown in front of it — a panic must not leave the shell with

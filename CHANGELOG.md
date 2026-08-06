@@ -26,6 +26,13 @@ and this project adheres to
 
 ### Fixed
 
+- **A TUI invocation with redirected stdout fails before it touches anything.**
+  `app.poll()` (and `open_log` before it) ran ahead of the `is_terminal` guard,
+  so `gpur --log rec.jsonl > out.txt` created the log file, wrote one record for
+  a session that then bailed, and on Linux waited out the first-walk delay
+  first. The terminal check now runs before both: no file is created, no record
+  is written, and the failure is immediate.
+
 - **`--once`/`--json` no longer exit 0 with an empty snapshot when every poll
   fails.** A driver reset after a successful probe left the headless paths
   printing `{"gpus":[],"processes":[]}` (or nothing at all) with exit 0 —

@@ -127,6 +127,33 @@ fn once_strips_control_characters_from_recorded_strings() {
     );
 }
 
+/// A TUI invocation with redirected stdout must fail before it touches
+/// anything: `--log` must not create its file, no record may land for a
+/// session that never ran, and the failure must be fast (the review finding
+/// — `app.poll()` ran before the `is_terminal` guard, so one spurious record
+/// was written and the bail was delayed by the first-walk wait).
+#[test]
+fn redirected_stdout_fails_before_creating_the_log() {
+    let sb = Sandbox::new("ttycheck");
+    let log = sb.path().join("never.jsonl");
+    let out = sb
+        .cmd()
+        .args(["--mock", "--tick-ms", "100", "--log"])
+        .arg(&log)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "TUI path accepted redirected stdout");
+    assert!(
+        !log.exists(),
+        "--log file created for a session that never ran"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not a terminal"),
+        "unexpected error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A metric the backend could not read is `null` in the record and `n/a` in
 /// the plain line — never a 0 that a consumer reads as a real idle sample.
 #[test]
