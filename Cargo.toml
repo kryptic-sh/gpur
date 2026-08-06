@@ -1,6 +1,6 @@
 [package]
 name = "gpur"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2024"
 description = "btop-style GPU monitor TUI — NVIDIA, AMD, Intel, Apple Silicon; Linux, macOS, Windows"
 license = "MIT"

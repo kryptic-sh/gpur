@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-08-06
+
 ### Changed
 
 - **The process table is now a view of indices into the raw rows, not a clone of
@@ -954,7 +956,8 @@ whose "Settled by review" section records what was checked and still holds.
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/kryptic-sh/gpur/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/kryptic-sh/gpur/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.12.0
 [0.11.1]: https://github.com/kryptic-sh/gpur/releases/tag/v0.11.1
