@@ -8,6 +8,15 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-08-12
+
+### Fixed
+
+- **The AUR package is current again.** `gpur-bin` had been stuck at 0.11.0
+  since the AUR's multi-day maintenance outage failed the 0.12.0, 0.13.0 and
+  0.13.1 publish jobs; the 0.13.1 job was re-run once the outage ended, and this
+  release's own publish job keeps the package at the newest version.
+
 ## [0.13.1] - 2026-08-06
 
 ### Changed
@@ -956,7 +965,8 @@ whose "Settled by review" section records what was checked and still holds.
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.13.2...HEAD
+[0.13.2]: https://github.com/kryptic-sh/gpur/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/kryptic-sh/gpur/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/kryptic-sh/gpur/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/kryptic-sh/gpur/releases/tag/v0.12.0
