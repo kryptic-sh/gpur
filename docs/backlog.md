@@ -22,30 +22,6 @@ the last holdout, because a waveform has no glyph for absent — in 0.11.1.
 
 ---
 
-## Pending: the AUR publish (0.12.0 and 0.13.0)
-
-**Everything else in both releases landed.** The GitHub release for 0.12.0 and
-0.13.0 each carries all 25 assets, crates.io reports 0.13.0 as its max version,
-and the Homebrew, Scoop and Alpine jobs succeeded on both tags. Only
-`Publish AUR (gpur-bin)` failed on each — 0.12.0's run `30735988517` and
-0.13.0's run `30873677163`, both at
-`git clone ssh://aur@aur.archlinux.org/gpur-bin.git`:
-
-> The AUR is down due to maintenance. We will be back soon.
-
-Not a configuration fault. The same `git ls-remote` fails identically from a
-developer machine with a working AUR account, while `ssh aur@aur.archlinux.org`
-answers its greeter normally — the interactive shell is up and git-upload-pack
-is not. Re-run attempts at the time all hit the same banner, and re-checks on
-2026-08-03 and 2026-08-04 (the 0.13.0 tag run included) got the same one — so
-this is an outage measured in days, not minutes.
-
-**To finish:** once `git ls-remote ssh://aur@aur.archlinux.org/gpur-bin.git`
-succeeds, `gh run rerun 30873677163 --failed` — the 0.13.0 run. Its job is
-idempotent — it exits early with "nothing to push" if the PKGBUILD is already
-current — and pushing the newest version supersedes the 0.12.0 state, which
-never needs to land separately. Delete this section once it is green.
-
 ## 1. Windows vendor exclusion is per vendor, not per adapter
 
 **Severity: low.** `src/backend/mod.rs` `compose_with_generic`,
