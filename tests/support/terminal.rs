@@ -115,6 +115,7 @@ impl Tui {
         // reads as "colour is fine" to `detect_color_mode`, and the explicit
         // `("NO_COLOR", Some("1"))` override in the no_color test replaces it.
         cmd.env("NO_COLOR", "");
+        cmd.env_remove("WT_SESSION");
         cmd.env("XDG_CONFIG_HOME", &home.0);
         cmd.env("XDG_CACHE_HOME", &home.0);
         cmd.env("XDG_DATA_HOME", &home.0);

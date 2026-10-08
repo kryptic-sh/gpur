@@ -17,7 +17,7 @@ pub enum ColorMode {
     Mono,
 }
 
-/// Honor NO_COLOR (https://no-color.org/), then sniff COLORTERM/TERM.
+/// Honor NO_COLOR, then explicit color hints and Windows Terminal detection.
 pub fn detect_color_mode() -> ColorMode {
     if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
         return ColorMode::Mono;
@@ -32,6 +32,9 @@ pub fn detect_color_mode() -> ColorMode {
     }
     if term.contains("256color") {
         return ColorMode::Ansi256;
+    }
+    if term.is_empty() && std::env::var_os("WT_SESSION").is_some_and(|v| !v.is_empty()) {
+        return ColorMode::Truecolor;
     }
     ColorMode::Ansi16
 }

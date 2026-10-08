@@ -387,7 +387,68 @@ fn without_colorterm_the_app_quantizes_to_the_256_colour_palette() {
     }
 }
 
-#[cfg(windows)]
+#[test]
+fn windows_terminal_colour_detection_preserves_explicit_preferences() {
+    use vt100::Color::{Default, Idx, Rgb};
+
+    let wt = Some("gpur-test-windows-terminal");
+    for (term, colorterm, no_color, session, expected) in [
+        (None, None, None, wt, Rgb(203, 166, 247)),
+        (Some(""), None, None, wt, Rgb(203, 166, 247)),
+        (None, None, Some(""), wt, Rgb(203, 166, 247)),
+        (None, None, Some("1"), wt, Default),
+        (None, None, Some("0"), wt, Default),
+        (Some("dumb"), Some("truecolor"), None, wt, Default),
+        (None, None, None, None, Idx(15)),
+        (None, None, None, Some(""), Idx(15)),
+        (Some("xterm"), None, None, wt, Idx(15)),
+        (Some("xterm-256color"), None, None, wt, Idx(183)),
+        (
+            Some("xterm-256color"),
+            Some("truecolor"),
+            None,
+            wt,
+            Rgb(203, 166, 247),
+        ),
+        (Some("xterm"), Some("24bit"), None, wt, Rgb(203, 166, 247)),
+    ] {
+        let env = [
+            ("TERM", term),
+            ("COLORTERM", colorterm),
+            ("NO_COLOR", no_color),
+            ("WT_SESSION", session),
+        ];
+        let mut t = Tui::spawn_with_env(&[], &env);
+        let pid = t.child.process_id().expect("child pid");
+        t.wait_for("selected process row", |s| mono_process_table_ready(s, pid));
+        let card = t
+            .parser
+            .screen()
+            .cell(row_y(&t, "0·Mock GPU 0"), 0)
+            .unwrap();
+        let actual = card.fgcolor();
+        // ConPTY can expand indexed colours into their displayed RGB values.
+        let matches = actual == expected
+            || matches!(
+                (expected, actual),
+                (Idx(15), Rgb(255, 255, 255)) | (Idx(183), Rgb(215, 175, 255))
+            );
+        assert!(
+            matches,
+            "selected card accent: expected {expected:?}, got {actual:?}; {env:?}"
+        );
+        if expected == Default {
+            assert_mono_screen(t.parser.screen());
+        }
+        t.send("q");
+        assert!(t.wait_exit().success());
+        #[cfg(unix)]
+        if expected == Default {
+            assert!(colour_sgr(&String::from_utf8_lossy(&t.raw)).is_empty());
+        }
+    }
+}
+
 fn assert_mono_screen(screen: &vt100::Screen) {
     let mut reversed = false;
     for y in 0..ROWS {
