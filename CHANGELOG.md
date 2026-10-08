@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.4] - 2026-10-09
+
 ### Fixed
 
 - **Windows Terminal keeps the full-color theme without Unix environment
@@ -997,7 +999,8 @@ whose "Settled by review" section records what was checked and still holds.
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.13.3...HEAD
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.13.4...HEAD
+[0.13.4]: https://github.com/kryptic-sh/gpur/compare/v0.13.3...v0.13.4
 [0.13.3]: https://github.com/kryptic-sh/gpur/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/kryptic-sh/gpur/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/kryptic-sh/gpur/compare/v0.13.0...v0.13.1
