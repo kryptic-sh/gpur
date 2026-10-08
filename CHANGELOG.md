@@ -8,6 +8,29 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows TUI startup no longer fails on kitty keyboard setup.** Windows uses
+  Crossterm's native keyboard events instead of its unsupported kitty
+  enhancement commands.
+- **Windows GPU utilization is grouped by physical engine, not engine type.**
+  PDH process samples are summed within each engine before selecting the busiest
+  engine for adapter, process, encode and decode utilization. Independent
+  engines of the same type no longer inflate the readings.
+- **PDH operation failures surface as polling errors.** Valid and newly
+  collected samples remain usable when other samples are invalid; wildcard
+  buffer bounds and growth retries are checked instead of silently dropping
+  failed reads.
+
+### Added
+
+- Windows ConPTY integration coverage for dashboard rendering, keyboard and
+  mouse input, resizing, persisted state and alternate-screen/cursor
+  restoration. Windows Server 2022 and 2025 CI jobs require the terminal tests
+  to be present and enforce bounded test execution.
+- Deterministic PDH engine/status/buffer regressions and an opt-in live Windows
+  GPU identity and memory test.
+
 ## [0.13.2] - 2026-08-12
 
 ### Fixed

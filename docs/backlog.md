@@ -22,6 +22,19 @@ the last holdout, because a waveform has no glyph for absent — in 0.11.1.
 
 ---
 
+## Windows validation follow-up — 2026-10-08
+
+- `src/main.rs::restore_extras` and the Windows console-control handler still
+  need a same-console observer test for native input-mode restoration and
+  console-control events. ConPTY `q` coverage checks alternate-screen/cursor
+  restoration, not those native modes or external control events.
+- `src/backend/windows/native.rs::probe` still returns `Option`, so discovery
+  failures cannot expose diagnostic details through the current backend API.
+- Live GPU validation covers this machine's adapters and memory readings, not
+  vendor-wide driver compatibility or utilization accuracy under a controlled
+  GPU workload. Hosted CI exercises deterministic PDH tests without requiring
+  GPU hardware. Miri covers buffer decoding, not the native PDH FFI calls.
+
 ## 1. Windows vendor exclusion is per vendor, not per adapter
 
 **Severity: low.** `src/backend/mod.rs` `compose_with_generic`,
@@ -865,47 +878,6 @@ recorded** (see the 08-05 section above): `poll()` → `poll_inner(true)`
 
 Two new findings, both low, neither a regression of anything fixed since the
 last pass. Everything else traced held.
-
-### Finding 1 — Windows: the GPU% gauge sums per-process and adapter-aggregate
-
-PDH engine instances, so it reads roughly double the real utilization
-
-**Severity: low (Windows only, one gauge, clamped at 100).**
-`src/backend/windows.rs:253` —
-`*engine.entry((luid.clone(), eng.clone())).or_default() += v;` sums **every**
-`GPU Engine` instance that parses to a `(luid, engtype)` pair, pid-scoped and
-adapter-scoped alike. The WDDM counter publishes both forms per engine —
-`pid_<pid>_luid_…_engtype_<type>` for each process and a
-`luid_…_phys_…_eng_…_engtype_<type>` aggregate — and the aggregate already
-contains everything the pid instances sum to. `util_by_luid` then takes the max
-over engines of the inflated sum (`:274-275`, clamped at `:355`), so a GPU
-genuinely 40% busy renders ~80% and anything past ~50% renders a confident 100%.
-The per-process column is unaffected — it is built only from pid instances
-(`:254-260`).
-
-The comment at `:243-244` says the map is "summed % **across processes**"; the
-implementation sums all instances instead, so intent and code disagree even
-before the counter shape is consulted.
-
-```
-Repro: on a Windows box, one engine whose adapter-aggregate instance reads 50%
-       beside pid instances summing to 50%:
-       engine[(luid, "3d")] = 50 + 50 = 100  ->  adapter gauge shows 100%
-Expect: the adapter gauge reads ~50% (the aggregate, or the pid sum — not both)
-Actual: the sum of both, ~100% (clamped)
-```
-
-Unverifiable on this host — the `#[cfg(windows)]` module is not compiled here,
-and the claim rests on the instance shape of `\GPU Engine(*)`, which the unit
-tests never exercise (their fixtures are pid-scoped only, `windows.rs:491`). A
-Windows box running the binary against a known load settles it in minutes.
-**Fix, if confirmed:** skip instances without a `pid_` prefix in the `engine`
-loop (the aggregate then comes out of the pid sum, matching the comment), or
-take the adapter gauge from the non-pid instances alone. **Deferred 2026-08-06:
-** the fix lives on the `#[cfg(windows)]` poll path, which is neither compiled
-nor executable on a Linux host — shipping it would be unverified platform code
-that CI's other runners would have to catch. Needs a Windows box running the
-binary against a known load to confirm the premise and validate the change.
 
 ### Finding 2 — headless `--once`/`--json` silently report the priming poll when
 
