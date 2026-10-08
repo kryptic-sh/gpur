@@ -8,6 +8,13 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows Terminal keeps the full-color theme without Unix environment
+  hints.** A nonempty `WT_SESSION` selects truecolor when `TERM` is absent or
+  empty, avoiding the ANSI16 fallback that collapsed pastel accents to white.
+  Explicit `NO_COLOR`, `TERM=dumb`, and terminal color hints retain precedence.
+
 ## [0.13.3] - 2026-10-08
 
 ### Fixed

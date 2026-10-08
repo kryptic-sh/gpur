@@ -24,6 +24,11 @@ the last holdout, because a waveform has no glyph for absent — in 0.11.1.
 
 ## Windows validation follow-up — 2026-10-08
 
+- `src/theme.rs::rgb_to_16` collapses many pastel theme colors to the same
+  ANSI16 index. Windows Terminal now avoids that fallback when `WT_SESSION`
+  identifies it without Unix hints; improving genuine ANSI16 palettes and
+  detecting other truecolor terminals remains separate work.
+
 - The Windows console-control handler in `src/main.rs` still needs an external
   console-control event test. The same-console observer now checks screen and
   native input-mode restoration on normal `q` exit, not external control events.
