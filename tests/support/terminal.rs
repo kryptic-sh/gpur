@@ -6,6 +6,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+#[path = "console.rs"]
+mod console;
+#[cfg(windows)]
+pub(super) use console::observe_console;
+
 /// A throwaway XDG root for one test. gpur resolves its config/cache/data
 /// through hjkl-config, which honours `XDG_*_HOME` on every platform, so
 /// redirecting the three vars keeps the suite off the developer's real
@@ -85,8 +91,22 @@ impl Tui {
                 })
                 .unwrap()
         });
-        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_gpur"));
-        cmd.args(args);
+        #[cfg(windows)]
+        let observing = env
+            .iter()
+            .any(|(key, value)| *key == "GPUR_TEST_CONSOLE_OBSERVER" && *value == Some("1"));
+        #[cfg(not(windows))]
+        let observing = false;
+        let mut cmd = if observing {
+            let mut cmd = CommandBuilder::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "quit_restores_terminal_modes", "--nocapture"]);
+            cmd.env("GPUR_TEST_CONSOLE_HOME", &home.0);
+            cmd
+        } else {
+            let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_gpur"));
+            cmd.args(args);
+            cmd
+        };
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         // A parent shell's NO_COLOR must not leak into the harness: the colour
@@ -166,6 +186,20 @@ impl Tui {
             raw: Vec::new(),
             home,
             master: Some(pty.master),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn wait_console_observation(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.home.0.join("console-active").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "console entry was not observed; screen:\n{}; status: {:?}",
+                self.screen_text(),
+                self.child.try_wait()
+            );
+            self.pump_once(Duration::from_millis(50));
         }
     }
 
@@ -436,6 +470,10 @@ fn unwind_reaps_child_after_output_receiver_disappears() {
         system.process(pid).is_some(),
         "child was never observed alive"
     );
+    assert!(
+        t.child.try_wait().unwrap().is_none(),
+        "child already exited"
+    );
     let (_, rx) = mpsc::channel();
     drop(std::mem::replace(&mut t.rx, rx));
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -443,6 +481,18 @@ fn unwind_reaps_child_after_output_receiver_disappears() {
         panic!("exercise assertion-failure cleanup");
     }));
     assert!(panic.is_err());
-    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-    assert!(system.process(pid).is_none(), "child survived unwinding");
+    #[cfg(unix)]
+    {
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        assert!(system.process(pid).is_none(), "child survived unwinding");
+    }
+    #[cfg(windows)]
+    {
+        // Keep the pre-unwind Process: wait() queries its retained native handle,
+        // whereas a process-list entry can outlive execution on Windows.
+        let status = bounded("observe terminated child", move || {
+            system.process(pid).unwrap().wait()
+        });
+        assert!(status.is_some(), "child termination was not observed");
+    }
 }

@@ -24,10 +24,10 @@ the last holdout, because a waveform has no glyph for absent — in 0.11.1.
 
 ## Windows validation follow-up — 2026-10-08
 
-- `src/main.rs::restore_extras` and the Windows console-control handler still
-  need a same-console observer test for native input-mode restoration and
-  console-control events. ConPTY `q` coverage checks alternate-screen/cursor
-  restoration, not those native modes or external control events.
+- The Windows console-control handler in `src/main.rs` still needs an external
+  console-control event test. The same-console observer now checks screen and
+  native input-mode restoration on normal `q` exit, not external control events.
+  Native console FFI is exercised on Windows, not under a sanitizer.
 - `src/backend/windows/native.rs::probe` still returns `Option`, so discovery
   failures cannot expose diagnostic details through the current backend API.
 - Live GPU validation covers this machine's adapters and memory readings, not

@@ -334,8 +334,18 @@ fn filter_narrows_process_table() {
 
 #[test]
 fn quit_restores_terminal_modes() {
+    #[cfg(windows)]
+    if terminal::observe_console() {
+        return;
+    }
+    #[cfg(windows)]
+    let mut t = Tui::spawn_with_env(&[], &[("GPUR_TEST_CONSOLE_OBSERVER", Some("1"))]);
+    #[cfg(unix)]
     let mut t = Tui::spawn(&[]);
     t.wait_for("cards", |s| s.contains("Mock GPU 0"));
+    #[cfg(windows)]
+    t.wait_console_observation();
+    #[cfg(unix)]
     assert!(
         t.parser.screen().alternate_screen(),
         "alternate screen never entered"
@@ -346,17 +356,22 @@ fn quit_restores_terminal_modes() {
         t.pump_once(Duration::from_millis(50));
     }
     t.send("q");
-    assert!(t.wait_exit().success());
     assert!(
-        !t.parser.screen().alternate_screen(),
-        "alternate screen not restored"
+        t.wait_exit().success(),
+        "teardown failed:\n{}",
+        t.screen_text()
     );
-    assert!(!t.parser.screen().hide_cursor(), "cursor not restored");
-    let raw = String::from_utf8_lossy(&t.raw);
-    assert!(raw.contains("[?1049l"), "alt screen not left");
-    // Windows toggles ENABLE_MOUSE_INPUT in the console, not SGR reporting.
     #[cfg(unix)]
-    assert!(raw.contains("[?1006l"), "mouse capture not disabled");
+    {
+        assert!(
+            !t.parser.screen().alternate_screen(),
+            "alternate screen not restored"
+        );
+        let raw = String::from_utf8_lossy(&t.raw);
+        assert!(raw.contains("[?1049l"), "alt screen not left");
+        assert!(raw.contains("[?1006l"), "mouse capture not disabled");
+    }
+    assert!(!t.parser.screen().hide_cursor(), "cursor not restored");
 }
 
 #[test]
