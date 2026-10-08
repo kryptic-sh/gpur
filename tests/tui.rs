@@ -303,6 +303,25 @@ fn fold_toggles_card() {
     t.wait_exit();
 }
 
+fn filtered_process_table_ready(screen: &str, pid: u32) -> bool {
+    screen.contains("filter:gpur") && proc_pids(screen) == [pid]
+}
+
+#[test]
+fn filtered_process_table_waits_for_the_expected_row() {
+    let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+    parser.process(b"filter:gpur\r\n1000005 user 0 Compute 40 256MiB firefox");
+    assert!(!filtered_process_table_ready(
+        &parser.screen().contents(),
+        8208
+    ));
+    parser.process(b"\x1b[2;1H\x1b[2K8208 user 0 Compute 40 3064MiB gpur");
+    assert!(filtered_process_table_ready(
+        &parser.screen().contents(),
+        8208
+    ));
+}
+
 #[test]
 fn filter_narrows_process_table() {
     let mut t = Tui::spawn(&[]);
@@ -311,9 +330,8 @@ fn filter_narrows_process_table() {
     // five are fabricated (ollama, blender, Xorg, ffmpeg, firefox) and must
     // all drop out — the caption alone renders unconditionally.
     t.send("/gpur\r");
-    t.wait_for("narrowed table", |s| {
-        s.contains("filter:gpur") && proc_pids(s).len() == 1
-    });
+    let pid = t.child.process_id().expect("child pid");
+    t.wait_for("narrowed table", |s| filtered_process_table_ready(s, pid));
     let s = t.screen_text();
     assert!(!s.contains("ollama runner"), "filtered-out row still drawn");
     assert!(!s.contains("blender -b"), "filtered-out row still drawn");
