@@ -1,0 +1,3 @@
+[[profile.default.overrides]]
+filter = 'binary(tui)'
+slow-timeout = { period = "30s", terminate-after = 3 }

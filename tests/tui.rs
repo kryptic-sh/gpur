@@ -1,236 +1,14 @@
-//! PTY integration tests: run the real binary against a pseudo-terminal,
-//! parse its output with a vt100 emulator, and assert on the rendered
-//! screen. Unix-only (ConPTY in CI is flaky); mock backend throughout.
-#![cfg(unix)]
-
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use std::io::Read;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
+//! PTY integration tests against the real binary and a vt100 screen.
+#[path = "support/mouse.rs"]
+mod mouse;
+#[path = "support/rendering.rs"]
+mod rendering;
+#[path = "support/terminal.rs"]
+mod terminal;
 use std::time::{Duration, Instant};
-
+use terminal::{Sandbox, Tui};
 const COLS: u16 = 120;
 const ROWS: u16 = 36;
-
-/// A throwaway XDG root for one test. gpur resolves its config/cache/data
-/// through hjkl-config, which honours `XDG_*_HOME` on every platform, so
-/// redirecting the three vars keeps the suite off the developer's real
-/// `~/.cache/gpur/state.json` — which the app both reads at startup and
-/// overwrites on a clean quit.
-struct Sandbox(PathBuf);
-
-impl Sandbox {
-    fn new() -> Self {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "gpur-tui-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Sandbox(dir)
-    }
-}
-
-impl Drop for Sandbox {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-struct Tui {
-    parser: vt100::Parser,
-    rx: mpsc::Receiver<Vec<u8>>,
-    writer: Box<dyn std::io::Write + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-    /// Every byte the app ever wrote, for teardown-sequence assertions.
-    raw: Vec<u8>,
-    /// Removed on drop; keep it alive for the whole run.
-    home: Sandbox,
-    _master: Box<dyn portable_pty::MasterPty + Send>,
-}
-
-impl Tui {
-    fn spawn(extra_args: &[&str]) -> Self {
-        Self::spawn_with_env(extra_args, &[])
-    }
-
-    fn spawn_with_env(extra_args: &[&str], env: &[(&str, Option<&str>)]) -> Self {
-        // Defaults, omitted when the caller passes its own — clap rejects a
-        // repeated flag rather than letting the last one win.
-        let mut args = vec!["--no-splash"];
-        if !extra_args.contains(&"--mock") {
-            args.push("--mock");
-        }
-        if !extra_args.contains(&"--tick-ms") {
-            args.extend(["--tick-ms", "100"]);
-        }
-        args.extend_from_slice(extra_args);
-        Self::spawn_in(&args, env, Sandbox::new())
-    }
-
-    /// Full control over the command line and the sandbox — for tests that
-    /// plant a cache file, or that need a persisted setting to win because
-    /// no CLI flag overrides it.
-    ///
-    /// `env` overrides the defaults below rather than adding to them:
-    /// `CommandBuilder` keys its environment by name, so a caller's entry
-    /// replaces the one set here. `None` unsets the variable outright, which
-    /// is not the same as the empty string — `detect_color_mode` reads
-    /// `NO_COLOR` as set-but-empty meaning "colour is fine".
-    fn spawn_in(args: &[&str], env: &[(&str, Option<&str>)], home: Sandbox) -> Self {
-        let pty = native_pty_system()
-            .openpty(PtySize {
-                rows: ROWS,
-                cols: COLS,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_gpur"));
-        cmd.args(args);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        // A parent shell's NO_COLOR must not leak into the harness: the colour
-        // assertions in this file depend on the app painting, and NO_COLOR is
-        // the one variable the child would otherwise inherit. An empty value
-        // reads as "colour is fine" to `detect_color_mode`, and the explicit
-        // `("NO_COLOR", Some("1"))` override in the no_color test replaces it.
-        cmd.env("NO_COLOR", "");
-        cmd.env("XDG_CONFIG_HOME", &home.0);
-        cmd.env("XDG_CACHE_HOME", &home.0);
-        cmd.env("XDG_DATA_HOME", &home.0);
-        for (k, v) in env {
-            match v {
-                Some(v) => cmd.env(k, v),
-                None => cmd.env_remove(k),
-            }
-        }
-        let child = pty.slave.spawn_command(cmd).unwrap();
-        drop(pty.slave);
-
-        let mut reader = pty.master.try_clone_reader().unwrap();
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
-                    break;
-                }
-            }
-        });
-
-        Tui {
-            parser: vt100::Parser::new(ROWS, COLS, 0),
-            rx,
-            writer: pty.master.take_writer().unwrap(),
-            child,
-            raw: Vec::new(),
-            home,
-            _master: pty.master,
-        }
-    }
-
-    /// Where the app persists its UI state under this test's sandbox.
-    fn state_file(&self) -> PathBuf {
-        self.home.0.join("gpur").join("state.json")
-    }
-
-    fn pump_once(&mut self, timeout: Duration) -> bool {
-        match self.rx.recv_timeout(timeout) {
-            Ok(bytes) => {
-                self.raw.extend_from_slice(&bytes);
-                self.parser.process(&bytes);
-                true
-            }
-            Err(_) => false,
-        }
-    }
-
-    fn screen_text(&self) -> String {
-        self.parser.screen().contents()
-    }
-
-    /// Poll the emulated screen until `pred` holds — never trust a fixed
-    /// sleep to mean "rendered".
-    fn wait_for(&mut self, what: &str, pred: impl Fn(&str) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if pred(&self.screen_text()) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for {what}; screen:\n{}",
-                self.screen_text()
-            );
-            self.pump_once(Duration::from_millis(100));
-        }
-    }
-
-    fn send(&mut self, keys: &str) {
-        self.writer.write_all(keys.as_bytes()).unwrap();
-        self.writer.flush().unwrap();
-    }
-
-    /// One SGR mouse report over a 0-based screen cell. The encoding is
-    /// 1-based, `M` presses and `m` releases; the wheel buttons have no
-    /// release, exactly as a real terminal reports them.
-    fn mouse(&mut self, button: u8, col: u16, row: u16) {
-        self.send(&format!("\x1b[<{button};{};{}M", col + 1, row + 1));
-        if button < WHEEL_UP {
-            self.send(&format!("\x1b[<{button};{};{}m", col + 1, row + 1));
-        }
-    }
-
-    fn click(&mut self, col: u16, row: u16) {
-        self.mouse(MOUSE_LEFT, col, row);
-    }
-
-    /// Like [`wait_for`], but over every byte the app has written — for
-    /// states that flash by between frames and would be erased from the
-    /// screen before the next poll of the emulator.
-    fn wait_for_raw(&mut self, what: &str, needle: &str) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if String::from_utf8_lossy(&self.raw).contains(needle) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for {what}; screen:\n{}",
-                self.screen_text()
-            );
-            self.pump_once(Duration::from_millis(100));
-        }
-    }
-
-    /// Pump for a fixed window, then return the screen. The app repaints on
-    /// every tick even when nothing changed, so waiting for the pty to fall
-    /// silent would never return.
-    fn drain(&mut self, window: Duration) -> String {
-        let until = Instant::now() + window;
-        while Instant::now() < until {
-            self.pump_once(Duration::from_millis(50));
-        }
-        self.screen_text()
-    }
-
-    fn wait_exit(&mut self) -> portable_pty::ExitStatus {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            // Keep draining so the child can't block on a full pty buffer.
-            self.pump_once(Duration::from_millis(50));
-            if let Ok(Some(status)) = self.child.try_wait() {
-                // Drain whatever teardown bytes remain.
-                while self.pump_once(Duration::from_millis(100)) {}
-                return status;
-            }
-            assert!(Instant::now() < deadline, "child did not exit");
-        }
-    }
-}
 
 /// SGR button numbers, as the app's mouse capture reports them.
 const MOUSE_LEFT: u8 = 0;
@@ -558,11 +336,64 @@ fn filter_narrows_process_table() {
 fn quit_restores_terminal_modes() {
     let mut t = Tui::spawn(&[]);
     t.wait_for("cards", |s| s.contains("Mock GPU 0"));
+    assert!(
+        t.parser.screen().alternate_screen(),
+        "alternate screen never entered"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !t.parser.screen().hide_cursor() {
+        assert!(Instant::now() < deadline, "dashboard cursor was not hidden");
+        t.pump_once(Duration::from_millis(50));
+    }
     t.send("q");
     assert!(t.wait_exit().success());
+    assert!(
+        !t.parser.screen().alternate_screen(),
+        "alternate screen not restored"
+    );
+    assert!(!t.parser.screen().hide_cursor(), "cursor not restored");
     let raw = String::from_utf8_lossy(&t.raw);
     assert!(raw.contains("[?1049l"), "alt screen not left");
+    // Windows toggles ENABLE_MOUSE_INPUT in the console, not SGR reporting.
+    #[cfg(unix)]
     assert!(raw.contains("[?1006l"), "mouse capture not disabled");
+}
+
+#[test]
+fn resize_changes_layout_and_restores_it() {
+    let mut t = Tui::spawn(&["--mock", "4"]);
+    t.wait_for("full-size process window", |s| {
+        proc_window(s) == Some((1, 7, 12))
+    });
+    t.parser.screen_mut().set_size(24, 80);
+    t.resize(24, 80);
+    t.wait_for("smaller process window", |s| {
+        proc_window(s) == Some((1, 3, 12))
+            && proc_pids(s).len() == 3
+            && s.lines().nth(22).is_some_and(|line| line.ends_with('╯'))
+    });
+    assert_eq!(proc_pids(&t.screen_text()).len(), 3);
+    assert_eq!(t.parser.screen().cell(22, 79).unwrap().contents(), "╯");
+    t.parser.screen_mut().set_size(ROWS, COLS);
+    t.resize(ROWS, COLS);
+    t.wait_for("restored process window", |s| {
+        proc_window(s) == Some((1, 7, 12))
+            && proc_pids(s).len() == 7
+            && s.lines()
+                .nth(usize::from(ROWS - 2))
+                .is_some_and(|line| line.ends_with('╯'))
+    });
+    assert_eq!(proc_pids(&t.screen_text()).len(), 7);
+    assert_eq!(
+        t.parser
+            .screen()
+            .cell(ROWS - 2, COLS - 1)
+            .unwrap()
+            .contents(),
+        "╯"
+    );
+    t.send("q");
+    assert!(t.wait_exit().success());
 }
 
 #[test]
@@ -582,14 +413,7 @@ fn survives_resize_storm() {
         (10, 30),
         (ROWS, COLS),
     ] {
-        t._master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
+        t.resize(rows, cols);
         // NB: the vt100 test parser stays at full size — it panics on 1x1
         // grids, and out-of-range coords from small-screen frames clamp.
         t.pump_once(Duration::from_millis(50));
@@ -604,7 +428,7 @@ fn survives_resize_storm() {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         assert!(
-            !matches!(t.child.try_wait(), Ok(Some(_))),
+            t.child.try_wait().expect("query child status").is_none(),
             "app exited during/after resize storm"
         );
         t.send("?");
@@ -644,6 +468,7 @@ fn help_overlay_opens_and_closes() {
 }
 
 #[test]
+#[cfg(unix)]
 fn sigterm_restores_terminal_modes() {
     let mut t = Tui::spawn(&[]);
     t.wait_for("cards", |s| s.contains("Mock GPU 0"));
@@ -660,6 +485,43 @@ fn sigterm_restores_terminal_modes() {
     );
 }
 
+fn own_process_row(screen: &str, pid: &str, user: &str) -> bool {
+    use ratatui::{style::Style, text::Line};
+
+    // Match draw_processes' USER column in display columns, not bytes or chars.
+    let line = Line::from(user);
+    let mut remaining: usize = 10;
+    let user: String = line
+        .styled_graphemes(Style::default())
+        .map_while(|g| {
+            remaining = remaining.checked_sub(Line::from(g.symbol).width())?;
+            Some(g.symbol)
+        })
+        .collect();
+    screen.lines().any(|l| {
+        let l = l.trim_start_matches('│').trim_start();
+        let mut cols = l.split_whitespace();
+        cols.next() == Some(pid) && cols.next() == Some(user.as_str()) && l.contains("MiB")
+    })
+}
+
+#[test]
+fn own_process_row_matches_display_width_and_exact_pid() {
+    for (user, displayed) in [
+        ("runneradmin", "runneradmi"),
+        ("界界界界界界", "界界界界界"),
+        ("abcdefghi界", "abcdefghi"),
+        ("e\u{301}123456789x", "e\u{301}123456789"),
+    ] {
+        let row = format!("│12345    {displayed} 0 Compute 40 3064MiB");
+        assert!(own_process_row(&row, "12345", user), "{user:?}");
+        assert!(!own_process_row(&row, "1234", user));
+        assert!(!own_process_row(&row, "123456", user));
+        assert!(!own_process_row(&row, "12345", "different"));
+        assert!(!own_process_row(&row.replace("MiB", ""), "12345", user));
+    }
+}
+
 #[test]
 fn process_rows_show_real_content() {
     let mut t = Tui::spawn(&[]);
@@ -670,16 +532,11 @@ fn process_rows_show_real_content() {
     // Anchor on USER, not COMMAND: the command column holds the binary's full
     // path and is truncated to the terminal width, so whether the basename
     // survives depends on where the repo happens to live.
+    #[cfg(unix)]
     let user = std::env::var("USER").expect("USER");
-    t.wait_for("own process row", move |s| {
-        s.lines().any(|l| {
-            let l = l.trim_start_matches('│').trim_start();
-            let mut cols = l.split_whitespace();
-            cols.next() == Some(pid.as_str())
-                && cols.next() == Some(user.as_str()) // sysinfo resolved it
-                && l.contains("MiB")
-        })
-    });
+    #[cfg(windows)]
+    let user = std::env::var("USERNAME").expect("USERNAME");
+    t.wait_for("own process row", move |s| own_process_row(s, &pid, &user));
     t.send("q");
     t.wait_exit();
 }
@@ -787,7 +644,7 @@ fn poll_failure_degrades_gracefully() {
     assert!(s.contains("Mock GPU 0"), "snapshot dropped on poll failure");
     assert!(meter_line(&s, "GPU ", "■·").is_some(), "meters dropped");
     assert!(
-        !matches!(t.child.try_wait(), Ok(Some(_))),
+        t.child.try_wait().expect("query child status").is_none(),
         "app exited on a backend failure"
     );
     t.send("q");
@@ -947,699 +804,16 @@ fn kill_is_refused_under_the_mock_backend() {
         "mock backend opened a kill dialog"
     );
     assert!(
-        !matches!(t.child.try_wait(), Ok(Some(_))),
+        t.child.try_wait().expect("query child status").is_none(),
         "app died after a refused kill"
     );
     t.send("q");
     assert!(t.wait_exit().success());
 }
 
-// --- mouse input ---------------------------------------------------------
-//
-// `--mock 4` publishes 12 process rows, of which 7 fit at 120x36: enough
-// for a click or a wheel to be able to scroll the window, which is what the
-// hit test's bounds are about. Every coordinate below is read off the
-// rendered screen so a layout change moves the tests with it.
-
-/// Ordering barrier for the negative assertions. `-` halves the poll rate,
-/// and the app reads its input in order, so once the new rate is on screen
-/// every byte sent before it has been consumed — where waiting a fixed
-/// delay would only be a guess. It touches nothing else the tests look at.
-fn tick_marker(t: &mut Tui, now_ms: u64) {
-    t.send("-");
-    let needle = format!("{now_ms}ms");
-    t.wait_for("the tick marker", move |s| s.contains(&needle));
-}
-
-/// A click selects the row under the cursor and focuses the pane. The last
-/// visible row is the interesting one: it borders the frame, which
-/// `Rect::contains` counts as part of the pane.
-#[test]
-fn click_selects_the_process_row_under_the_cursor() {
-    let mut t = Tui::spawn(&["--mock", "4"]);
-    t.wait_for("a windowed table", |s| proc_window(s) == Some((1, 7, 12)));
-    let rows = wait_for_procs(&mut t, 7);
-    let (last_y, last_pid) = *rows.last().expect("data rows");
-    t.click(10, last_y);
-    wait_for_selected_pid(&mut t, last_pid, "the clicked row to be selected");
-    assert_eq!(
-        wait_for_procs(&mut t, 7),
-        rows,
-        "clicking a visible row scrolled the table"
-    );
-    // Focus followed the click, so j walks the process list from there —
-    // one past the last visible row, which does scroll.
-    t.send("j");
-    t.wait_for("the cursor to move on within the process pane", |s| {
-        proc_window(s) == Some((2, 8, 12))
-    });
-    t.send("q");
-    assert!(t.wait_exit().success());
-}
-
-/// The pane's bottom border is inside `proc_rect` as far as
-/// `Rect::contains` is concerned. Clicking it must select nothing: bounded
-/// by the row count instead of by the window, it picked a row that was
-/// never on screen and scrolled the view to reveal it.
-#[test]
-fn click_on_the_process_pane_border_selects_nothing() {
-    let mut t = Tui::spawn(&["--mock", "4"]);
-    t.wait_for("a windowed table", |s| proc_window(s) == Some((1, 7, 12)));
-    let rows = wait_for_procs(&mut t, 7);
-    let before_sel = wait_for_selection(&mut t);
-    let border_y = rows.last().expect("data rows").0 + 1;
-    let border = row_text(t.parser.screen(), border_y);
-    assert!(
-        border.starts_with('╰'),
-        "row {border_y} is not the pane's bottom border: {border:?}"
-    );
-    t.click(10, border_y);
-    tick_marker(&mut t, 200);
-    assert_eq!(
-        proc_window(&t.screen_text()),
-        Some((1, 7, 12)),
-        "a click on the border scrolled the table"
-    );
-    assert_eq!(wait_for_procs(&mut t, 7), rows);
-    assert_eq!(
-        wait_for_selection(&mut t),
-        before_sel,
-        "a click on the border moved the cursor"
-    );
-    t.send("q");
-    assert!(t.wait_exit().success());
-}
-
-/// The wheel over the process pane walks the cursor, and clamps at both
-/// ends rather than wrapping or running off the list.
-#[test]
-fn wheel_over_the_process_pane_scrolls_and_clamps() {
-    let mut t = Tui::spawn(&["--mock", "4"]);
-    t.wait_for("a windowed table", |s| proc_window(s) == Some((1, 7, 12)));
-    let rows = wait_for_procs(&mut t, 7);
-    let (first_pid, second_pid) = (rows[0].1, rows[1].1);
-    let y = rows[3].0; // mid-pane: never a border, whatever the window shows
-
-    // The cursor starts on the first row, so wheel-up has nowhere to go.
-    t.mouse(WHEEL_UP, 10, y);
-    tick_marker(&mut t, 200);
-    assert_eq!(
-        wait_for_selection(&mut t),
-        first_pid,
-        "wheel-up at the top of the list moved the cursor"
-    );
-    assert_eq!(proc_window(&t.screen_text()), Some((1, 7, 12)));
-
-    t.mouse(WHEEL_DOWN, 10, y);
-    wait_for_selected_pid(&mut t, second_pid, "the cursor to step down a row");
-
-    // Far more notches than there are rows: the window must stop at the end.
-    for _ in 0..20 {
-        t.mouse(WHEEL_DOWN, 10, y);
-    }
-    t.wait_for("the last page of rows", |s| {
-        proc_window(s) == Some((6, 12, 12))
-    });
-    tick_marker(&mut t, 400);
-    assert_eq!(
-        proc_window(&t.screen_text()),
-        Some((6, 12, 12)),
-        "the wheel ran off the end of the list"
-    );
-    let last_pid = wait_for_procs(&mut t, 7).last().expect("data rows").1;
-    assert_eq!(
-        wait_for_selection(&mut t),
-        last_pid,
-        "the cursor is not on the final row"
-    );
-    t.send("q");
-    assert!(t.wait_exit().success());
-}
-
-/// Clicking a card selects that GPU: `card_rects` hit-testing.
-#[test]
-fn click_selects_the_gpu_card_under_the_cursor() {
-    let mut t = Tui::spawn(&[]);
-    t.wait_for("both cards", |s| {
-        s.contains("0·Mock GPU 0") && s.contains("1·Mock GPU 1")
-    });
-    wait_for_selected_card(&mut t, 0, "GPU 0 to be selected at startup");
-    // Two rows below the title: inside the second card, clear of its border.
-    let y = row_y(&t, "1·Mock GPU 1") + 2;
-    t.click(10, y);
-    wait_for_selected_card(&mut t, 1, "the clicked card to be selected");
-    t.send("q");
-    assert!(t.wait_exit().success());
-}
-
-/// The wheel over the GPU pane moves the card selection, dragging the card
-/// window with it, and clamps at both ends. Eight cards do not fit at
-/// 120x36, so the selection is visible in what the pane shows.
-#[test]
-fn wheel_over_the_gpu_pane_moves_the_card_selection() {
-    let mut t = Tui::spawn(&["--mock", "8"]);
-    t.wait_for("windowed cards", |s| {
-        s.contains("0·Mock GPU 0") && !s.contains("Mock GPU 7")
-    });
-    // Fixed for the whole test: the GPU pane keeps its rows while the cards
-    // inside it scroll.
-    let y = row_y(&t, "0·Mock GPU 0") + 2;
-
-    // GPU 0 is selected at startup, so wheel-up must not wrap to the last.
-    t.mouse(WHEEL_UP, 10, y);
-    tick_marker(&mut t, 200);
-    assert_eq!(
-        wait_for_a_selected_card(&mut t),
-        0,
-        "wheel-up wrapped past the first card"
-    );
-
-    for _ in 0..7 {
-        t.mouse(WHEEL_DOWN, 10, y);
-    }
-    wait_for_selected_card(&mut t, 7, "the wheel to reach the last card");
-    t.wait_for("the card window to follow the selection", |s| {
-        s.contains("7·Mock GPU 7") && !s.contains("Mock GPU 0")
-    });
-
-    for _ in 0..5 {
-        t.mouse(WHEEL_DOWN, 10, y);
-    }
-    tick_marker(&mut t, 400);
-    assert_eq!(
-        wait_for_a_selected_card(&mut t),
-        7,
-        "wheel-down past the last card did not clamp"
-    );
-    t.send("q");
-    assert!(t.wait_exit().success());
-}
-
-/// Modals own the screen: with the help overlay up, a click or a wheel must
-/// not move the process cursor, the card selection or the focus underneath
-/// it.
-#[test]
-fn mouse_is_ignored_while_the_help_overlay_is_open() {
-    let mut t = Tui::spawn(&["--mock", "4"]);
-    t.wait_for("a windowed table", |s| proc_window(s) == Some((1, 7, 12)));
-    let rows = wait_for_procs(&mut t, 7);
-    let before_sel = wait_for_selection(&mut t);
-    let proc_y = rows.last().expect("data rows").0;
-    let gpu_y = row_y(&t, "0·Mock GPU 0") + 2;
-
-    t.send("?");
-    t.wait_for("help overlay", |s| s.contains("any key closes"));
-    t.click(10, proc_y);
-    for _ in 0..3 {
-        t.mouse(WHEEL_DOWN, 10, proc_y);
-    }
-    t.mouse(WHEEL_DOWN, 10, gpu_y);
-    // Closing the overlay takes a key, and input is read in order: once the
-    // overlay is gone, every mouse event above has been read.
-    t.send("x");
-    t.wait_for("overlay gone", |s| !s.contains("any key closes"));
-
-    assert_eq!(
-        wait_for_procs(&mut t, 7),
-        rows,
-        "the table scrolled under the overlay"
-    );
-    assert_eq!(
-        wait_for_selection(&mut t),
-        before_sel,
-        "the process cursor moved under the overlay"
-    );
-    assert_eq!(
-        wait_for_a_selected_card(&mut t),
-        0,
-        "the card selection moved under the overlay"
-    );
-    // Focus is still on the GPU pane, so the digit folds the card it
-    // already selects. Had the click stolen the focus, the same key would
-    // merely take it back.
-    t.send("0");
-    t.wait_for("GPU 0 folded by the digit", |s| {
-        s.contains("▸ 0·Mock GPU 0")
-    });
-    t.send("q");
-    assert!(t.wait_exit().success());
-}
-
-/// The same guard covers every non-Normal input mode, not just the help
-/// overlay: the filter prompt must swallow mouse input too. (The kill
-/// dialog is the third such mode, but no mock or replay backend will open
-/// one — it is refused before the dialog exists.)
-#[test]
-fn mouse_is_ignored_while_the_filter_prompt_is_open() {
-    let mut t = Tui::spawn(&["--mock", "4"]);
-    t.wait_for("a windowed table", |s| proc_window(s) == Some((1, 7, 12)));
-    let rows = wait_for_procs(&mut t, 7);
-    let before_sel = wait_for_selection(&mut t);
-    let proc_y = rows.last().expect("data rows").0;
-    let gpu_y = row_y(&t, "0·Mock GPU 0") + 2;
-
-    t.send("/");
-    t.wait_for("filter prompt", |s| s.contains("filter>"));
-    t.click(10, proc_y);
-    for _ in 0..3 {
-        t.mouse(WHEEL_DOWN, 10, proc_y);
-    }
-    t.mouse(WHEEL_DOWN, 10, gpu_y);
-    // A typed character reaches the prompt only after the mouse bytes ahead
-    // of it have been read.
-    t.send("z");
-    t.wait_for("the typed character", |s| s.contains("filter> z"));
-
-    assert_eq!(
-        wait_for_procs(&mut t, 7),
-        rows,
-        "the table scrolled under the filter prompt"
-    );
-    assert_eq!(
-        wait_for_selection(&mut t),
-        before_sel,
-        "the process cursor moved under the filter prompt"
-    );
-    assert_eq!(
-        wait_for_a_selected_card(&mut t),
-        0,
-        "the card selection moved under the filter prompt"
-    );
-    // Back out with an empty filter — the table must come back untouched.
-    t.send("\x7f\r");
-    t.wait_for("prompt closed", |s| !s.contains("filter>"));
-    assert_eq!(wait_for_procs(&mut t, 7), rows);
-    t.send("q");
-    assert!(t.wait_exit().success());
-}
-
-// --- kill dialog ---------------------------------------------------------
-//
-// mock and replay refuse to signal by design, so no backend could open the
-// kill dialog under the PTY harness. `GPUR_STUB_BACKEND=1` injects a stub
-// backend that reports one real local process, reaching the dialog, its
-// modal guards, and the confirm path end to end.
-
-/// Spawn with the stub backend: no `--mock`, one real local `sleep` process.
-fn spawn_stub() -> Tui {
-    Tui::spawn_in(
-        &["--no-splash", "--tick-ms", "100"],
-        &[("GPUR_STUB_BACKEND", Some("1"))],
-        Sandbox::new(),
-    )
-}
-
-#[test]
-fn kill_dialog_opens_for_a_real_process_and_cancels() {
-    let mut t = spawn_stub();
-    t.wait_for("the stub's process row", |s| s.contains("sleep 60"));
-    t.send("p");
-    t.send("x");
-    t.wait_for("the kill dialog", |s| s.contains("send SIGTERM to"));
-    assert!(
-        t.screen_text().contains("sleep 60"),
-        "the dialog does not name the command:\n{}",
-        t.screen_text()
-    );
-    // Any key other than y cancels — nothing may be signalled.
-    t.send("n");
-    t.wait_for("dialog closed", |s| !s.contains("send SIGTERM to"));
-    t.send("q");
-    assert!(t.wait_exit().success());
-}
-
-#[test]
-fn mouse_is_ignored_while_the_kill_dialog_is_open() {
-    let mut t = spawn_stub();
-    t.wait_for("the stub's rows", |s| proc_pids(s).len() == 2);
-    let rows = wait_for_procs(&mut t, 2);
-    // The child (higher pid) is the second row; select it by click, which
-    // also focuses the process pane.
-    let child = *rows.last().expect("two rows");
-    t.click(10, child.0);
-    wait_for_selected_pid(&mut t, child.1, "the child row to be selected");
-    t.send("x");
-    t.wait_for("the kill dialog", |s| s.contains("send SIGTERM to"));
-
-    // Mouse events under the dialog: a click on the other row, wheel on the
-    // process pane, wheel on the GPU pane.
-    let own = rows[0];
-    t.click(10, own.0);
-    for _ in 0..3 {
-        t.mouse(WHEEL_DOWN, 10, child.0);
-    }
-    let gpu_y = row_y(&t, "0·Stub GPU 0") + 2;
-    t.mouse(WHEEL_DOWN, 10, gpu_y);
-    // Input is read in order, so once the dialog closes every event above
-    // has been consumed.
-    t.send("n");
-    t.wait_for("dialog closed", |s| !s.contains("send SIGTERM to"));
-
-    assert_eq!(
-        wait_for_procs(&mut t, 2),
-        rows,
-        "the table changed under the kill dialog"
-    );
-    assert_eq!(
-        wait_for_selection(&mut t),
-        child.1,
-        "the process cursor moved under the kill dialog"
-    );
-    assert_eq!(
-        wait_for_a_selected_card(&mut t),
-        0,
-        "the card selection moved under the kill dialog"
-    );
-    t.send("q");
-    assert!(t.wait_exit().success());
-}
-
-#[test]
-fn kill_confirm_sends_the_signal_and_reports_it() {
-    let mut t = spawn_stub();
-    t.wait_for("the stub's rows", |s| proc_pids(s).len() == 2);
-    let rows = wait_for_procs(&mut t, 2);
-    let child = *rows.last().expect("two rows");
-    t.click(10, child.0);
-    wait_for_selected_pid(&mut t, child.1, "the child row to be selected");
-    t.send("x");
-    t.wait_for("the kill dialog", |s| s.contains("send SIGTERM to"));
-    t.send("y");
-    t.wait_for("the status line", |s| s.contains("sent SIGTERM to"));
-    t.send("q");
-    assert!(t.wait_exit().success());
-}
-
-// --- graph glyph sets ----------------------------------------------------
-//
-// `--graphs` picks the glyph set every graph draws with. The negative half of
-// each test below is the one that carries weight: a style that silently fell
-// back to braille would satisfy any assertion that only looked for its own
-// glyphs, because braille cells are what the default already paints.
-
-/// A cell from the braille block, whichever dots are set.
-fn is_braille(c: char) -> bool {
-    ('\u{2800}'..='\u{28ff}').contains(&c)
-}
-
-/// `ui::EIGHTHS` without its blank level, and the `ui::ASCII_RAMP` levels a
-/// waveform can actually index — it skips empty cells, so the `_` baseline
-/// belongs to `mini_spark` alone and never appears in a graph.
-const EIGHTHS: &str = "▁▂▃▄▅▆▇█";
-const ASCII_RAMP: &str = ".-+#";
-
-/// Screen rows of the first card's waveform, top and bottom inclusive.
-/// `waveform_halves` writes its own `gpu%` at the graph's top-left and
-/// `mem%` at its bottom-left, so the labels bracket exactly the rows the
-/// graph owns — and nothing else on screen is mistakable for them, the
-/// process table's column being upper-case `GPU%`.
-fn waveform_rows(t: &mut Tui) -> (u16, u16) {
-    // The graph is drawn only once a card has history and the card has rows
-    // to spare, so wait for the labels rather than assume the first frame.
-    t.wait_for("a drawn waveform", |s| {
-        s.contains("gpu%") && s.contains("mem%")
-    });
-    let screen = t.parser.screen();
-    let top = (0..ROWS)
-        .find(|&y| row_text(screen, y).contains("gpu%"))
-        .expect("a gpu% label");
-    let bot = (top..ROWS)
-        .find(|&y| row_text(screen, y).contains("mem%"))
-        .expect("a mem% label below the gpu% one");
-    (top, bot)
-}
-
-/// Every glyph the first card's waveform drew. Whole rows go in as they are:
-/// the two labels and the card border carry no character from any of the
-/// three glyph sets, while the process commands and card captions that do
-/// (`.`, `-`, `+`, `·`) all sit outside these rows.
-fn waveform_glyphs(t: &Tui, (top, bot): (u16, u16)) -> String {
-    let screen = t.parser.screen();
-    (top..=bot).map(|y| row_text(screen, y)).collect()
-}
-
-/// The default style, and the contrast the other two are read against.
-#[test]
-fn the_default_graph_style_draws_braille_dots() {
-    let mut t = Tui::spawn(&[]);
-    let rows = waveform_rows(&mut t);
-    let glyphs = waveform_glyphs(&t, rows);
-    assert!(
-        glyphs.chars().any(is_braille),
-        "no braille in the waveform:\n{glyphs}"
-    );
-    assert!(
-        !glyphs
-            .chars()
-            .any(|c| EIGHTHS.contains(c) || ASCII_RAMP.contains(c)),
-        "the braille waveform drew a cell glyph:\n{glyphs}"
-    );
-    assert!(
-        meter_line(&t.screen_text(), "GPU ", "■·").is_some(),
-        "meters are not on the unicode glyphs:\n{}",
-        t.screen_text()
-    );
-    t.send("q");
-    assert!(t.wait_exit().success());
-}
-
-/// `--graphs block` must reach `draw_waveform_cells`' block arm — including
-/// the fg/bg swap it draws the down-growing half with, which is where the
-/// colour-quantization bug lived.
-#[test]
-fn block_graphs_draw_eighth_blocks_and_swap_colours_below_the_midline() {
-    let mut t = Tui::spawn(&["--graphs", "block"]);
-    let rows = waveform_rows(&mut t);
-    let glyphs = waveform_glyphs(&t, rows);
-    assert!(
-        glyphs.chars().any(|c| EIGHTHS.contains(c)),
-        "no eighth blocks in the waveform:\n{glyphs}"
-    );
-    assert!(
-        !glyphs
-            .chars()
-            .any(|c| is_braille(c) || ASCII_RAMP.contains(c)),
-        "the block waveform drew another style's glyph:\n{glyphs}"
-    );
-    let screen_text = t.screen_text();
-    // `mini_spark` branches on the same setting, and it is the only other
-    // braille in the UI — so one sweep of the whole screen catches it.
-    assert!(
-        !screen_text.chars().any(is_braille),
-        "braille outside the waveform: a graph ignored --graphs block:\n{screen_text}"
-    );
-    assert!(
-        meter_line(&screen_text, "GPU ", "■·").is_some(),
-        "block mode changed the meter glyphs, which only ascii does:\n{screen_text}"
-    );
-
-    // Unicode has no upper-partial block, so the down-growing half paints the
-    // *empty* part of a cell in the theme background over a bar-coloured one.
-    // Prove that reaches the terminal: a cell below the midline whose
-    // foreground is the page background, over a background that is not.
-    let (top, bot) = rows;
-    let screen = t.parser.screen();
-    let page_bg = screen.cell(0, 0).expect("the top-left cell").bgcolor();
-    // `waveform_halves` gives the up half `height / 2` rows and the rest to
-    // the down half, so the down half starts here.
-    let height = bot - top + 1;
-    let midline = top + height / 2;
-    let swapped = (midline..=bot).any(|y| {
-        (0..COLS).any(|x| {
-            screen
-                .cell(y, x)
-                .is_some_and(|c| c.fgcolor() == page_bg && c.bgcolor() != page_bg)
-        })
-    });
-    assert!(
-        swapped,
-        "no fg/bg-swapped cell below the midline; the down half is not \
-         drawing its partial cells:\n{glyphs}"
-    );
-    t.send("q");
-    assert!(t.wait_exit().success());
-}
-
-/// `--graphs ascii` is the setting for a terminal with no block or braille
-/// coverage at all, so nothing it draws may reach outside 7-bit ascii — the
-/// meters included, which are `draw_meter`'s own branch on the style.
-#[test]
-fn ascii_graphs_draw_the_ascii_ramp_and_plain_meters() {
-    let mut t = Tui::spawn(&["--graphs", "ascii"]);
-    let rows = waveform_rows(&mut t);
-    let glyphs = waveform_glyphs(&t, rows);
-    assert!(
-        glyphs.chars().any(|c| ASCII_RAMP.contains(c)),
-        "no ascii ramp in the waveform:\n{glyphs}"
-    );
-    assert!(
-        !glyphs.chars().any(|c| is_braille(c) || EIGHTHS.contains(c)),
-        "the ascii waveform drew a unicode glyph:\n{glyphs}"
-    );
-    let s = t.screen_text();
-    assert!(
-        !s.chars().any(is_braille),
-        "braille outside the waveform: a graph ignored --graphs ascii:\n{s}"
-    );
-    let util = meter_line(&s, "GPU ", "=.").expect("an ascii GPU meter");
-    let glyph_count = util.chars().filter(|c| "=.".contains(*c)).count();
-    assert!(glyph_count >= 40, "GPU meter has no ascii bar: {util:?}");
-    assert!(
-        !s.contains('■'),
-        "the meters kept their unicode fill glyph under --graphs ascii:\n{s}"
-    );
-    t.send("q");
-    assert!(t.wait_exit().success());
-}
-
-// --- colour modes --------------------------------------------------------
-//
-// `theme::detect_color_mode` reads the environment once at startup and every
-// style is quantized as it is built, so the only end-to-end proof is the byte
-// stream: what the app writes for a terminal that cannot take 24-bit colour.
-// These read `Tui::raw` rather than the screen because vt100 normalises SGR
-// into cell attributes and would hide the encoding entirely.
-
-/// The parameter list of every SGR (`ESC [ … m`) sequence in a byte stream.
-fn sgr_sequences(raw: &str) -> Vec<Vec<u16>> {
-    let mut out = Vec::new();
-    let mut rest = raw;
-    while let Some(i) = rest.find("\x1b[") {
-        let tail = &rest[i + 2..];
-        let end = tail
-            .find(|c: char| !c.is_ascii_digit() && c != ';')
-            .unwrap_or(tail.len());
-        if tail[end..].starts_with('m') {
-            out.push(
-                tail[..end]
-                    .split(';')
-                    .filter_map(|p| p.parse().ok())
-                    .collect(),
-            );
-        }
-        rest = &tail[end..];
-    }
-    out
-}
-
-/// The colours those sequences set, tagged the way SGR spells them: `38`/`48`
-/// introduce an extended colour whose next parameter picks the encoding — `5`
-/// for one palette index, `2` for three rgb components — and 30-37 / 40-47
-/// plus their bright ranges are direct palette codes. `39`/`49` are "back to
-/// the terminal's own default", which is what mono paints with and is not a
-/// colour; every other parameter is an attribute (bold, dim, reverse).
-fn colour_sgr(raw: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    for params in sgr_sequences(raw) {
-        let mut i = 0;
-        while i < params.len() {
-            match params[i] {
-                p @ (38 | 48) => {
-                    let encoding = params.get(i + 1).copied().unwrap_or_default();
-                    found.push(format!("{p};{encoding}"));
-                    i += if encoding == 2 { 5 } else { 3 };
-                }
-                p @ (30..=37 | 40..=47 | 90..=97 | 100..=107) => {
-                    found.push(p.to_string());
-                    i += 1;
-                }
-                _ => i += 1,
-            }
-        }
-    }
-    found
-}
-
-/// `NO_COLOR=1` has to reach the terminal as no colour at all — not as a
-/// muted palette. The app still has to be usable, so this asserts its content
-/// is drawn rather than that it drew nothing.
-#[test]
-fn no_color_renders_the_dashboard_without_a_single_colour_escape() {
-    let mut t = Tui::spawn_with_env(&[], &[("NO_COLOR", Some("1"))]);
-    t.wait_for("cards", |s| {
-        s.contains("Mock GPU 0") && s.contains("Mock GPU 1")
-    });
-    t.wait_for("process table", |s| s.contains("COMMAND"));
-    t.wait_for("meters", |s| meter_line(s, "GPU ", "■·").is_some());
-    assert!(
-        t.screen_text().contains("gpur v"),
-        "banner missing under NO_COLOR:\n{}",
-        t.screen_text()
-    );
-    t.send("q");
-    assert!(t.wait_exit().success());
-
-    let raw = String::from_utf8_lossy(&t.raw).into_owned();
-    let colours = colour_sgr(&raw);
-    assert!(
-        colours.is_empty(),
-        "NO_COLOR still emitted colour: {colours:?}"
-    );
-    // Mono is not "no styling": with no background to highlight with, the
-    // theme substitutes reverse video for the cursor row. Losing that would
-    // leave the selection invisible on exactly the terminals this mode is for.
-    assert!(
-        raw.contains("\x1b[7m"),
-        "mono drew no reverse video, so the selection is unmarked"
-    );
-}
-
-/// The other route into mono, and the one that has to beat a `COLORTERM` the
-/// environment still advertises — `detect_color_mode` reads `TERM=dumb`
-/// first.
-#[test]
-fn term_dumb_renders_the_dashboard_in_mono() {
-    let mut t = Tui::spawn_with_env(&[], &[("TERM", Some("dumb"))]);
-    t.wait_for("cards", |s| s.contains("Mock GPU 0"));
-    t.wait_for("process table", |s| s.contains("COMMAND"));
-    t.send("q");
-    assert!(t.wait_exit().success());
-
-    let colours = colour_sgr(&String::from_utf8_lossy(&t.raw));
-    assert!(
-        colours.is_empty(),
-        "TERM=dumb still emitted colour (COLORTERM won): {colours:?}"
-    );
-}
-
-/// A terminal that never claimed truecolor gets the 256-colour palette. This
-/// is the regression that matters: a 24-bit escape sent to a 256-colour
-/// terminal is exactly what `theme::paint`'s quantization exists to prevent,
-/// and it is invisible in every other test because the suite pins
-/// `COLORTERM=truecolor`.
-#[test]
-fn without_colorterm_the_app_quantizes_to_the_256_colour_palette() {
-    let mut t = Tui::spawn_with_env(&[], &[("COLORTERM", None)]);
-    t.wait_for("cards", |s| s.contains("Mock GPU 0"));
-    t.wait_for("meters", |s| meter_line(s, "GPU ", "■·").is_some());
-    t.send("q");
-    assert!(t.wait_exit().success());
-
-    let colours = colour_sgr(&String::from_utf8_lossy(&t.raw));
-    let truecolor: Vec<&String> = colours
-        .iter()
-        .filter(|c| *c == "38;2" || *c == "48;2")
-        .collect();
-    assert!(
-        truecolor.is_empty(),
-        "24-bit colour on a terminal that only advertised 256: {} sequences",
-        truecolor.len()
-    );
-    // Both halves of the frame are painted, so demand both: an app that only
-    // ever set a foreground would pass a foreground-only assertion while its
-    // backgrounds went out unquantized.
-    assert!(
-        colours.iter().any(|c| c == "38;5"),
-        "no 256-palette foreground was ever set: {colours:?}"
-    );
-    assert!(
-        colours.iter().any(|c| c == "48;5"),
-        "no 256-palette background was ever set: {colours:?}"
-    );
-}
-
 /// Minimal libc-free SIGTERM via /bin/kill would need a shell; declare the
 /// one libc fn we need instead of pulling the libc crate into dev-deps.
+#[cfg(unix)]
 unsafe fn libc_kill(pid: i32) {
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;

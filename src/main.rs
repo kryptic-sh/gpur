@@ -115,6 +115,9 @@ fn main() -> Result<()> {
     // try_init has already put the tty into raw mode + alt screen; on these
     // two paths the panic hook and signal teardown are not installed yet, so
     // restore explicitly before bailing (restore_extras is idempotent).
+    // Crossterm's Windows console input uses native key events; its kitty
+    // push command unconditionally returns Unsupported on that platform.
+    #[cfg(not(windows))]
     if let Err(e) = hjkl_kitty::enable(&mut stdout()) {
         return Err(fail_setup(e, "enabling kitty keyboard protocol"));
     }
@@ -179,6 +182,7 @@ fn open_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
 /// Safe to call more than once — both sequences are idempotent pops.
 fn restore_extras() {
     let _ = crossterm::execute!(stdout(), DisableMouseCapture);
+    #[cfg(not(windows))]
     let _ = hjkl_kitty::disable(&mut stdout());
 }
 
