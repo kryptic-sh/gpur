@@ -16,6 +16,9 @@ pub struct GpurConfig {
     pub history_len: usize,
     /// Graph glyph set: "braille" (default), "block", or "ascii".
     pub graphs: String,
+    /// don't paint the page background: let the terminal's own background
+    /// (transparency, blur, wallpaper) show through
+    pub transparent: bool,
 }
 
 impl Default for GpurConfig {
@@ -25,6 +28,7 @@ impl Default for GpurConfig {
             theme: None,
             history_len: 300,
             graphs: "braille".into(),
+            transparent: false,
         }
     }
 }

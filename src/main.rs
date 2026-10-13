@@ -56,7 +56,10 @@ fn main() -> Result<()> {
     let tick_ms = app::clamp_tick_ms(cli.tick_ms.or(saved_tick).unwrap_or(cfg.tick_ms));
     let theme_path = cli.theme.clone().or(cfg.theme.clone());
 
-    let theme = theme::load(theme_path.as_deref(), theme::detect_color_mode())?;
+    let mut theme = theme::load(theme_path.as_deref(), theme::detect_color_mode())?;
+    if cfg.transparent {
+        theme.bg = ratatui::style::Color::Reset;
+    }
     // The session carries this along so a re-detect after repeated poll
     // failures re-runs exactly this detection — see `App::poll_inner`.
     let source = backend::BackendSource::from_cli(cli.mock, cli.replay.clone());

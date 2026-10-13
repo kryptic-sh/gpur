@@ -1066,7 +1066,10 @@ fn draw_waveform_cells(
                         GraphStyle::Block if half == 0 => {
                             (EIGHTHS[in_cell], Style::new().fg(color))
                         }
-                        GraphStyle::Block if t.mode == ColorMode::Mono => {
+                        GraphStyle::Block
+                            if t.mode == ColorMode::Mono
+                                || t.bg == ratatui::style::Color::Reset =>
+                        {
                             // The complement trick below needs two distinct
                             // colors, and Mono has none: `paint` answers
                             // `Color::Reset` for the bar and for the page

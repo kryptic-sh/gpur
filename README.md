@@ -98,6 +98,9 @@ history_len = 300
 graphs = "braille"
 # hjkl-theme TOML; omit for the built-in theme
 theme = "/path/to/theme.toml"
+# don't paint the page background: let the terminal's own background
+# (transparency, blur, wallpaper) show through
+transparent = false
 ```
 
 ### Persisted UI state
