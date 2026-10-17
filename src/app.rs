@@ -1427,6 +1427,12 @@ impl App {
 
     /// Apply a key action. Returns true when the app should quit.
     pub fn apply(&mut self, action: Action) -> bool {
+        // A hidden process pane must not take focus, open its filter or
+        // signal a row nobody can see. Its keys are left out of the help and
+        // footer too, so ignoring them here is what the screen advertises.
+        if action.needs_procs() && !self.show_processes {
+            return false;
+        }
         match action {
             Action::Quit => return true,
             Action::TogglePause => self.paused = !self.paused,
@@ -1459,11 +1465,7 @@ impl App {
                     }
                 }
             }
-            Action::FocusProcs => {
-                if self.show_processes {
-                    self.focus = Focus::Procs;
-                }
-            }
+            Action::FocusProcs => self.focus = Focus::Procs,
             Action::Help => self.show_help = true,
             Action::ProcScrollDown => self.proc_down(),
             Action::ProcScrollUp => self.proc_up(),
@@ -1476,11 +1478,9 @@ impl App {
                 self.rebuild_proc_view();
             }
             Action::FilterOpen => {
-                if self.show_processes {
-                    self.focus = Focus::Procs;
-                    self.filter_input = self.filter.clone();
-                    self.input_mode = InputMode::Filter;
-                }
+                self.focus = Focus::Procs;
+                self.filter_input = self.filter.clone();
+                self.input_mode = InputMode::Filter;
             }
             Action::KillTerm | Action::KillForce => {
                 self.request_kill(matches!(action, Action::KillForce))
@@ -1978,6 +1978,23 @@ mod tests {
         app.apply(Action::KillTerm);
         assert!(app.pending_kill.is_some());
         assert!(app.input_mode == InputMode::Confirm);
+    }
+
+    #[test]
+    fn a_hidden_process_pane_ignores_its_keys() {
+        let mut app = app_with(Box::new(LocalBackend));
+        app.show_processes = false;
+        for action in [Action::FocusProcs, Action::FilterOpen, Action::KillTerm] {
+            app.apply(action);
+            assert!(app.focus == Focus::Gpus);
+            assert!(app.input_mode == InputMode::Normal);
+            assert!(app.pending_kill.is_none());
+        }
+        // ...and the same keys still work once the pane is shown.
+        app.show_processes = true;
+        app.apply(Action::FilterOpen);
+        assert!(app.focus == Focus::Procs);
+        assert!(app.input_mode == InputMode::Filter);
     }
 
     /// The process cache is refreshed with `ProcessesToUpdate::Some`, and

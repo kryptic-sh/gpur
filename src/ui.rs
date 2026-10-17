@@ -82,7 +82,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled("  (Enter apply · empty clears · Esc cancel)", app.theme.dim),
         ])
     } else {
-        Line::styled(crate::keys::footer_hints(), app.theme.dim)
+        Line::styled(crate::keys::footer_hints(app.show_processes), app.theme.dim)
     };
     frame.render_widget(Paragraph::new(footer_line), footer);
 
@@ -117,7 +117,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let t = &app.theme;
-    let rows = crate::keys::help_rows();
+    let rows = crate::keys::help_rows(app.show_processes);
     let key_w = rows
         .iter()
         .map(|(k, _)| k.chars().count())

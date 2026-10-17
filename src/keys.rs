@@ -39,6 +39,24 @@ pub enum Action {
     Help,
 }
 
+impl Action {
+    /// Whether the action works on the process pane, and so means nothing
+    /// while config `show_processes = false` hides it.
+    pub fn needs_procs(&self) -> bool {
+        matches!(
+            self,
+            Action::FocusProcs
+                | Action::ProcScrollDown
+                | Action::ProcScrollUp
+                | Action::SortCycle
+                | Action::SortReverse
+                | Action::FilterOpen
+                | Action::KillTerm
+                | Action::KillForce
+        )
+    }
+}
+
 /// Single source of truth: feeds the keymap, the `?` overlay and the footer.
 ///
 /// The 4th field is the footer chunk. It is set on the *first* chord of a
@@ -130,11 +148,21 @@ const BINDS: &[(&str, Action, &str, Option<&str>)] = &[
 /// entry per digit, but the overlay and footer describe them as one row.
 const DIGITS: (&str, &str, &str) = ("0-9", "focus/select GPU N; same digit folds it", "0-9 gpu");
 
+type Bind = (&'static str, Action, &'static str, Option<&'static str>);
+
+/// The binds worth advertising: all of them, or without the process-pane
+/// ones when that pane is hidden and they would do nothing.
+fn shown_binds(show_procs: bool) -> impl Iterator<Item = &'static Bind> {
+    BINDS
+        .iter()
+        .filter(move |(_, action, _, _)| show_procs || !action.needs_procs())
+}
+
 /// Rows for the `?` overlay: the bind table (aliases folded together by
 /// description) plus entries the trie can't express.
-pub fn help_rows() -> Vec<(String, &'static str)> {
+pub fn help_rows(show_procs: bool) -> Vec<(String, &'static str)> {
     let mut rows: Vec<(String, &'static str)> = Vec::new();
-    for (chord, _, desc, _) in BINDS {
+    for (chord, _, desc, _) in shown_binds(show_procs) {
         if let Some(row) = rows.iter_mut().find(|(_, d)| d == desc) {
             row.0.push_str(&format!(" {chord}"));
         } else {
@@ -142,19 +170,21 @@ pub fn help_rows() -> Vec<(String, &'static str)> {
         }
     }
     rows.push((DIGITS.0.into(), DIGITS.1));
-    rows.push(("y".into(), "confirm kill dialog (any other key cancels)"));
+    if show_procs {
+        rows.push(("y".into(), "confirm kill dialog (any other key cancels)"));
+    }
     rows.push(("wheel/click".into(), "scroll + focus pane; click selects"));
     rows
 }
 
 /// The persistent one-line footer, derived from [`BINDS`] so a new binding
-/// never has to be transcribed by hand. Built once: the binding table is
-/// const, so re-formatting the same string every frame is pure waste.
-pub fn footer_hints() -> &'static str {
-    static HINTS: OnceLock<String> = OnceLock::new();
-    HINTS.get_or_init(|| {
+/// never has to be transcribed by hand. Built once per variant: the binding
+/// table is const, so re-formatting the same string every frame is pure waste.
+pub fn footer_hints(show_procs: bool) -> &'static str {
+    static HINTS: [OnceLock<String>; 2] = [OnceLock::new(), OnceLock::new()];
+    HINTS[usize::from(show_procs)].get_or_init(|| {
         let mut out = String::new();
-        for short in BINDS.iter().filter_map(|(_, _, _, s)| *s) {
+        for short in shown_binds(show_procs).filter_map(|(_, _, _, s)| *s) {
             out.push(' ');
             out.push_str(short);
             out.push(' ');
@@ -194,7 +224,7 @@ mod tests {
 
     #[test]
     fn footer_advertises_help_and_stays_one_line() {
-        let f = footer_hints();
+        let f = footer_hints(true);
         assert!(f.contains("? help"), "help overlay must be discoverable");
         assert!(!f.contains('\n'));
         // Fits an 80-column terminal only when truncated; keep it sane for
@@ -212,11 +242,11 @@ mod tests {
                     chord.starts_with('<') || s.starts_with(*chord),
                     "footer chunk {s:?} does not lead with its chord {chord:?}"
                 );
-                assert!(footer_hints().contains(s), "footer dropped {s:?}");
+                assert!(footer_hints(true).contains(s), "footer dropped {s:?}");
             }
         }
         // Nothing in the footer that isn't a binding.
-        let footer = footer_hints();
+        let footer = footer_hints(true);
         for chunk in footer.split("  ").map(str::trim) {
             assert!(
                 chunk == DIGITS.2 || BINDS.iter().any(|(_, _, _, s)| *s == Some(chunk)),
@@ -229,15 +259,42 @@ mod tests {
     /// per-frame rebuild is the waste the cache exists to remove.
     #[test]
     fn the_footer_is_built_once() {
-        assert!(
-            std::ptr::eq(footer_hints(), footer_hints()),
-            "footer_hints() rebuilt its string"
-        );
+        for show_procs in [true, false] {
+            assert!(
+                std::ptr::eq(footer_hints(show_procs), footer_hints(show_procs)),
+                "footer_hints({show_procs}) rebuilt its string"
+            );
+        }
+    }
+
+    /// `show_processes = false` turns every process-pane key into a no-op,
+    /// so neither the footer nor the overlay may still offer one.
+    #[test]
+    fn a_hidden_process_pane_advertises_none_of_its_keys() {
+        let footer = footer_hints(false);
+        assert!(footer.contains("? help"), "{footer}");
+        assert!(footer.contains("q quit"), "{footer}");
+        let rows = help_rows(false);
+        for (chord, action, desc, short) in BINDS {
+            if !action.needs_procs() {
+                continue;
+            }
+            if let Some(s) = short {
+                assert!(!footer.contains(s), "footer still offers {s:?}");
+                assert!(footer_hints(true).contains(s), "{s:?} never shown");
+            }
+            assert!(
+                !rows.iter().any(|(_, d)| d == desc),
+                "overlay still offers {chord} ({desc})"
+            );
+        }
+        assert!(!rows.iter().any(|(k, _)| k == "y"), "kill dialog key shown");
+        assert!(rows.iter().any(|(k, _)| k == "0-9"));
     }
 
     #[test]
     fn help_rows_fold_aliases_and_cover_untried_keys() {
-        let rows = help_rows();
+        let rows = help_rows(true);
         let quit = rows.iter().find(|(_, d)| *d == "quit").unwrap();
         assert_eq!(quit.0, "q <Esc> <C-c>");
         for chord in ["0-9", "y", "wheel/click", "?"] {

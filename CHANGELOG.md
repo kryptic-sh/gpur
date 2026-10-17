@@ -8,6 +8,14 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **`show_processes` config option.** Setting `show_processes = false` in
+  `config.toml` hides the process list so the GPU cards take the full height.
+  The process-pane keys (`p`, `/`, `s`, `r`, `x`/`X`, `J`/`K`, PgUp/PgDn) are
+  then ignored and dropped from the footer and the `?` overlay. `--json` output
+  is unchanged.
+
 ## [0.13.5] - 2026-10-14
 
 ### Added
