@@ -9,14 +9,14 @@ the hjkl stack.
 
 ![gpur running with three mock GPUs](assets/screenshot.png)
 
-> **Status: beta.** The AMD Linux path is the one exercised on real hardware.
-> The NVIDIA, Intel, macOS, and Windows backends are implemented, and their pure
-> parsing layers have unit tests over recorded fixtures (PDH instance names in
-> `windows.rs`; fdinfo and sysfs trees in `linux.rs`, `amd.rs`, `intel.rs`), but
-> no CI runner has a usable GPU: the CI backend probe accepts the "no supported
-> GPU backend" exit as success, so it proves the graceful no-hardware path and
-> nothing about live data. The PTY integration tests are Unix-only; Windows runs
-> the unit and smoke suites. Real-GPU reports are very welcome.
+> **Status: beta.** Two paths are exercised on real hardware: AMD on Linux
+> (amdgpu) and AMD on Windows (pdh). The NVIDIA, Intel, and macOS backends are
+> implemented, and their pure parsing layers have unit tests over recorded
+> fixtures (fdinfo and sysfs trees in `linux.rs`, `amd.rs`, `intel.rs`), but no
+> CI runner has a usable GPU: the CI backend probe accepts the "no supported GPU
+> backend" exit as success, so it proves the graceful no-hardware path and
+> nothing about live data. The PTY integration tests run on Linux, macOS, and
+> Windows (ConPTY). Real-GPU reports are very welcome.
 
 ## Install
 
@@ -41,7 +41,7 @@ gpur --json           # machine-readable snapshot (waybar/polybar, monitoring)
 gpur --log x.jsonl    # append one JSON record per poll (benchmark/sensor logs)
 gpur --replay x.jsonl # re-drive the TUI from a --log recording
 gpur --graphs ascii   # graph glyphs: braille (default) | block | ascii
-gpur --tick-ms 250    # poll interval in ms, floor 50 (overrides the config)
+gpur --tick-ms 250    # poll interval in ms, 50-10000 (overrides the config)
 gpur -c my.toml       # --config: alternate config.toml
 gpur -t my-theme.toml # --theme: theme file (overrides the config)
 gpur --no-splash      # skip the startup splash
@@ -66,10 +66,12 @@ rather than a panic.
 | `s` / `r`              | cycle process sort column / reverse it                      |
 | `/`                    | filter processes (Enter applies, empty clears, Esc cancels) |
 | `x` / `X`              | SIGTERM / SIGKILL the selected process (`y` confirms)       |
-| `+`/`=` / `-`          | poll rate faster/slower (floor 50 ms)                       |
+| `+`/`=` / `-`          | poll rate faster/slower (50 ms to 10 s)                     |
 | wheel / click          | scroll + focus the pane under the cursor; click selects     |
 
-The filter input also takes `Ctrl-U` (clear) and `Ctrl-W` (delete word).
+The filter input also takes `Ctrl-U` (clear) and `Ctrl-W` (delete word). With
+`show_processes = false` the process-pane keys (`p`, `J`/`K`, `s`/`r`, `/`,
+`x`/`X`) are ignored and left out of the footer and help overlay.
 
 **Killing processes is deliberately restricted.** `x`/`X` only open the confirm
 dialog when the process pane has focus (press `p` first) — otherwise the status
@@ -83,11 +85,12 @@ instead of signalled.
 ## Configuration
 
 `gpur` reads `$XDG_CONFIG_HOME/gpur/config.toml` (falls back to
-`~/.config/gpur/config.toml`). No file is written automatically; missing file
-means built-in defaults.
+`~/.config/gpur/config.toml`), on Windows and macOS too, not `%APPDATA%` or
+`~/Library`. No file is written automatically; missing file means built-in
+defaults.
 
 ```toml
-# poll interval in milliseconds; floor 50
+# poll interval in milliseconds; clamped to 50-10000
 tick_ms = 1000
 # MINIMUM history samples kept per GPU. Wide terminals keep more: braille
 # graphs consume two samples per column, so retention grows with the widest
@@ -101,16 +104,17 @@ theme = "/path/to/theme.toml"
 # don't paint the page background: let the terminal's own background
 # (transparency, blur, wallpaper) show through
 transparent = false
-# show the process list below the GPU cards
+# show the process list below the GPU cards; false gives the cards the
+# full height and disables the process-pane keys
 show_processes = true
 ```
 
 ### Persisted UI state
 
-On a clean quit gpur writes `state.json` into its cache directory
-(`$XDG_CACHE_HOME/gpur/state.json` on Linux, the platform cache dir elsewhere).
-It holds folded cards, the process sort column and direction, and the poll rate
-— it is not a config file and is safe to delete.
+On a clean quit gpur writes `state.json` into its cache directory,
+`$XDG_CACHE_HOME/gpur/state.json` (falls back to `~/.cache/gpur/state.json`), on
+every platform. It holds folded cards, the process sort column and direction,
+and the poll rate — it is not a config file and is safe to delete.
 
 Folds are recorded per device (`folded_devices`), keyed by the identity the
 backend reports — NVML UUID, PCI address, IOKit registry entry id, adapter LUID
@@ -141,7 +145,7 @@ meters, waveform gradients, and highlights all derive from the palette.
 | nvml    | Linux, Windows | NVML (dynamic load)                | done   |
 | amdgpu  | Linux          | sysfs `/sys/class/drm` + fdinfo    | done   |
 | intel   | Linux          | i915/xe fdinfo + hwmon + PCI sysfs | beta   |
-| pdh     | Windows        | GPU Engine/Adapter Memory + DXGI   | beta   |
+| pdh     | Windows        | GPU Engine/Adapter Memory + DXGI   | done   |
 | ioaccel | macOS          | IOAccelerator PerfStats (IOKit)    | beta   |
 | mock    | all            | deterministic waves (`--mock`)     | done   |
 
