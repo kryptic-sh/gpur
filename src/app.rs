@@ -575,6 +575,8 @@ pub struct App {
     pub history_len: usize,
     pub selected: usize,
     pub paused: bool,
+    /// Config `show_processes`: false collapses the process pane to nothing.
+    pub show_processes: bool,
     pub tick_ms: u64,
     pub theme: UiTheme,
     pub started: Instant,
@@ -682,6 +684,7 @@ impl App {
             history_len: clamp_history_len(history_len),
             selected: 0,
             paused: false,
+            show_processes: true,
             tick_ms,
             theme,
             started: Instant::now(),
@@ -1456,7 +1459,11 @@ impl App {
                     }
                 }
             }
-            Action::FocusProcs => self.focus = Focus::Procs,
+            Action::FocusProcs => {
+                if self.show_processes {
+                    self.focus = Focus::Procs;
+                }
+            }
             Action::Help => self.show_help = true,
             Action::ProcScrollDown => self.proc_down(),
             Action::ProcScrollUp => self.proc_up(),
@@ -1469,9 +1476,11 @@ impl App {
                 self.rebuild_proc_view();
             }
             Action::FilterOpen => {
-                self.focus = Focus::Procs;
-                self.filter_input = self.filter.clone();
-                self.input_mode = InputMode::Filter;
+                if self.show_processes {
+                    self.focus = Focus::Procs;
+                    self.filter_input = self.filter.clone();
+                    self.input_mode = InputMode::Filter;
+                }
             }
             Action::KillTerm | Action::KillForce => {
                 self.request_kill(matches!(action, Action::KillForce))

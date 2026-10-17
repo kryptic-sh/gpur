@@ -102,6 +102,7 @@ fn main() -> Result<()> {
             log,
         },
     );
+    app.show_processes = cfg.show_processes;
     if headless {
         return snapshot(&mut app, cli.json, tick_ms);
     }

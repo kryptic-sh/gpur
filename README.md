@@ -101,6 +101,8 @@ theme = "/path/to/theme.toml"
 # don't paint the page background: let the terminal's own background
 # (transparency, blur, wallpaper) show through
 transparent = false
+# show the process list below the GPU cards
+show_processes = true
 ```
 
 ### Persisted UI state

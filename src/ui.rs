@@ -53,7 +53,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(Line::from(head)), header);
     }
 
-    let proc_height = proc_pane_height(body.height, app.procs.len());
+    let proc_height = if app.show_processes {
+        proc_pane_height(body.height, app.procs.len())
+    } else {
+        0
+    };
     let [gpus_area, proc_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(proc_height)]).areas(body);
 
