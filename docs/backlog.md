@@ -22,11 +22,6 @@ the last holdout, because a waveform has no glyph for absent — in 0.11.1.
 
 ---
 
-## `show_processes` follow-up — 2026-10-17
-
-- The process table is still polled and sorted while `show_processes = false`
-  hides it. Cheap, but skippable if it ever shows up in a profile.
-
 ## Transparent background follow-up — 2026-10-14
 
 - `transparent` is config-only: there is no `--transparent` CLI flag, and

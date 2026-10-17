@@ -102,10 +102,12 @@ fn main() -> Result<()> {
             log,
         },
     );
-    app.show_processes = cfg.show_processes;
     if headless {
         return snapshot(&mut app, cli.json, tick_ms);
     }
+    // TUI only: `--once` and `--json` print the process table regardless,
+    // and this setting also stops it being collected.
+    app.show_processes = cfg.show_processes;
     if let Some(s) = &state {
         app.restore_state(s);
     }

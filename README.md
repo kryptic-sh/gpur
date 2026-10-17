@@ -105,7 +105,8 @@ theme = "/path/to/theme.toml"
 # (transparency, blur, wallpaper) show through
 transparent = false
 # show the process list below the GPU cards; false gives the cards the
-# full height and disables the process-pane keys
+# full height, disables the process-pane keys and skips collecting the
+# table (a --log recording still gets it; --once/--json ignore this)
 show_processes = true
 ```
 

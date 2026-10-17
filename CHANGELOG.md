@@ -8,6 +8,13 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **`show_processes = false` also stops collecting the process table.** The TUI
+  no longer reads per-process user, CPU, memory and command line for a list
+  nobody can see. `--log` recordings still carry the full table, and `--once`
+  and `--json` ignore the setting.
+
 ## [0.13.6] - 2026-10-17
 
 ### Added

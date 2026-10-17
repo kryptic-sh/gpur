@@ -575,7 +575,8 @@ pub struct App {
     pub history_len: usize,
     pub selected: usize,
     pub paused: bool,
-    /// Config `show_processes`: false collapses the process pane to nothing.
+    /// Config `show_processes`: false collapses the process pane to nothing
+    /// and, without `--log`, stops collecting the table behind it.
     pub show_processes: bool,
     pub tick_ms: u64,
     pub theme: UiTheme,
@@ -934,7 +935,11 @@ impl App {
             }
         }
         self.evict_absent_devices();
-        self.refresh_processes();
+        // A hidden pane has nobody to read the table, unless a recording
+        // does: `--log` keeps the full table whatever the screen shows.
+        if self.show_processes || self.log.is_some() {
+            self.refresh_processes();
+        }
         if log {
             self.write_log();
         }
@@ -1995,6 +2000,57 @@ mod tests {
         app.apply(Action::FilterOpen);
         assert!(app.focus == Focus::Procs);
         assert!(app.input_mode == InputMode::Filter);
+    }
+
+    /// A hidden pane is not worth the per-process reads behind it, but a
+    /// `--log` recording still is: it promises the full table.
+    #[test]
+    fn a_hidden_process_pane_skips_collection_unless_logging() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingBackend(Arc<AtomicUsize>);
+
+        impl GpuBackend for CountingBackend {
+            fn name(&self) -> &'static str {
+                "counting"
+            }
+            fn poll(&mut self) -> anyhow::Result<Vec<GpuSnapshot>> {
+                Ok(Vec::new())
+            }
+            fn processes(&mut self) -> Vec<crate::backend::GpuProcess> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                vec![crate::backend::GpuProcess {
+                    pid: std::process::id(),
+                    ..Default::default()
+                }]
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut app = app_with(Box::new(CountingBackend(calls.clone())));
+        app.show_processes = false;
+        app.poll();
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "hidden pane was collected");
+        assert!(app.all_procs.is_empty());
+
+        let path = std::env::temp_dir().join(format!("gpur-hidden-{}.jsonl", std::process::id()));
+        app.log = Some(std::io::BufWriter::new(
+            std::fs::File::create(&path).unwrap(),
+        ));
+        app.poll();
+        app.log = None;
+        let recorded = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "--log skipped the table");
+        assert!(
+            recorded.contains(&format!("\"pid\":{}", std::process::id())),
+            "{recorded}"
+        );
+
+        app.show_processes = true;
+        app.poll();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a shown pane went stale");
     }
 
     /// The process cache is refreshed with `ProcessesToUpdate::Some`, and
