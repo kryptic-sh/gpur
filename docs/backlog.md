@@ -22,6 +22,22 @@ the last holdout, because a waveform has no glyph for absent — in 0.11.1.
 
 ---
 
+## `show_processes` follow-up — 2026-10-17
+
+Merged from PR #2 without these; none is a correctness problem.
+
+- No `CHANGELOG.md` entry under `[Unreleased]` for the `show_processes` config
+  option.
+- With `show_processes = false` the help overlay (`keys.rs` bindings table)
+  still lists `p`, `/`, sort, scroll and kill keys, all now no-ops, and
+  `App::request_kill` answers "focus the process pane first (p)", pointing at a
+  key that does nothing. Either hide those rows and reword the status when the
+  pane is off, or accept it.
+- No test covers the option: e.g. that `Action::FocusProcs` and
+  `Action::FilterOpen` leave `focus` on `Focus::Gpus` when it is off.
+- The process table is still polled and sorted while hidden. Cheap, but
+  skippable if it ever shows up in a profile.
+
 ## Transparent background follow-up — 2026-10-14
 
 - `transparent` is config-only: there is no `--transparent` CLI flag, and
