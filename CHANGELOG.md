@@ -8,6 +8,8 @@ and this project adheres to
 
 ## [Unreleased]
 
+## [0.13.7] - 2026-10-17
+
 ### Changed
 
 - **`show_processes = false` also stops collecting the process table.** The TUI
@@ -1026,7 +1028,8 @@ whose "Settled by review" section records what was checked and still holds.
 - CI (`ci.yml`) with lint/test/smoke across Linux/macOS/Windows and tag-driven
   release workflow (`release.yml`).
 
-[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.13.6...HEAD
+[Unreleased]: https://github.com/kryptic-sh/gpur/compare/v0.13.7...HEAD
+[0.13.7]: https://github.com/kryptic-sh/gpur/compare/v0.13.6...v0.13.7
 [0.13.6]: https://github.com/kryptic-sh/gpur/compare/v0.13.5...v0.13.6
 [0.13.5]: https://github.com/kryptic-sh/gpur/compare/v0.13.4...v0.13.5
 [0.13.4]: https://github.com/kryptic-sh/gpur/compare/v0.13.3...v0.13.4
