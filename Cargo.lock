@@ -695,7 +695,7 @@ dependencies = [
  "serde_json",
  "signal-hook 0.4.4",
  "sysinfo",
- "vt100",
+ "vt1k",
  "windows",
 ]
 
@@ -2158,12 +2158,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "vt100"
-version = "0.16.2"
+name = "vt1k"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
+checksum = "77a4729325d35a4b3d49c0f425689f72e3368908a74678c2f8be476d25e00040"
 dependencies = [
- "itoa",
  "unicode-width",
  "vte",
 ]

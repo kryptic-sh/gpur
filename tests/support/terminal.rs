@@ -39,10 +39,10 @@ impl Drop for Sandbox {
 }
 
 pub(super) struct Tui {
-    pub(super) parser: vt100::Parser,
+    pub(super) parser: vt1k::Parser,
     rx: mpsc::Receiver<Result<Vec<u8>, String>>,
     output_closed: bool,
-    service: Arc<Mutex<vt100::Parser<CursorReplies>>>,
+    service: Arc<Mutex<vt1k::Parser<CursorReplies>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub(super) child: ChildGuard,
     /// Every byte the app ever wrote, for teardown-sequence assertions.
@@ -129,9 +129,9 @@ impl Tui {
         let writer = Arc::new(Mutex::new(pty.master.take_writer().unwrap()));
         let replies = writer.clone();
         let (tx, rx) = mpsc::channel();
-        let service = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
-            ROWS,
-            COLS,
+        let service = Arc::new(Mutex::new(vt1k::Parser::new_with_callbacks(
+            dim(ROWS),
+            dim(COLS),
             0,
             CursorReplies(Vec::new(), (ROWS, COLS)),
         )));
@@ -178,7 +178,7 @@ impl Tui {
         });
 
         Tui {
-            parser: vt100::Parser::new(ROWS, COLS, 0),
+            parser: vt1k::Parser::new(dim(ROWS), dim(COLS), 0),
             rx,
             output_closed: false,
             service,
@@ -229,7 +229,7 @@ impl Tui {
         // ConPTY emits wrapped rows; contents() joins those logical lines.
         let screen = self.parser.screen();
         screen
-            .rows(0, screen.size().1)
+            .rows(0, screen.size().1.get())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -329,9 +329,9 @@ impl Tui {
     pub(super) fn resize(&mut self, rows: u16, cols: u16) {
         {
             let mut service = self.service.lock().unwrap();
-            // vt100 underflows while wrapping a one-row grid. Keep its
-            // scratch grid larger, but clamp cursor replies to the real PTY.
-            service.screen_mut().set_size(rows.max(2), cols.max(2));
+            // Cursor replies stay inside the real PTY, as the cursor can
+            // wait past the last column.
+            service.screen_mut().set_size(dim(rows), dim(cols));
             service.callbacks_mut().1 = (rows, cols);
         }
         let master = self.master.take().expect("open PTY");
@@ -416,11 +416,16 @@ fn bounded<T: Send + 'static>(
         })
 }
 
+/// A screen dimension as vt1k takes it.
+pub(super) fn dim(n: u16) -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(n).expect("a screen dimension is at least 1")
+}
+
 struct CursorReplies(Vec<u8>, (u16, u16));
-impl vt100::Callbacks for CursorReplies {
+impl vt1k::Callbacks for CursorReplies {
     fn unhandled_csi(
         &mut self,
-        screen: &mut vt100::Screen,
+        screen: &mut vt1k::Screen,
         i1: Option<u8>,
         i2: Option<u8>,
         params: &[&[u16]],
@@ -442,8 +447,12 @@ impl vt100::Callbacks for CursorReplies {
 
 #[test]
 fn cursor_queries_are_fragmented_repeated_and_position_aware() {
-    let mut p =
-        vt100::Parser::new_with_callbacks(ROWS, COLS, 0, CursorReplies(Vec::new(), (ROWS, COLS)));
+    let mut p = vt1k::Parser::new_with_callbacks(
+        dim(ROWS),
+        dim(COLS),
+        0,
+        CursorReplies(Vec::new(), (ROWS, COLS)),
+    );
     for chunk in [
         b"\x1b[4;9H\x1b[".as_slice(),
         b"6",
@@ -455,7 +464,7 @@ fn cursor_queries_are_fragmented_repeated_and_position_aware() {
     assert_eq!(p.callbacks().0, b"\x1b[4;9R\x1b[4;12R");
     p.callbacks_mut().0.clear();
     p.callbacks_mut().1 = (1, 1);
-    p.screen_mut().set_size(2, 2);
+    p.screen_mut().set_size(dim(2), dim(2));
     p.process(b"abcdef\x1b[6n");
     assert_eq!(p.callbacks().0, b"\x1b[1;1R");
 }

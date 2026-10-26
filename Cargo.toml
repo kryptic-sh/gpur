@@ -62,4 +62,4 @@ signal-hook = "0.4"
 
 [dev-dependencies]
 portable-pty = "0.9"
-vt100 = "0.16"
+vt1k = "0.1"

@@ -227,7 +227,7 @@ fn mono_process_table_ready(screen: &str, pid: u32) -> bool {
 
 #[test]
 fn mono_process_table_waits_for_fragmented_selected_row() {
-    let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+    let mut parser = vt1k::Parser::new(dim(ROWS), dim(COLS), 0);
     parser.process(b"Mock GPU 0\r\nPID USER COMMAND");
     assert!(!mono_process_table_ready(
         &parser.screen().contents(),
@@ -331,7 +331,7 @@ fn without_colorterm_the_app_quantizes_to_the_256_colour_palette() {
         assert!(
             matches!(
                 card.fgcolor(),
-                vt100::Color::Idx(183) | vt100::Color::Rgb(215, 175, 255)
+                vt1k::Color::Idx(183) | vt1k::Color::Rgb(215, 175, 255)
             ),
             "unquantized foreground: {:?}",
             card.fgcolor()
@@ -339,7 +339,7 @@ fn without_colorterm_the_app_quantizes_to_the_256_colour_palette() {
         assert!(
             matches!(
                 card.bgcolor(),
-                vt100::Color::Idx(59) | vt100::Color::Rgb(95, 95, 95)
+                vt1k::Color::Idx(59) | vt1k::Color::Rgb(95, 95, 95)
             ),
             "unquantized background: {:?}",
             card.bgcolor()
@@ -348,7 +348,7 @@ fn without_colorterm_the_app_quantizes_to_the_256_colour_palette() {
             for x in 0..COLS {
                 let cell = t.parser.screen().cell(y, x).unwrap();
                 for color in [cell.fgcolor(), cell.bgcolor()] {
-                    if let vt100::Color::Rgb(r, g, b) = color {
+                    if let vt1k::Color::Rgb(r, g, b) = color {
                         let levels = [0, 95, 135, 175, 215, 255];
                         let cube = [r, g, b].iter().all(|v| levels.contains(v));
                         let gray = r == g && g == b && (8..=238).contains(&r) && (r - 8) % 10 == 0;
@@ -389,7 +389,7 @@ fn without_colorterm_the_app_quantizes_to_the_256_colour_palette() {
 
 #[test]
 fn windows_terminal_colour_detection_preserves_explicit_preferences() {
-    use vt100::Color::{Default, Idx, Rgb};
+    use vt1k::Color::{Default, Idx, Rgb};
 
     let wt = Some("gpur-test-windows-terminal");
     for (term, colorterm, no_color, session, expected) in [
@@ -449,19 +449,19 @@ fn windows_terminal_colour_detection_preserves_explicit_preferences() {
     }
 }
 
-fn assert_mono_screen(screen: &vt100::Screen) {
+fn assert_mono_screen(screen: &vt1k::Screen) {
     let mut reversed = false;
     for y in 0..ROWS {
         for x in 0..COLS {
             let cell = screen.cell(y, x).unwrap();
             assert_eq!(
                 cell.fgcolor(),
-                vt100::Color::Default,
+                vt1k::Color::Default,
                 "foreground at {x},{y}"
             );
             assert_eq!(
                 cell.bgcolor(),
-                vt100::Color::Default,
+                vt1k::Color::Default,
                 "background at {x},{y}"
             );
             reversed |= cell.inverse();

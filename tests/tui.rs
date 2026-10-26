@@ -1,4 +1,4 @@
-//! PTY integration tests against the real binary and a vt100 screen.
+//! PTY integration tests against the real binary and a vt1k screen.
 #[path = "support/mouse.rs"]
 mod mouse;
 #[path = "support/rendering.rs"]
@@ -6,7 +6,7 @@ mod rendering;
 #[path = "support/terminal.rs"]
 mod terminal;
 use std::time::{Duration, Instant};
-use terminal::{Sandbox, Tui};
+use terminal::{Sandbox, Tui, dim};
 const COLS: u16 = 120;
 const ROWS: u16 = 36;
 
@@ -34,7 +34,7 @@ fn proc_pids(screen: &str) -> Vec<u32> {
 /// Text of one screen row. Mouse coordinates are row numbers, so anything
 /// feeding them has to come off the cell grid rather than out of
 /// `screen_text().lines()`, whose split need not line up with it.
-fn row_text(screen: &vt100::Screen, row: u16) -> String {
+fn row_text(screen: &vt1k::Screen, row: u16) -> String {
     (0..COLS)
         .filter_map(|c| screen.cell(row, c).map(|cl| cl.contents()))
         .collect()
@@ -111,7 +111,7 @@ fn selected_card(t: &mut Tui) -> Option<usize> {
     let screen = t.parser.screen();
     (0..ROWS).find_map(|y| {
         let cell = screen.cell(y, 0)?;
-        if cell.contents() != "╭" || cell.fgcolor() != vt100::Color::Rgb(0xcb, 0xa6, 0xf7) {
+        if cell.contents() != "╭" || cell.fgcolor() != vt1k::Color::Rgb(0xcb, 0xa6, 0xf7) {
             return None;
         }
         // `╭┐3·Mock GPU 3┌───…` — the index leads the card title, whatever
@@ -309,7 +309,7 @@ fn filtered_process_table_ready(screen: &str, pid: u32) -> bool {
 
 #[test]
 fn filtered_process_table_waits_for_the_expected_row() {
-    let mut parser = vt100::Parser::new(ROWS, COLS, 0);
+    let mut parser = vt1k::Parser::new(dim(ROWS), dim(COLS), 0);
     parser.process(b"filter:gpur\r\n1000005 user 0 Compute 40 256MiB firefox");
     assert!(!filtered_process_table_ready(
         &parser.screen().contents(),
@@ -398,7 +398,7 @@ fn resize_changes_layout_and_restores_it() {
     t.wait_for("full-size process window", |s| {
         proc_window(s) == Some((1, 7, 12))
     });
-    t.parser.screen_mut().set_size(24, 80);
+    t.parser.screen_mut().set_size(dim(24), dim(80));
     t.resize(24, 80);
     t.wait_for("smaller process window", |s| {
         proc_window(s) == Some((1, 3, 12))
@@ -407,7 +407,7 @@ fn resize_changes_layout_and_restores_it() {
     });
     assert_eq!(proc_pids(&t.screen_text()).len(), 3);
     assert_eq!(t.parser.screen().cell(22, 79).unwrap().contents(), "╯");
-    t.parser.screen_mut().set_size(ROWS, COLS);
+    t.parser.screen_mut().set_size(dim(ROWS), dim(COLS));
     t.resize(ROWS, COLS);
     t.wait_for("restored process window", |s| {
         proc_window(s) == Some((1, 7, 12))
@@ -447,8 +447,8 @@ fn survives_resize_storm() {
         (ROWS, COLS),
     ] {
         t.resize(rows, cols);
-        // NB: the vt100 test parser stays at full size — it panics on 1x1
-        // grids, and out-of-range coords from small-screen frames clamp.
+        // NB: the test parser stays at full size; out-of-range coords from
+        // small-screen frames clamp.
         t.pump_once(Duration::from_millis(50));
     }
     // Let the app drain the resize backlog before probing.
@@ -812,7 +812,7 @@ fn highlighted_row(t: &mut Tui) -> Option<String> {
     for row in 0..ROWS {
         if matches!(
             screen.cell(row, 2).map(|c| c.bgcolor()),
-            Some(vt100::Color::Rgb(0x45, 0x47, 0x5a))
+            Some(vt1k::Color::Rgb(0x45, 0x47, 0x5a))
         ) {
             let text = row_text(screen, row);
             if !text.trim().is_empty() {
