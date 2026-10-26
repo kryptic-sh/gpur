@@ -1229,6 +1229,24 @@ drm-resident-gtt:\t1024 KiB
             }
         }
 
+        /// The GT spent most of a short wait in its sleep state (RC6, which
+        /// i915 counts in `gt/gt0/rc6_residency_ms`, xe in the tile's
+        /// `gtidle/idle_residency_ms`): asleep there, with GuC SLPC, the
+        /// driver reports every clock as 0 (seen on a Raptor Lake iGPU idle
+        /// beside the discrete card driving the display).
+        fn gt_asleep(d: &IntelDevice) -> bool {
+            const WAIT_MS: u64 = 200;
+            let residency = || {
+                read_u64(&d.card.join("gt/gt0/rc6_residency_ms"))
+                    .or_else(|| read_u64(&d.dev.join("tile0/gt0/gtidle/idle_residency_ms")))
+            };
+            let Some(before) = residency() else {
+                return false;
+            };
+            std::thread::sleep(Duration::from_millis(WAIT_MS));
+            residency().is_some_and(|after| after.saturating_sub(before) >= WAIT_MS / 2)
+        }
+
         /// i915 keeps the current clock on the card dir, xe under the tile.
         /// A path that drifts reads as a card with no clock rather than an
         /// error, so the check is against the files that are actually there.
@@ -1250,8 +1268,8 @@ drm-resident-gtt:\t1024 KiB
                 );
                 let mhz = gt_cur_freq_mhz(d).unwrap();
                 assert!(
-                    (1..=5000).contains(&mhz),
-                    "{} at {mhz} MHz — a clock read as 0 is a file that stopped parsing",
+                    (1..=5000).contains(&mhz) || (mhz == 0 && gt_asleep(d)),
+                    "{} at {mhz} MHz — a clock read as 0 while the GT runs is a file that stopped parsing",
                     d.name
                 );
             }
